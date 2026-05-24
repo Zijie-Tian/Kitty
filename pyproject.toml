@@ -22,8 +22,12 @@ classifiers = [
 [tool.setuptools.packages.find]
 include = ["kitty_sim*", "kitty*"]
 
+[tool.setuptools.package-data]
+kitty_sim = ["longbench/config/*.json"]
+
 
 [project.scripts]
 eval_kitty = "kitty_sim.cli.eval_kitty:main"
 eval_hf_kv = "kitty_sim.cli.eval_hf_kv:main"
-
+eval_longbench_kitty = "kitty_sim.cli.eval_longbench:main"
+score_longbench_kitty = "kitty_sim.cli.score_longbench:main"

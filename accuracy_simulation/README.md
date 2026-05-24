@@ -96,3 +96,9 @@ If arguments are missing or invalid, the script prints usage help and exits.
 
     ./accuracy_eval.sh "Qwen/Qwen3-32B" "aime25" "0,1" "10" "1"
 
+
+---
+
+## LongBench Evaluation (GPU1-only)
+
+See [`LONGBENCH.md`](LONGBENCH.md) for the Kitty LongBench runner. This workflow is constrained to physical GPU1 (`CUDA_VISIBLE_DEVICES=1`) and includes strict completeness checks for smoke/full runs.

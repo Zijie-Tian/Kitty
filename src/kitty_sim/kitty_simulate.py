@@ -192,8 +192,10 @@ class KittyKVCache(DynamicCache):
                 keys_to_return = current_key_cache.detach().clone()
                 values_to_return = current_value_cache.detach().clone()
 
-            assert current_cache_length > self.sink_length, "Kitty-KV: sequence length must be greater than sink_length, currently."
-            # Need to quantize the middle part of the key and value caches
+            # Need to quantize the middle part of the key and value caches.
+            # Short LongBench prompts can be no longer than the sink window; in
+            # that case the cache should remain full precision until enough
+            # tokens accumulate to fill the sink + quantization buffer.
             if current_cache_length > self.sink_length + self.buffer_length:
                 start_idx = self.sink_length
                 num_tokens = current_cache_length - self.sink_length

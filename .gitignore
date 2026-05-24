@@ -10,3 +10,7 @@ venv/
 .cache/
 build/
 /outputs
+/data/gsm8k_local_clean
+.env
+.env.*
+!.env.example
