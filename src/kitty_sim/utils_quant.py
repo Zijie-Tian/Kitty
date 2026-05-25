@@ -82,10 +82,27 @@ def fake_quant_groupwise_lastdim(
         dequantized_data: same shape as input, fp16 tensor with fake quantized values
     """
     assert data.dim() == 4, "Expected input shape [B, nh, D, T]"
+    assert group_size > 0, "group_size must be positive"
     B, nh, D, T = data.shape
-    assert T % group_size == 0, "T must be divisible by group_size"
     if bit >= 16:   # No quantization needed, return the original data
         return data
+    if T == 0:
+        return data
+    if T % group_size != 0:
+        # Newer/smaller Llama-family checkpoints can have head_dim < the
+        # paper-default group_size=128 for value-cache quantization. Quantize
+        # complete groups and use one smaller final group instead of failing.
+        chunks = [
+            fake_quant_groupwise_lastdim(
+                chunk,
+                min(group_size, chunk.shape[-1]),
+                bit,
+                promote_mask,
+                promote_bit,
+            )
+            for chunk in data.split(group_size, dim=-1)
+        ]
+        return torch.cat(chunks, dim=-1)
     G = T // group_size
     data = data.contiguous()  # Ensure contiguous memory layout
     x = data.view(B, nh, D, G, group_size)

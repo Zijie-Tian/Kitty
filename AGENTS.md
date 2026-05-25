@@ -54,13 +54,52 @@ GPU_ID=1
   unless `MODEL_PATH` or `--model-path` is provided. Do not reintroduce tracked
   model-to-local-path maps.
 
-The `kitty` conda env has the compatible stack used here:
+The `kitty` conda env has the compatible stack used here. The detailed
+package snapshot below was read from the active `kitty` env on 2026-05-25.
+Re-check this table after upgrading packages, because cache APIs can change
+across Transformers releases.
 
-- Python 3.10
-- PyTorch 2.4.1 + CUDA 12.1
-- Transformers 4.53.2 from `third_party/transformers` branch `hf-4.53.2`
-- lm-evaluation-harness from `third_party/lm-evaluation-harness` branch `kitty`
-- editable Kitty install
+| Component | Observed version / detail |
+| --- | --- |
+| Python | `3.10.20` (`GCC 14.3.0`) |
+| PyTorch | `torch==2.4.1+cu121` |
+| PyTorch CUDA ABI | `torch.version.cuda == 12.1` |
+| Triton | `triton==3.0.0` |
+| Transformers | `transformers==4.57.6` |
+| Tokenizers | `tokenizers==0.22.2` |
+| Accelerate | `accelerate==1.13.0` |
+| Datasets | `datasets==3.6.0` |
+| Hugging Face Hub | `huggingface-hub==0.36.2` |
+| Safetensors | `safetensors==0.7.0` |
+| lm-evaluation-harness | `lm-eval==0.4.9.1` |
+| Evaluate | `evaluate==0.4.6` |
+| NumPy | `numpy==2.2.6` |
+| SciPy | `scipy==1.15.3` |
+| scikit-learn | `scikit-learn==1.7.2` |
+| Pandas | `pandas==2.3.3` |
+| PyArrow | `pyarrow==24.0.0` |
+| tqdm | `tqdm==4.67.3` |
+| einops | `einops==0.8.2` |
+| rouge-score | `rouge-score==0.1.2` |
+| NLTK | `nltk==3.9.4` |
+| regex | `regex==2026.5.9` |
+| requests | `requests==2.34.2` |
+| filelock | `filelock==3.29.0` |
+| packaging | `packaging==26.2` |
+| psutil | `psutil==7.2.2` |
+| Kitty package | `kitty==1.0.0` |
+| torchvision | not installed |
+| torchaudio | not installed |
+| sentencepiece | not installed |
+| protobuf | not installed |
+| jieba | not installed |
+| fuzzywuzzy | not installed |
+
+Important compatibility note: this env currently uses Transformers `4.57.6`,
+not the older `third_party/transformers` `hf-4.53.2` checkout. In this version,
+`transformers.cache_utils.CacheConfig` is no longer importable, so Kitty
+simulation code must keep its local compatibility shim unless the environment
+is pinned back to an older Transformers API.
 
 ## Kitty paper-style quantization defaults
 

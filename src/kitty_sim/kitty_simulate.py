@@ -6,7 +6,14 @@ from dataclasses import dataclass
 import argparse
 
 import torch
-from transformers.cache_utils import CacheConfig, DynamicCache
+try:
+    from transformers.cache_utils import CacheConfig, DynamicCache
+except ImportError:  # transformers>=4.57 removed CacheConfig from cache_utils
+    from transformers.cache_utils import DynamicCache
+
+    class CacheConfig:  # minimal compatibility shim for Kitty's local config
+        def __init__(self, cache_implementation: str | None = None) -> None:
+            self.cache_implementation = cache_implementation
 
 from .utils_quant import build_promote_mask, fake_quant_groupwise_lastdim
 
@@ -150,6 +157,12 @@ class KittyKVCache(DynamicCache):
 
     def __init__(self, cache_config: KittyKVCacheConfig) -> None:
         super().__init__()
+        # transformers<=4.56 DynamicCache exposed key_cache/value_cache lists.
+        # transformers>=4.57 stores layers internally instead. Kitty's quantized
+        # cache logic is intentionally list-based, so keep local legacy-style
+        # lists and override the small Cache API surface that generation uses.
+        self.key_cache: list[torch.Tensor] = []
+        self.value_cache: list[torch.Tensor] = []
         # Initialize Kitty-KV specific configurations
         self.sink_length = cache_config.sink_length
         self.buffer_length = cache_config.buffer_length
@@ -165,6 +178,54 @@ class KittyKVCache(DynamicCache):
         #
         #self.query_cache: list[torch.Tensor] = []
         #self.query_score: list[torch.Tensor] = []
+
+    def get_seq_length(self, layer_idx: int = 0) -> int:
+        """Return cached sequence length for transformers cache/mask helpers."""
+        if layer_idx >= len(self.key_cache):
+            return 0
+        return self.key_cache[layer_idx].shape[-2]
+
+    def get_mask_sizes(self, cache_position: torch.Tensor, layer_idx: int) -> tuple[int, int]:
+        """Return dynamic-cache mask dimensions for transformers>=4.57."""
+        kv_length = self.get_seq_length(layer_idx) + cache_position.shape[0]
+        return kv_length, 0
+
+    def get_max_cache_shape(self, layer_idx: int = 0) -> int:
+        """Dynamic Kitty caches do not have a fixed maximum length."""
+        return -1
+
+    def reorder_cache(self, beam_idx: torch.LongTensor):
+        """Reorder cache batch dimension for generation helpers."""
+        for layer_idx in range(len(self.key_cache)):
+            device_index = beam_idx.to(self.key_cache[layer_idx].device)
+            self.key_cache[layer_idx] = self.key_cache[layer_idx].index_select(0, device_index)
+            self.value_cache[layer_idx] = self.value_cache[layer_idx].index_select(0, device_index)
+
+    def crop(self, max_length: int):
+        """Crop cache sequence length, matching DynamicCache helper semantics."""
+        if max_length < 0:
+            max_length = self.get_seq_length() + max_length
+        for layer_idx in range(len(self.key_cache)):
+            self.key_cache[layer_idx] = self.key_cache[layer_idx][..., :max_length, :]
+            self.value_cache[layer_idx] = self.value_cache[layer_idx][..., :max_length, :]
+
+    def batch_repeat_interleave(self, repeats: int):
+        """Repeat batch entries for generation helpers."""
+        for layer_idx in range(len(self.key_cache)):
+            self.key_cache[layer_idx] = self.key_cache[layer_idx].repeat_interleave(repeats, dim=0)
+            self.value_cache[layer_idx] = self.value_cache[layer_idx].repeat_interleave(repeats, dim=0)
+
+    def batch_select_indices(self, indices: torch.Tensor):
+        """Select batch entries for generation helpers."""
+        for layer_idx in range(len(self.key_cache)):
+            device_indices = indices.to(self.key_cache[layer_idx].device)
+            self.key_cache[layer_idx] = self.key_cache[layer_idx][device_indices, ...]
+            self.value_cache[layer_idx] = self.value_cache[layer_idx][device_indices, ...]
+
+    def reset(self):
+        """Clear all cached tensors."""
+        self.key_cache.clear()
+        self.value_cache.clear()
 
     # To Do: support prefill length smaller than sink_length
     def update(

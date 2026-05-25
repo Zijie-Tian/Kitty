@@ -10,6 +10,7 @@ from kitty_sim.kitty_simulate import KittyKVCache, KittyKVCacheConfig
 from kitty_sim.longbench.scorer import score_directory
 from kitty_sim.longbench.templates import build_chat, format_longbench_prompt
 from kitty_sim.longbench.runner import build_variant
+from kitty_sim.utils_quant import fake_quant_groupwise_lastdim
 
 
 class DummyEncoding:
@@ -76,6 +77,30 @@ class LongBenchTests(unittest.TestCase):
         out_k, out_v = cache.update(key, value, layer_idx=0)
         self.assertEqual(out_k.shape, key.shape)
         self.assertEqual(out_v.shape, value.shape)
+
+    def test_kitty_cache_accepts_llama32_head_dim_smaller_than_group_size(self):
+        cache = KittyKVCache(
+            KittyKVCacheConfig(
+                sink_length=32,
+                buffer_length=128,
+                group_size=128,
+                kbits=2,
+                vbits=2,
+                promote_ratio=0.125,
+                promote_bit=4,
+                channel_selection=1,
+            )
+        )
+        key = torch.randn(1, 4, 200, 64, dtype=torch.float16)
+        value = torch.randn(1, 4, 200, 64, dtype=torch.float16)
+        out_k, out_v = cache.update(key, value, layer_idx=0)
+        self.assertEqual(out_k.shape, key.shape)
+        self.assertEqual(out_v.shape, value.shape)
+
+    def test_fake_quant_allows_smaller_final_group(self):
+        data = torch.randn(1, 2, 3, 64, dtype=torch.float16)
+        quantized = fake_quant_groupwise_lastdim(data, group_size=128, bit=2)
+        self.assertEqual(quantized.shape, data.shape)
 
     def test_strict_scorer_rejects_incomplete_manifest(self):
         with TemporaryDirectory() as tmp:

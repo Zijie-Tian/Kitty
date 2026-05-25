@@ -13,7 +13,7 @@ import argparse
 import math
 
 import torch
-from transformers.cache_utils import CacheConfig, Cache
+from transformers.cache_utils import Cache
 from transformers.configuration_utils import PretrainedConfig
 
 #
@@ -256,4 +256,3 @@ def get_kvcache_kitty(
         max_batch_size=max_batch_size,
         max_length=max_length,
     )
-
