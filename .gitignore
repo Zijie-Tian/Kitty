@@ -16,3 +16,5 @@ build/
 !.env.example
 /.omx
 /longbench_out
+logs/longbench_gpu0
+logs/longbench
