@@ -46,7 +46,11 @@ from transformers.modeling_outputs import (
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.processing_utils import Unpack
-from transformers.utils import LossKwargs, auto_docstring, can_return_tuple, logging
+try:
+    from transformers.utils import LossKwargs, auto_docstring, can_return_tuple, logging
+except ImportError:
+    from transformers.utils import TransformersKwargs as LossKwargs
+    from transformers.utils import auto_docstring, can_return_tuple, logging
 
 from transformers.models.qwen3 import Qwen3Config
 

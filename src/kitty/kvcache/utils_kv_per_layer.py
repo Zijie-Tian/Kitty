@@ -17,7 +17,18 @@ class KVCache_Layer:
     """
     def __init__(self, MAX_BS: int, MAX_LEN: int, H_KV: int, D: int, D_BOOSTED: int, LOW_BIT: int, HIGH_BIT: int, PAGE_SIZE: int, S: int):
         ######################################### Quantized Pages #########################################
-        assert PAGE_SIZE % 128 == 0, "PAGE_SIZE must be a multiple of 128."
+        if PAGE_SIZE <= 0 or PAGE_SIZE % 4 != 0:
+            raise ValueError(
+                f"PAGE_SIZE must be positive and a multiple of 4 for INT2 token packing; got {PAGE_SIZE}."
+            )
+        if D % 4 != 0:
+            raise ValueError(
+                f"D must be a multiple of 4 for INT2 value packing; got {D}."
+            )
+        if not 0 <= D_BOOSTED <= D:
+            raise ValueError(
+                f"D_BOOSTED must be in [0, {D}] for boosted key channels; got {D_BOOSTED}."
+            )
         self.BITS_PER_BYTE = 8
         self.HIGH_BIT = HIGH_BIT
         self.LOW_BIT = LOW_BIT

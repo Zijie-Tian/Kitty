@@ -46,6 +46,7 @@ Use `VARIANTS_CSV="fp16,kitty"` only when you explicitly want both baseline and 
 
 - `fp16`: HuggingFace default KV cache.
 - `kitty`: paper-style Kitty, K2V2 with 12.5% Key channels promoted to INT4 (`sink=32`, `buffer=128`, `group=128`).
+- `kitty_page16`: fake-quant accuracy proxy for the 16-token page-size experiment (`sink=32`, `buffer=16`, `group=16`). This is not a real Triton-kernel accuracy proof.
 - `kitty_pro`: K2V2 with 25% Key channels promoted to INT4.
 - `kivi_2`: K2V2 without sink or promoted channels.
 - `kivi_star_2`: K2V2 with first 32 sink tokens kept in full precision, no promoted channels.

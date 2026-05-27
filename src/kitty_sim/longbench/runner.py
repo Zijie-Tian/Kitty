@@ -54,6 +54,15 @@ def build_variant(args: Any) -> VariantConfig:
         return VariantConfig(name="fp16", use_kitty=False, promote_ratio=0.0)
     if variant == "kitty":
         return VariantConfig(name="kitty", use_kitty=True, promote_ratio=0.125)
+    if variant == "kitty_page16":
+        return VariantConfig(
+            name="kitty_page16",
+            use_kitty=True,
+            sink_length=32,
+            buffer_length=16,
+            group_size=16,
+            promote_ratio=0.125,
+        )
     if variant == "kitty_pro":
         return VariantConfig(name="kitty_pro", use_kitty=True, promote_ratio=0.25)
     if variant == "kivi_2":

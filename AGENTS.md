@@ -22,6 +22,7 @@ values there.
 KITTY_CONDA_ENV=kitty
 KITTY_PYTHON_BIN=python
 KITTY_LLAMA31_8B_PATH=/path/to/Llama-3.1-8B-Instruct
+KITTY_LLAMA32_1B_PATH=/path/to/Llama-3.2-1B-Instruct
 KITTY_QWEN3_8B_PATH=/path/to/Qwen3-8B
 LONGBENCH_DATA_ROOT=/path/to/LongBench
 GPU_IDS_CSV=1
@@ -117,6 +118,54 @@ channel_selection=1  # magnitude-based Key-channel selection
 ```
 
 Use `promote_ratio=0.25` only for an intentional Kitty-Pro run.
+
+## Kitty page16 experiment configuration
+
+Keep paper-style Kitty defaults at 128-token pages unless the task explicitly
+asks for the QUEST-aligned page16 experiment. Page16 is opt-in and should be
+reported as an experimental variant, not as the default Kitty setting.
+
+Real Triton Kitty path:
+
+```python
+from kitty.kvcache import get_kvcache_kitty
+
+kv_cache = get_kvcache_kitty(
+    config,
+    max_batch_size=max_batch_size,
+    max_length=max_length,
+    page_size=16,
+)
+```
+
+Latency benchmark path:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 PYTHONPATH=src python latency_benchmarking/benchmark_kitty.py \
+  --cache_implementation 0 \
+  --page_size 16 \
+  --max_seq_len 4096 \
+  --batch_size 1 \
+  --warmup_runs 1 \
+  --repeat_runs 2
+```
+
+LongBench fake-quant accuracy proxy:
+
+```bash
+GPU_IDS_CSV=1 \
+VARIANTS_CSV=kitty_page16 \
+MAX_MODEL_LEN=3500 \
+LOCAL_FILES_ONLY=1 \
+OVERWRITE=1 \
+bash accuracy_simulation/run_longbench.sh
+```
+
+Important reporting caveat: `kitty_page16` in `kitty_sim` is a fake-quant
+accuracy proxy (`sink=32`, `buffer=16`, `group=16`). It is useful for quick
+accuracy smoke testing, but it is not by itself a proof of real Triton page16
+accuracy. Real page16 correctness must be validated with GPU1 kernel/cache
+smoke tests, and latency claims must come from the real Triton path.
 
 ## GSM8K LLaMA3.1-8B-Instruct GPU1 reproduction
 

@@ -53,11 +53,18 @@ class LongBenchTests(unittest.TestCase):
 
     def test_variant_defaults_match_plan(self):
         kitty = build_variant(SimpleNamespace(variant="kitty"))
+        page16 = build_variant(SimpleNamespace(variant="kitty_page16"))
         pro = build_variant(SimpleNamespace(variant="kitty_pro"))
         self.assertEqual(kitty.promote_ratio, 0.125)
         self.assertEqual(pro.promote_ratio, 0.25)
         self.assertEqual(kitty.sink_length, 32)
+        self.assertEqual(kitty.buffer_length, 128)
         self.assertEqual(kitty.group_size, 128)
+        self.assertEqual(page16.sink_length, 32)
+        self.assertEqual(page16.buffer_length, 16)
+        self.assertEqual(page16.group_size, 16)
+        self.assertEqual(page16.promote_ratio, 0.125)
+        self.assertIn("g16_b16_s32", page16.tag)
 
     def test_kitty_cache_accepts_short_prefill_without_assertion(self):
         cache = KittyKVCache(

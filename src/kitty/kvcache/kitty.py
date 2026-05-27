@@ -32,15 +32,23 @@ class KittyCache(Cache):
         config: PretrainedConfig,
         max_batch_size: int,
         max_length: int,
+        page_size: int = 128,
     ) -> None:
-        super().__init__()
+        try:
+            # transformers>=4.57 requires explicit layer storage at Cache init time.
+            super().__init__(layers=[])
+        except TypeError:
+            # Older transformers Cache versions accepted a no-arg initializer.
+            super().__init__()
         self.kv_cache: list[KVCache_Layer] = []
+        self._max_batch_size = max_batch_size
+        self._max_length = max_length
         # Reading the model configurations
         self.num_hidden_layers = config.num_hidden_layers
         self.head_dim = config.head_dim
         self.num_key_value_heads = config.num_key_value_heads
         ######################## Kitty Specific Configurations ########################
-        self.page_size = 128                    # PAGE_SIZE=128
+        self.page_size = page_size              # PAGE_SIZE=128 by default; page_size=16 for QUEST-aligned experiments.
         self.d_boosted = self.head_dim // 4     # 25% channels are boosted to INT4
         self.sink_length = 32                   # SINK_LENGTH=32
         self.low_bit = 2                        # LOW_BIT=2
@@ -240,11 +248,36 @@ class KittyCache(Cache):
         KVCache_Layer = self.kv_cache[layer_idx]
         return KVCache_Layer.get_total_length()
 
+    @property
+    def max_batch_size(self) -> int:
+        """Return the maximum batch size of this statically allocated Kitty cache."""
+        return self._max_batch_size
+
+    @property
+    def max_cache_len(self) -> int:
+        """Return the maximum sequence length allocated for this Kitty cache."""
+        return self._max_length
+
+    def get_max_cache_shape(self, layer_idx: int = 0) -> int:
+        """Return the maximum sequence length allocated for this Kitty cache."""
+        return self._max_length
+
+    def get_mask_sizes(self, cache_position: torch.Tensor, layer_idx: int) -> tuple[int, int]:
+        """
+        Return the KV length and offset expected by transformers causal-mask helpers.
+
+        Mask construction happens before this cache's `update()` call. Therefore the
+        visible KV length is the already cached length plus the current step length
+        represented by `cache_position`.
+        """
+        return self.get_seq_length(layer_idx) + cache_position.shape[0], 0
+
 
 def get_kvcache_kitty(
         config: PretrainedConfig,
         max_batch_size: int,
-        max_length: int,) -> KittyCache:
+        max_length: int,
+        page_size: int = 128,) -> KittyCache:
     """
     Get the KittyCache object.
     Returns:
@@ -255,4 +288,5 @@ def get_kvcache_kitty(
         config=config,
         max_batch_size=max_batch_size,
         max_length=max_length,
+        page_size=page_size,
     )
