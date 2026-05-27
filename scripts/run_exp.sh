@@ -3,62 +3,137 @@
 # It only runs subtasks that were partial or not started when this script was created.
 #
 # Default: run Llama, Qwen3, and GLM loops concurrently on GPU 0/1/2.
+# DeepSeek is an explicit target for completing the existing Distill-Llama run.
 # Usage:
-#   bash scripts/run_exp.sh [all|llama|qwen|glm]
+#   bash scripts/run_exp.sh [all|llama|qwen|glm|deepseek] [--gpu GPU]
 #   SERIAL=1 bash scripts/run_exp.sh all
+#   bash scripts/run_exp.sh deepseek --gpu 0
 #
 # Notes:
 # - No nohup is used; keep the terminal/session alive.
 # - Completed subtasks are skipped.
 # - Partial subtasks in the list are deleted and rerun from scratch.
-# - When a model finishes its listed subtasks, result.json is regenerated.
+# - When a model finishes its listed subtasks, strict score_longbench regenerates result.json.
+# - If any generated jsonl is still partial, scoring fails and writes result.partial.json.
 
 set -Eeuo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
 
-PYTHON_BIN="${PYTHON_BIN:-/home/tzj/anaconda3/envs/kitty/bin/python}"
-DATA_ROOT="${DATA_ROOT:-/home/tzj/data/LongBench}"
+PYTHON_BIN="${PYTHON_BIN:-${KITTY_PYTHON_BIN:-${HOME}/anaconda3/envs/kitty/bin/python}}"
+DATA_ROOT="${DATA_ROOT:-${LONGBENCH_DATA_ROOT:-${HOME}/data/LongBench}}"
+GPU_OVERRIDE="${GPU_OVERRIDE:-}"
 
 KITTY_TAG="kitty_g128_b128_s32_sel1_k2_v2_pb4_pr0p125"
 
-LLAMA_MODEL_ID="meta-llama/Llama-3.1-8B-Instruct"
-LLAMA_MODEL_PATH="/home/tzj/models/Llama-3.1-8B-Instruct"
-LLAMA_MODEL_TAG="llama31-8b-instruct-gpu0-full-32k"
-LLAMA_OUTPUT_DIR="longbench_out/llama31-8b-instruct/pred"
+LLAMA_GPU="${LLAMA_GPU:-0}"
+LLAMA_MODEL_ID="${LLAMA_MODEL_ID:-meta-llama/Llama-3.1-8B-Instruct}"
+LLAMA_MODEL_PATH="${LLAMA_MODEL_PATH:-${KITTY_LLAMA31_8B_PATH:-${HOME}/models/Llama-3.1-8B-Instruct}}"
+LLAMA_MODEL_TAG="${LLAMA_MODEL_TAG:-llama31-8b-instruct-gpu0-full-32k}"
+LLAMA_OUTPUT_DIR="${LLAMA_OUTPUT_DIR:-longbench_out/llama31-8b-instruct/pred}"
 LLAMA_PRED_DIR="${LLAMA_OUTPUT_DIR}/${LLAMA_MODEL_TAG}-${KITTY_TAG}"
-LLAMA_REPORT_PREFIX="longbench_out/llama31-8b-instruct/logs/report_full_32k"
+LLAMA_REPORT_PREFIX="${LLAMA_REPORT_PREFIX:-longbench_out/llama31-8b-instruct/logs/report_full_32k}"
 LLAMA_DATASETS=(triviaqa samsum lsht passage_retrieval_en passage_count passage_retrieval_zh lcc repobench-p)
 
-QWEN_MODEL_ID="Qwen/Qwen3-8B"
-QWEN_MODEL_PATH="/home/tzj/models/Qwen3-8B"
-QWEN_MODEL_TAG="qwen3-8b-gpu1-full-32k-gen2048"
-QWEN_OUTPUT_DIR="longbench_out/qwen3-8b/pred"
+QWEN_GPU="${QWEN_GPU:-1}"
+QWEN_MODEL_ID="${QWEN_MODEL_ID:-Qwen/Qwen3-8B}"
+QWEN_MODEL_PATH="${QWEN_MODEL_PATH:-${KITTY_QWEN3_8B_PATH:-${HOME}/models/Qwen3-8B}}"
+QWEN_MODEL_TAG="${QWEN_MODEL_TAG:-qwen3-8b-gpu1-full-32k-gen2048}"
+QWEN_OUTPUT_DIR="${QWEN_OUTPUT_DIR:-longbench_out/qwen3-8b/pred}"
 QWEN_PRED_DIR="${QWEN_OUTPUT_DIR}/${QWEN_MODEL_TAG}-${KITTY_TAG}"
-QWEN_REPORT_PREFIX="longbench_out/qwen3-8b/logs/report_full_32k_gen2048"
+QWEN_REPORT_PREFIX="${QWEN_REPORT_PREFIX:-longbench_out/qwen3-8b/logs/report_full_32k_gen2048}"
 QWEN_DATASETS=(hotpotqa 2wikimqa musique dureader gov_report qmsum multi_news vcsum trec triviaqa samsum lsht passage_retrieval_en passage_count passage_retrieval_zh lcc repobench-p)
 
-GLM_MODEL_ID="THUDM/GLM-4-9B-Chat-1M"
-GLM_MODEL_PATH="/home/tzj/models/GLM-4-9B-Chat-1M"
-GLM_MODEL_TAG="glm4-9b-chat-1m-gpu2-full-32k"
-GLM_OUTPUT_DIR="longbench_out/glm4-9b-chat-1m/pred"
+GLM_GPU="${GLM_GPU:-2}"
+GLM_MODEL_ID="${GLM_MODEL_ID:-THUDM/GLM-4-9B-Chat-1M}"
+GLM_MODEL_PATH="${GLM_MODEL_PATH:-${KITTY_GLM4_9B_1M_PATH:-${HOME}/models/GLM-4-9B-Chat-1M}}"
+GLM_MODEL_TAG="${GLM_MODEL_TAG:-glm4-9b-chat-1m-gpu2-full-32k}"
+GLM_OUTPUT_DIR="${GLM_OUTPUT_DIR:-longbench_out/glm4-9b-chat-1m/pred}"
 GLM_PRED_DIR="${GLM_OUTPUT_DIR}/${GLM_MODEL_TAG}-${KITTY_TAG}"
-GLM_REPORT_PREFIX="longbench_out/glm4-9b-chat-1m/logs/report_full_32k"
+GLM_REPORT_PREFIX="${GLM_REPORT_PREFIX:-longbench_out/glm4-9b-chat-1m/logs/report_full_32k}"
 GLM_DATASETS=(vcsum trec triviaqa samsum lsht passage_retrieval_en passage_count passage_retrieval_zh lcc repobench-p)
+
+DEEPSEEK_GPU="${DEEPSEEK_GPU:-0}"
+DEEPSEEK_MODEL_ID="${DEEPSEEK_MODEL_ID:-deepseek-ai/DeepSeek-R1-Distill-Llama-8B}"
+DEEPSEEK_MODEL_PATH="${DEEPSEEK_MODEL_PATH:-${HOME}/models/DeepSeek-R1-Distill-Llama-8B}"
+DEEPSEEK_MODEL_TAG="${DEEPSEEK_MODEL_TAG:-deepseek-r1-distill-llama-8b}"
+DEEPSEEK_OUTPUT_DIR="${DEEPSEEK_OUTPUT_DIR:-longbench_out/pred}"
+DEEPSEEK_PRED_DIR="${DEEPSEEK_PRED_DIR:-${DEEPSEEK_OUTPUT_DIR}/${DEEPSEEK_MODEL_TAG}-${KITTY_TAG}}"
+DEEPSEEK_REPORT_PREFIX="${DEEPSEEK_REPORT_PREFIX:-logs/longbench/reports/deepseek_r1_distill_llama_8b_kitty}"
+DEEPSEEK_MAX_GEN="${DEEPSEEK_MAX_GEN:-1024}"
+DEEPSEEK_DATASETS=(lsht passage_retrieval_en passage_count passage_retrieval_zh lcc repobench-p)
 
 usage() {
   cat <<USAGE
-Usage: bash scripts/run_exp.sh [all|llama|qwen|glm]
+Usage: bash scripts/run_exp.sh [all|llama|qwen|glm|deepseek] [--gpu GPU]
 
 Default target is: all
 Default all-mode runs three model loops concurrently on GPU 0/1/2.
 Set SERIAL=1 to run all targets one by one.
+DeepSeek is opt-in and is not included in the default all target.
+
+Examples:
+  bash scripts/run_exp.sh deepseek --gpu 0
+  SERIAL=1 bash scripts/run_exp.sh all --gpu 0
 
 Environment overrides:
   PYTHON_BIN=${PYTHON_BIN}
   DATA_ROOT=${DATA_ROOT}
+  GPU_OVERRIDE=${GPU_OVERRIDE:-<unset>}
+  LLAMA_GPU=${LLAMA_GPU}
+  QWEN_GPU=${QWEN_GPU}
+  GLM_GPU=${GLM_GPU}
+  DEEPSEEK_GPU=${DEEPSEEK_GPU}
+  DEEPSEEK_MODEL_PATH=${DEEPSEEK_MODEL_PATH}
 USAGE
+}
+
+parse_args() {
+  TARGET=""
+  while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+      -h|--help|help)
+        TARGET="help"
+        shift
+        ;;
+      -g|--gpu)
+        if [[ "$#" -lt 2 || -z "${2:-}" || "${2:-}" == -* ]]; then
+          echo "ERROR: --gpu requires a GPU id, for example: --gpu 0" >&2
+          return 2
+        fi
+        GPU_OVERRIDE="$2"
+        shift 2
+        ;;
+      --gpu=*)
+        GPU_OVERRIDE="${1#--gpu=}"
+        if [[ -z "${GPU_OVERRIDE}" ]]; then
+          echo "ERROR: --gpu requires a non-empty GPU id" >&2
+          return 2
+        fi
+        shift
+        ;;
+      -*)
+        echo "ERROR: unknown option: $1" >&2
+        usage >&2
+        return 2
+        ;;
+      *)
+        if [[ -n "${TARGET}" ]]; then
+          echo "ERROR: only one target may be specified (got '${TARGET}' and '$1')" >&2
+          return 2
+        fi
+        TARGET="$1"
+        shift
+        ;;
+    esac
+  done
+  TARGET="${TARGET:-all}"
+}
+
+select_gpu() {
+  local default_gpu="$1"
+  printf '%s\n' "${GPU_OVERRIDE:-${default_gpu}}"
 }
 
 count_rows() {
@@ -148,6 +223,8 @@ run_eval_dataset() {
   local -a env_cmd=(
     env
     "CUDA_VISIBLE_DEVICES=${gpu}"
+    "GPU_ID=${gpu}"
+    "GPU_IDS_CSV=${gpu}"
     "TOKENIZERS_PARALLELISM=false"
     "HF_DATASETS_TRUST_REMOTE_CODE=1"
     "PYTHONPATH=${REPO_ROOT}/src:${PYTHONPATH:-}"
@@ -182,16 +259,9 @@ run_eval_dataset() {
 
 score_pred_dir() {
   local pred_dir="$1"
-  echo "[score] ${pred_dir} -> result.json"
-  env "PYTHONPATH=${REPO_ROOT}/src:${PYTHONPATH:-}" "${PYTHON_BIN}" - "${pred_dir}" <<'PY'
-from pathlib import Path
-import sys
-from kitty_sim.longbench.scorer import score_directory
-
-pred_dir = Path(sys.argv[1])
-scores = score_directory(pred_dir, strict_complete=False, output_name="result.json")
-print(scores)
-PY
+  echo "[score] strict ${pred_dir} -> result.json"
+  env "PYTHONPATH=${REPO_ROOT}/src:${PYTHONPATH:-}" \
+    "${PYTHON_BIN}" -m kitty_sim.cli.score_longbench --model "${pred_dir}"
 }
 
 run_model_loop() {
@@ -241,7 +311,7 @@ run_model_loop() {
 
 run_llama() {
   run_model_loop \
-    llama 0 \
+    llama "$(select_gpu "${LLAMA_GPU}")" \
     "${LLAMA_MODEL_ID}" \
     "${LLAMA_MODEL_PATH}" \
     "${LLAMA_MODEL_TAG}" \
@@ -256,7 +326,7 @@ run_llama() {
 
 run_qwen() {
   run_model_loop \
-    qwen3 1 \
+    qwen3 "$(select_gpu "${QWEN_GPU}")" \
     "${QWEN_MODEL_ID}" \
     "${QWEN_MODEL_PATH}" \
     "${QWEN_MODEL_TAG}" \
@@ -271,7 +341,7 @@ run_qwen() {
 
 run_glm() {
   run_model_loop \
-    glm4 2 \
+    glm4 "$(select_gpu "${GLM_GPU}")" \
     "${GLM_MODEL_ID}" \
     "${GLM_MODEL_PATH}" \
     "${GLM_MODEL_TAG}" \
@@ -282,6 +352,21 @@ run_glm() {
     "" \
     error \
     "${GLM_DATASETS[@]}"
+}
+
+run_deepseek() {
+  run_model_loop \
+    deepseek "$(select_gpu "${DEEPSEEK_GPU}")" \
+    "${DEEPSEEK_MODEL_ID}" \
+    "${DEEPSEEK_MODEL_PATH}" \
+    "${DEEPSEEK_MODEL_TAG}" \
+    llama3 \
+    "${DEEPSEEK_OUTPUT_DIR}" \
+    "${DEEPSEEK_PRED_DIR}" \
+    "${DEEPSEEK_REPORT_PREFIX}" \
+    "${DEEPSEEK_MAX_GEN}" \
+    "" \
+    "${DEEPSEEK_DATASETS[@]}"
 }
 
 run_all_parallel() {
@@ -308,13 +393,19 @@ run_all_parallel() {
 }
 
 main() {
-  local target="${1:-all}"
+  parse_args "$@"
+  local target="${TARGET}"
   case "${target}" in
-    -h|--help|help)
+    help)
       usage
       return 0
       ;;
   esac
+
+  if [[ "${target}" == "all" && -n "${GPU_OVERRIDE}" && "${SERIAL:-0}" != "1" ]]; then
+    echo "ERROR: --gpu with target 'all' requires SERIAL=1, otherwise all model loops would share GPU${GPU_OVERRIDE} concurrently." >&2
+    return 2
+  fi
 
   check_prereqs
 
@@ -327,6 +418,9 @@ main() {
       ;;
     glm|glm4)
       run_glm
+      ;;
+    deepseek|deepseek-distill|deepseek-distill-llama-8b|deepseek-r1-distill-llama-8b)
+      run_deepseek
       ;;
     all)
       if [[ "${SERIAL:-0}" == "1" ]]; then
