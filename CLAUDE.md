@@ -143,6 +143,7 @@ Latency benchmark path:
 ```bash
 CUDA_VISIBLE_DEVICES=1 PYTHONPATH=src python latency_benchmarking/benchmark_kitty.py \
   --cache_implementation 0 \
+  --attn-implementation sdpa \
   --page_size 16 \
   --max_seq_len 4096 \
   --batch_size 1 \
@@ -155,7 +156,7 @@ LongBench fake-quant accuracy proxy:
 ```bash
 GPU_IDS_CSV=1 \
 VARIANTS_CSV=kitty_page16 \
-MAX_MODEL_LEN=3500 \
+MAX_MODEL_LEN=32768 \
 MAX_GEN=256 \
 LOCAL_FILES_ONLY=1 \
 OVERWRITE=1 \
@@ -167,6 +168,124 @@ accuracy proxy (`sink=32`, `buffer=16`, `group=16`). It is useful for quick
 accuracy smoke testing, but it is not by itself a proof of real Triton page16
 accuracy. Real page16 correctness must be validated with GPU1 kernel/cache
 smoke tests, and latency claims must come from the real Triton path.
+
+## True QUEST + Kitty page16 kernel usage
+
+The true QUEST + Kitty path is the real Qwen3 Kitty decode path with 16-token
+pages, query-aware page selection, and Triton sparse QK/SV kernels. It is not
+the same as the `kitty_sim` fake proxy.
+
+Naming rules:
+
+- `quest_proxy_kitty_page16` is a fake-quant/dense LongBench accuracy proxy.
+  Do not use it for kernel-speed claims.
+- A real `quest+kitty` / `quest_kitty_page16_kernel` result must show
+  `last_quest_path` values like `triton_sparse_reduced_budget` or
+  `triton_sparse_forced_all_pages`.
+- `python_sparse_debug` is an internal correctness/debug path only and does not
+  count as true QUEST kernel evidence.
+
+Default true QUEST settings:
+
+```text
+page_size=16
+promote_ratio=0.125
+quest_enabled=True
+quest_token_budget=2048  # default when no explicit QUEST budget is supplied
+quest_skip_layers=2
+```
+
+Budget mapping for page16:
+
+| QUEST token budget | Selected logical pages |
+| ---: | ---: |
+| 512 | 32 |
+| 1024 | 64 |
+| 2048 | 128 |
+
+### GPU decode speed gate
+
+Use this command shape to prove the real QUEST + Kitty implementation on a
+32k input. It compares pure Kitty page16 against QUEST + Kitty page16 using
+only decode-token timing; prefill is excluded from the reported ms/token.
+
+Default GPU1 command:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 PYTHONPATH=src:. python latency_benchmarking/benchmark_kitty.py \
+  --model /mnt/data/tzj/models/Qwen3-8B \
+  --cache_implementation 0 \
+  --attn-implementation sdpa \
+  --page_size 16 \
+  --promote_ratio 0.125 \
+  --max_seq_len 32768 \
+  --max_new_tokens 32 \
+  --batch_size 1 \
+  --warmup_runs 1 \
+  --repeat_runs 3 \
+  --compare-quest-kitty \
+  --quest-enabled \
+  --quest-token-budget 2048 \
+  --quest-skip-layers 2
+```
+
+Use GPU0 only when the user explicitly overrides the GPU1-only evaluation rule:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 PYTHONPATH=src:. python latency_benchmarking/benchmark_kitty.py \
+  --model /mnt/data/tzj/models/Qwen3-8B \
+  --cache_implementation 0 \
+  --attn-implementation sdpa \
+  --page_size 16 \
+  --promote_ratio 0.125 \
+  --max_seq_len 32768 \
+  --max_new_tokens 32 \
+  --batch_size 1 \
+  --warmup_runs 1 \
+  --repeat_runs 3 \
+  --compare-quest-kitty \
+  --quest-enabled \
+  --quest-token-budget 2048 \
+  --quest-skip-layers 2
+```
+
+Expected evidence in output:
+
+```text
+paths={'dense': <skip-layer count>, 'triton_sparse_reduced_budget': <nonzero>}
+selected_pages=128
+selected_tokens=2048
+decode_speedup=<pure Kitty page16 ms/token / QUEST+Kitty ms/token>
+```
+
+A real implementation should be materially faster than pure Kitty page16 on a
+32k decode. If `decode_speedup < 1.5`, first suspect dense fallback, Python
+debug fallback, selector-side all-page dequantization, or unselected pages
+still being loaded by the sparse kernels.
+
+Recent local GPU1 sample evidence with Qwen3-8B, 32768-token prompt,
+`max_new_tokens=32`, `warmup_runs=0`, `repeat_runs=1`:
+
+| QUEST budget | Selected pages | QUEST ms/token | QUEST tok/s | Pure Kitty ms/token | Speedup |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 512 | 32 | 47.0848 | 21.24 | 228.0413 | 4.843x |
+| 1024 | 64 | 49.3885 | 20.25 | 227.7278 | 4.611x |
+| 2048 | 128 | 55.0113 | 18.18 | 227.8943 | 4.143x |
+
+Treat these as environment-specific smoke numbers, not a formal benchmark.
+
+### GPU0-only correctness tests for true sparse kernels
+
+When a task explicitly says to restrict this QUEST + Kitty work to GPU0, use:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 PYTHONPATH=src:. pytest -q tests/test_kitty_quest_sparse.py
+```
+
+These tests require `CUDA_VISIBLE_DEVICES=0` and exactly one visible CUDA
+device. They assert true Triton sparse path labels, budget behavior, dense
+full-budget fallback behavior, and that `python_sparse_debug` is not accepted as
+real kernel evidence.
 
 ## GSM8K LLaMA3.1-8B-Instruct GPU1 reproduction
 
@@ -207,7 +326,7 @@ find eval_results_gsm8k_gpu1 -name '*summary.json' -print | sort
 
 ## LongBench GPU1 workflow
 
-Use the Kitty-native LongBench runner added in this checkout.
+Use the Kitty-native LongBench runner added in this checkout. Unless a task explicitly asks for a shorter smoke/proxy run, LongBench runs in this checkout must use `MAX_MODEL_LEN=32768` (32k context) and `MAX_GEN=256`. Do not use the old `MAX_MODEL_LEN=3500` default for full LongBench commands.
 
 ### Normalized LongBench output layout
 

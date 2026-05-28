@@ -143,6 +143,7 @@ Latency benchmark path:
 ```bash
 CUDA_VISIBLE_DEVICES=1 PYTHONPATH=src python latency_benchmarking/benchmark_kitty.py \
   --cache_implementation 0 \
+  --attn-implementation sdpa \
   --page_size 16 \
   --max_seq_len 4096 \
   --batch_size 1 \
@@ -214,6 +215,7 @@ Default GPU1 command:
 CUDA_VISIBLE_DEVICES=1 PYTHONPATH=src:. python latency_benchmarking/benchmark_kitty.py \
   --model /mnt/data/tzj/models/Qwen3-8B \
   --cache_implementation 0 \
+  --attn-implementation sdpa \
   --page_size 16 \
   --promote_ratio 0.125 \
   --max_seq_len 32768 \
@@ -233,6 +235,7 @@ Use GPU0 only when the user explicitly overrides the GPU1-only evaluation rule:
 CUDA_VISIBLE_DEVICES=0 PYTHONPATH=src:. python latency_benchmarking/benchmark_kitty.py \
   --model /mnt/data/tzj/models/Qwen3-8B \
   --cache_implementation 0 \
+  --attn-implementation sdpa \
   --page_size 16 \
   --promote_ratio 0.125 \
   --max_seq_len 32768 \

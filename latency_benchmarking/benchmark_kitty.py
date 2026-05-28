@@ -132,6 +132,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--quest-skip-layers",      type=int, default=2,                  help="Disable QUEST sparse selection for the first N layers.")
     parser.add_argument("--force-sparse-for-equivalence", action="store_true",           help="Force sparse all-pages path for dense-equivalence tests.")
     parser.add_argument("--compare-quest-kitty",    action="store_true",                 help="Run a decode-only comparison: pure Kitty page16 vs QUEST+Kitty page16. Defaults QUEST token budget to 2048 when no QUEST budget is supplied.")
+    parser.add_argument("--attn-implementation",    type=str, default="sdpa",             choices=["eager", "sdpa", "flash_attention_2"], help="Transformers attention backend used while loading the model. Use sdpa when flash_attn is not installed.")
     return parser
 
 
@@ -683,7 +684,7 @@ def main() -> None:
         config = config,
         torch_dtype=torch.float16,
         low_cpu_mem_usage=True,
-        attn_implementation="flash_attention_2",
+        attn_implementation=args.attn_implementation,
         device_map='auto'
     )
     model.eval()
