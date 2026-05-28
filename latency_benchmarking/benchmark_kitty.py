@@ -129,7 +129,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--quest-enabled",          action="store_true",                 help="Enable correctness-first QUEST sparse page selection in the Kitty cache.")
     parser.add_argument("--quest-topk-pages",       type=int, default=None,               help="QUEST sparse page budget in page16 logical pages.")
     parser.add_argument("--quest-token-budget",     type=int, default=None,               help="QUEST sparse token budget; converted to pages by the cache page size.")
-    parser.add_argument("--quest-skip-layers",      type=int, default=2,                  help="Disable QUEST sparse selection for the first N layers.")
+    parser.add_argument("--quest-skip-layers",      type=int, default=0,                  help="Disable QUEST sparse selection for the first N layers (0 = all layers use QUEST).")
     parser.add_argument("--force-sparse-for-equivalence", action="store_true",           help="Force sparse all-pages path for dense-equivalence tests.")
     parser.add_argument("--compare-quest-kitty",    action="store_true",                 help="Run a decode-only comparison: pure Kitty page16 vs QUEST+Kitty page16. Defaults QUEST token budget to 2048 when no QUEST budget is supplied.")
     return parser
@@ -322,7 +322,7 @@ def benchmark_kitty_decode_only(
     quest_enabled: bool = False,
     quest_topk_pages: int | None = None,
     quest_token_budget: int | None = None,
-    quest_skip_layers: int = 2,
+    quest_skip_layers: int = 0,
     force_sparse_for_equivalence: bool = False,
 ) -> dict:
     if max_new_tokens <= 0:
@@ -430,7 +430,7 @@ def benchmark_quest_kitty_comparison(
     max_new_tokens: int,
     quest_topk_pages: int | None = None,
     quest_token_budget: int | None = None,
-    quest_skip_layers: int = 2,
+    quest_skip_layers: int = 0,
     force_sparse_for_equivalence: bool = False,
 ) -> None:
     if page_size != 16:
@@ -483,7 +483,7 @@ def benchmark_quest_kitty_comparison(
     )
 
 
-def benchmark_kitty(model: PreTrainedModel, tokenizer: AutoTokenizer, inputs: dict, max_seq_len, model_config: PretrainedConfig, warmup_runs: int, repeat_runs: int, page_size: int, promote_ratio: float, max_new_tokens: int | None = None, quest_enabled: bool = False, quest_topk_pages: int | None = None, quest_token_budget: int | None = None, quest_skip_layers: int = 2, force_sparse_for_equivalence: bool = False) -> None:
+def benchmark_kitty(model: PreTrainedModel, tokenizer: AutoTokenizer, inputs: dict, max_seq_len, model_config: PretrainedConfig, warmup_runs: int, repeat_runs: int, page_size: int, promote_ratio: float, max_new_tokens: int | None = None, quest_enabled: bool = False, quest_topk_pages: int | None = None, quest_token_budget: int | None = None, quest_skip_layers: int = 0, force_sparse_for_equivalence: bool = False) -> None:
     max_batch_size = inputs.input_ids.size(0)
     print(f"Kitty page_size: {page_size}")
     print(f"Kitty promote_ratio: {promote_ratio}")
