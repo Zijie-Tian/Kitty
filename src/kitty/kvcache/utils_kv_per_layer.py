@@ -49,6 +49,11 @@ class KVCache_Layer:
             (MAX_BS * self.MAX_PAGE, self.bytes_per_page_K), dtype=torch.uint8, device='cuda')
         self.KeyCache_metadata = torch.zeros( # scale & zero_point
             (MAX_BS * self.MAX_PAGE, H_KV, D, 2), dtype=torch.half, device='cuda')
+        # Query-aware QUEST selector bounds by logical page. These are metadata,
+        # not dequantized page tensors, and let the selector avoid all-page K
+        # dequantization.
+        self.KeyPage_Min = torch.zeros((MAX_BS, H_KV, self.MAX_PAGE, D), dtype=torch.float16, device='cuda')
+        self.KeyPage_Max = torch.zeros((MAX_BS, H_KV, self.MAX_PAGE, D), dtype=torch.float16, device='cuda')
         # Initialize Value Cache
         self.bytes_per_page_V = H_KV * PAGE_SIZE * D * self.LOW_BIT // self.BITS_PER_BYTE              # INT2
         self.ValueCache = torch.zeros(
@@ -100,6 +105,10 @@ class KVCache_Layer:
         self.last_selected_tokens = 0
         self.last_sparse_qk_hits = 0
         self.last_sparse_sv_hits = 0
+        self.last_effective_topk_pages = 0
+        self.last_effective_token_budget = None
+        self.last_sparse_qk_pages_loaded = 0
+        self.last_sparse_sv_pages_loaded = 0
         # Legacy for compatibility of prefills
         self.key_states: Optional[torch.Tensor] = None
         self.value_states: Optional[torch.Tensor] = None

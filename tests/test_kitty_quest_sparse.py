@@ -1,3 +1,4 @@
+import os
 import unittest
 from types import SimpleNamespace
 
@@ -22,8 +23,12 @@ def _tiny_config() -> SimpleNamespace:
 def _skip_reason() -> str | None:
     if _IMPORT_ERROR is not None:
         return f"real Kitty runtime import failed: {_IMPORT_ERROR}"
+    if os.environ.get("CUDA_VISIBLE_DEVICES") != "0":
+        return "requires CUDA_VISIBLE_DEVICES=0 for GPU0-only true QUEST+Kitty tests"
     if not torch.cuda.is_available():
         return "CUDA is required for real Kitty QUEST sparse tests"
+    if torch.cuda.device_count() != 1:
+        return "GPU0-only tests must see exactly one CUDA device"
     return None
 
 
@@ -71,10 +76,12 @@ class RealKittyQuestSparseTests(unittest.TestCase):
         torch.cuda.synchronize()
 
         layer = sparse_cache.kv_cache[2]
-        self.assertEqual(layer.last_quest_path, "sparse_forced_all_pages")
+        self.assertEqual(layer.last_quest_path, "triton_sparse_forced_all_pages")
         self.assertGreater(layer.last_sparse_qk_hits, 0)
         self.assertGreater(layer.last_sparse_sv_hits, 0)
-        self.assertEqual(layer.last_selected_pages_shape, (1, 1, 2))
+        self.assertEqual(layer.last_selected_pages_shape, (1, 1, layer.last_shared_page_count))
+        self.assertEqual(layer.last_sparse_qk_pages_loaded, layer.last_shared_page_count + max(0, layer.PageCount_K - layer.last_shared_page_count))
+        self.assertEqual(layer.last_sparse_sv_pages_loaded, layer.last_shared_page_count + max(0, layer.PageCount_V - layer.last_shared_page_count))
         torch.testing.assert_close(sparse, dense, atol=2e-2, rtol=2e-2)
 
     def test_page16_sparse_budget_finite_shape(self):
@@ -90,7 +97,13 @@ class RealKittyQuestSparseTests(unittest.TestCase):
         self.assertIsNone(attn)
         self.assertEqual(output.shape, (1, 1, 1, 16))
         self.assertTrue(torch.isfinite(output).all())
-        self.assertEqual(cache.kv_cache[2].last_quest_path, "sparse_reduced_budget")
+        layer = cache.kv_cache[2]
+        self.assertEqual(layer.last_quest_path, "triton_sparse_reduced_budget")
+        self.assertEqual(layer.last_selected_pages_shape, (1, 1, 1))
+        self.assertEqual(layer.last_selected_tokens, 16)
+        self.assertEqual(layer.last_sparse_qk_pages_loaded, 1 + max(0, layer.PageCount_K - layer.last_shared_page_count))
+        self.assertEqual(layer.last_sparse_sv_pages_loaded, 1 + max(0, layer.PageCount_V - layer.last_shared_page_count))
+        self.assertLess(layer.last_sparse_qk_pages_loaded, layer.PageCount_K)
 
     def test_page16_sparse_skip_first_layers(self):
         assert QuestConfig is not None and kitty_attention_forward is not None
@@ -103,8 +116,65 @@ class RealKittyQuestSparseTests(unittest.TestCase):
         torch.cuda.synchronize()
 
         self.assertEqual(output.shape, (1, 1, 1, 16))
-        self.assertEqual(cache.kv_cache[1].last_quest_path, "dense")
+        self.assertIn(cache.kv_cache[1].last_quest_path, {"dense", "dense_skip_layer"})
         self.assertEqual(cache.kv_cache[1].last_sparse_qk_hits, 0)
+
+
+    def test_token_budget_and_topk_use_stricter_budget(self):
+        assert QuestConfig is not None and kitty_attention_forward is not None
+        cache = self._cache(quest_config=QuestConfig(enabled=True, topk_pages=2, token_budget=16, skip_layers=0))
+        self._fill_prefill(cache, seq_len=96, layer_idx=2)
+        query = torch.randn(1, 1, 1, 16, dtype=torch.float16, device="cuda").contiguous()
+        module = SimpleNamespace(num_attention_heads=1, num_key_value_heads=1)
+
+        output, _ = kitty_attention_forward(module, query, cache.kv_cache[2], scaling=16 ** -0.5)
+        torch.cuda.synchronize()
+
+        layer = cache.kv_cache[2]
+        self.assertTrue(torch.isfinite(output).all())
+        self.assertEqual(layer.last_quest_path, "triton_sparse_reduced_budget")
+        self.assertEqual(layer.last_effective_topk_pages, 1)
+        self.assertEqual(layer.last_selected_tokens, 16)
+        self.assertEqual(layer.last_selected_pages_shape, (1, 1, 1))
+
+    def test_full_budget_without_force_records_dense_full_budget(self):
+        assert QuestConfig is not None and kitty_attention_forward is not None
+        cache = self._cache(quest_config=QuestConfig(enabled=True, topk_pages=999, skip_layers=0, force_sparse_for_equivalence=False))
+        self._fill_prefill(cache, seq_len=80, layer_idx=2)
+        query = torch.randn(1, 1, 1, 16, dtype=torch.float16, device="cuda").contiguous()
+        module = SimpleNamespace(num_attention_heads=1, num_key_value_heads=1)
+
+        output, _ = kitty_attention_forward(module, query, cache.kv_cache[2], scaling=16 ** -0.5)
+        torch.cuda.synchronize()
+
+        layer = cache.kv_cache[2]
+        self.assertTrue(torch.isfinite(output).all())
+        self.assertEqual(layer.last_quest_path, "dense_full_budget")
+        self.assertEqual(layer.last_sparse_qk_pages_loaded, 0)
+        self.assertEqual(layer.last_sparse_sv_pages_loaded, 0)
+
+    def test_python_sparse_debug_path_is_not_real_kernel_evidence(self):
+        assert QuestConfig is not None and kitty_attention_forward is not None
+        cache = self._cache(quest_config=QuestConfig(enabled=True, topk_pages=1, skip_layers=0, use_python_debug=True))
+        self._fill_prefill(cache, seq_len=80, layer_idx=2)
+        query = torch.randn(1, 1, 1, 16, dtype=torch.float16, device="cuda").contiguous()
+        module = SimpleNamespace(num_attention_heads=1, num_key_value_heads=1)
+
+        output, _ = kitty_attention_forward(module, query, cache.kv_cache[2], scaling=16 ** -0.5)
+        torch.cuda.synchronize()
+
+        layer = cache.kv_cache[2]
+        self.assertTrue(torch.isfinite(output).all())
+        self.assertEqual(layer.last_quest_path, "python_sparse_debug")
+        self.assertEqual(layer.last_sparse_qk_pages_loaded, 0)
+        self.assertEqual(layer.last_sparse_sv_pages_loaded, 0)
+
+    def test_negative_budget_values_raise_before_decode(self):
+        assert QuestConfig is not None
+        with self.assertRaises(ValueError):
+            QuestConfig(enabled=True, topk_pages=-1)
+        with self.assertRaises(ValueError):
+            QuestConfig(enabled=True, token_budget=-1)
 
 
 if __name__ == "__main__":

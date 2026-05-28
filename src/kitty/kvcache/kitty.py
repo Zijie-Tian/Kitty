@@ -35,6 +35,16 @@ class QuestConfig:
     token_budget: int | None = None
     skip_layers: int = 2
     force_sparse_for_equivalence: bool = False
+    use_python_debug: bool = False
+
+    def __post_init__(self) -> None:
+        for name, value in (("topk_pages", self.topk_pages), ("token_budget", self.token_budget), ("skip_layers", self.skip_layers)):
+            if value is None:
+                continue
+            if not isinstance(value, int):
+                raise TypeError(f"{name} must be an int or None; got {type(value).__name__}.")
+            if value < 0:
+                raise ValueError(f"{name} must be non-negative; got {value}.")
 
 
 class KittyCache(Cache):
@@ -76,6 +86,12 @@ class KittyCache(Cache):
         self.page_size = page_size              # PAGE_SIZE=128 by default; page_size=16 for QUEST-aligned experiments.
         self.promote_ratio = promote_ratio      # 0.125 for paper Kitty; 0.25 for Kitty-Pro.
         self.d_boosted = int(self.head_dim * promote_ratio + 1e-6)
+        if quest_config is None and quest_enabled and quest_topk_pages is None and quest_token_budget is None:
+            # User-facing QUEST+Kitty routes default to a reduced 2048-token budget
+            # so they cannot silently become dense full-budget runs. Explicit
+            # QuestConfig(enabled=True) remains available for internal full-budget
+            # equivalence/debug paths.
+            quest_token_budget = 2048
         self.quest_config = quest_config or QuestConfig(
             enabled=quest_enabled,
             topk_pages=quest_topk_pages,
@@ -184,7 +200,7 @@ class KittyCache(Cache):
             kvcache.Q_Buffer_K[:,:,:len_qbuf_k,:].copy_(kvcache.key_states[:, :, -len_qbuf_k:, :].contiguous())
             kvcache.Q_Buffer_Count_K = len_qbuf_k
         if pages_k > 0:
-            quantize_pack_k(
+            page_min, page_max = quantize_pack_k(
                 # data source
                 kvcache.key_states,
                 len_sink,
@@ -198,6 +214,8 @@ class KittyCache(Cache):
                 kvcache.PAGE_SIZE,
                 kvcache.D_BOOSTED,
             )
+            kvcache.KeyPage_Min[:, :, 0:pages_k, :].copy_(page_min)
+            kvcache.KeyPage_Max[:, :, 0:pages_k, :].copy_(page_max)
             #
             kvcache.PageCount_K += pages_k
 
@@ -243,7 +261,7 @@ class KittyCache(Cache):
         kvcache = self.kv_cache[layer_idx]
         # Key Cache
         if kvcache.Q_Buffer_Count_K == kvcache.PAGE_SIZE:
-            quantize_pack_k(
+            page_min, page_max = quantize_pack_k(
                 # data source
                 kvcache.Q_Buffer_K,
                 0,
@@ -257,6 +275,8 @@ class KittyCache(Cache):
                 kvcache.PAGE_SIZE,
                 kvcache.D_BOOSTED,
             )
+            kvcache.KeyPage_Min[:, :, kvcache.PageCount_K:kvcache.PageCount_K + 1, :].copy_(page_min)
+            kvcache.KeyPage_Max[:, :, kvcache.PageCount_K:kvcache.PageCount_K + 1, :].copy_(page_max)
             kvcache.PageCount_K += 1
             kvcache.Q_Buffer_Count_K = 0
         # Value Cache

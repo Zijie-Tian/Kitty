@@ -274,6 +274,8 @@ def quantize_pack_k(
     # Slicing the key states to pages
     key_to_quantize = key_states[:, :, key_states_t_offset : key_states_t_offset + page_size * key_states_page_count, :].contiguous() # (B, H_KV, page_count*PAGE_SIZE, D)
     key_to_quantize = key_to_quantize.view(B, H_KV, key_states_page_count, page_size, D)    # (B, H_KV, page_count, PAGE_SIZE, D)
+    page_min = key_to_quantize.amin(dim=-2).contiguous()
+    page_max = key_to_quantize.amax(dim=-2).contiguous()
 
     ##################################################################################################################
     # Computing the channel score, the formular of channel score can be modified here. We use maganitude here.
@@ -310,6 +312,7 @@ def quantize_pack_k(
         D,
         d_boost,
     )
+    return page_min, page_max
 
 
 def quantize_pack_v(

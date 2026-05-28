@@ -400,6 +400,312 @@ def sv_kernel(
 
 
 
+@triton.jit
+def qk_sparse_kernel(
+    # Query (t=1 for decoding step)
+    q_ptr,
+    q_stride_b, q_stride_h, q_stride_kvg, q_stride_t, q_stride_d,
+    # Selected logical pages [B, H_KV, K_SEL]
+    selected_pages_ptr,
+    selected_stride_b, selected_stride_h, selected_stride_k,
+    # Key Cache
+    sink_ptr_k,
+    sink_stride_b_k, sink_stride_h_k, sink_stride_s_k, sink_stride_d_k,
+    qbuff_ptr_k,
+    qbuff_stride_b_k, qbuff_stride_h_k, qbuff_stride_t_k, qbuff_stride_d_k,
+    page_table_ptr_k,
+    page_table_stride_b_k, page_table_stride_p_k,
+    kcache_ptr,
+    kcache_stride_p, kcache_stride_last,
+    kcache_meta_ptr,
+    kcache_meta_stride_p, kcache_meta_stride_h, kcache_meta_stride_d, kcache_meta_stride_last,
+    scaling,
+    output_ptr,
+    out_stride_b, out_stride_hq, out_stride_t_total,
+    sink_count,
+    qbuff_count_k,
+    page_count_k,
+    shared_page_count,
+    k_sel,
+    H_KV: tl.constexpr,
+    H_Q: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    D: tl.constexpr,
+    S: tl.constexpr,
+    D_BOOST: tl.constexpr,
+    MAX_KV_GROUP: tl.constexpr
+):
+    KV_GROUP:       tl.constexpr = H_Q // H_KV
+    K_STRIDE_D:     tl.constexpr = PAGE_SIZE * 2 // 8
+    K_STRIDE_H_KV:  tl.constexpr = K_STRIDE_D * (D + D_BOOST) + D
+    K_OFF_HI:       tl.constexpr = K_STRIDE_D * D
+    K_OFF_IDX:      tl.constexpr = K_STRIDE_D * (D + D_BOOST)
+
+    pid_b = tl.program_id(0)
+    pid_h_kv = tl.program_id(1)
+    offs_max_kvg = tl.arange(0, MAX_KV_GROUP)
+    offs_d = tl.arange(0, D)
+    offs_t = tl.arange(0, PAGE_SIZE)
+    offs_s = tl.arange(0, S)
+    offs_pack = offs_t // 4
+    shifts = (offs_t % 4) * 2
+
+    mask_load_q = (offs_max_kvg[:, None] < KV_GROUP) & (offs_d[None, :] >= 0)
+    q = tl.load(
+        q_ptr + pid_b * q_stride_b + pid_h_kv * q_stride_h + 0 * q_stride_t
+        + offs_max_kvg[:, None] * q_stride_kvg + offs_d[None, :] * q_stride_d,
+        mask=mask_load_q,
+        other=0.0,
+    )
+
+    # Sink logits
+    mask_load_k_sink = (offs_s[:, None] < sink_count) & (offs_d[None, :] >= 0)
+    k_sink = tl.load(
+        sink_ptr_k + pid_b * sink_stride_b_k + pid_h_kv * sink_stride_h_k
+        + offs_s[:, None] * sink_stride_s_k + offs_d[None, :] * sink_stride_d_k,
+        mask=mask_load_k_sink,
+        other=0.0,
+    )
+    logits_sink = (tl.dot(q, tl.trans(k_sink)) * scaling).to(tl.float16)
+    mask_store_score_sink = (offs_s[None, :] < sink_count) & (offs_max_kvg[:, None] < KV_GROUP)
+    tl.store(
+        output_ptr + pid_b * out_stride_b + pid_h_kv * KV_GROUP * out_stride_hq
+        + offs_max_kvg[:, None] * out_stride_hq + offs_s[None, :] * out_stride_t_total,
+        logits_sink,
+        mask=mask_store_score_sink,
+    )
+
+    # Selected shared pages
+    i = 0
+    while i < k_sel:
+        logical_page = tl.load(
+            selected_pages_ptr + pid_b * selected_stride_b + pid_h_kv * selected_stride_h + i * selected_stride_k
+        )
+        page_id = tl.load(page_table_ptr_k + pid_b * page_table_stride_b_k + logical_page * page_table_stride_p_k)
+        meta_base = kcache_meta_ptr + page_id * kcache_meta_stride_p + pid_h_kv * kcache_meta_stride_h
+        scale = tl.load(meta_base + offs_d * kcache_meta_stride_d + 0 * kcache_meta_stride_last)
+        zero_point = tl.load(meta_base + offs_d * kcache_meta_stride_d + 1 * kcache_meta_stride_last)
+        cache_base = kcache_ptr + page_id * kcache_stride_p + pid_h_kv * K_STRIDE_H_KV
+        boost_idx = tl.load(cache_base + K_OFF_IDX + offs_d)
+        boost_mask = boost_idx < D_BOOST
+        x_uint8_low = tl.load(cache_base + offs_d[:, None] * K_STRIDE_D + offs_pack[None, :])
+        x_uint8_low = (x_uint8_low >> shifts[None, :]) & 0x3
+        x_uint8_high = tl.load(
+            cache_base + K_OFF_HI + boost_idx[:, None] * K_STRIDE_D + offs_pack[None, :],
+            mask=boost_mask[:, None] & (offs_pack >= 0),
+            other=0.0,
+        )
+        x_uint8_high = (x_uint8_high >> shifts[None, :]) & 0x3
+        x_fp16 = (x_uint8_low | (x_uint8_high << 2)).to(tl.float16)
+        x_fp16 = x_fp16 * scale[:, None] + zero_point[:, None]
+        logits_page = (tl.dot(q, x_fp16) * scaling).to(tl.float16)
+        mask_store_score_page = (offs_max_kvg[:, None] < KV_GROUP) & (offs_t[None, :] >= 0)
+        tl.store(
+            output_ptr + pid_b * out_stride_b + pid_h_kv * KV_GROUP * out_stride_hq
+            + offs_max_kvg[:, None] * out_stride_hq
+            + (sink_count + i * PAGE_SIZE + offs_t)[None, :] * out_stride_t_total,
+            logits_page,
+            mask=mask_store_score_page,
+        )
+        i += 1
+
+    # K logical recent tail pages: shared_page_count..page_count_k-1
+    j = shared_page_count
+    while j < page_count_k:
+        page_id = tl.load(page_table_ptr_k + pid_b * page_table_stride_b_k + j * page_table_stride_p_k)
+        meta_base = kcache_meta_ptr + page_id * kcache_meta_stride_p + pid_h_kv * kcache_meta_stride_h
+        scale = tl.load(meta_base + offs_d * kcache_meta_stride_d + 0 * kcache_meta_stride_last)
+        zero_point = tl.load(meta_base + offs_d * kcache_meta_stride_d + 1 * kcache_meta_stride_last)
+        cache_base = kcache_ptr + page_id * kcache_stride_p + pid_h_kv * K_STRIDE_H_KV
+        boost_idx = tl.load(cache_base + K_OFF_IDX + offs_d)
+        boost_mask = boost_idx < D_BOOST
+        x_uint8_low = tl.load(cache_base + offs_d[:, None] * K_STRIDE_D + offs_pack[None, :])
+        x_uint8_low = (x_uint8_low >> shifts[None, :]) & 0x3
+        x_uint8_high = tl.load(
+            cache_base + K_OFF_HI + boost_idx[:, None] * K_STRIDE_D + offs_pack[None, :],
+            mask=boost_mask[:, None] & (offs_pack >= 0),
+            other=0.0,
+        )
+        x_uint8_high = (x_uint8_high >> shifts[None, :]) & 0x3
+        x_fp16 = (x_uint8_low | (x_uint8_high << 2)).to(tl.float16)
+        x_fp16 = x_fp16 * scale[:, None] + zero_point[:, None]
+        logits_page = (tl.dot(q, x_fp16) * scaling).to(tl.float16)
+        tail_slot = j - shared_page_count
+        tl.store(
+            output_ptr + pid_b * out_stride_b + pid_h_kv * KV_GROUP * out_stride_hq
+            + offs_max_kvg[:, None] * out_stride_hq
+            + (sink_count + k_sel * PAGE_SIZE + tail_slot * PAGE_SIZE + offs_t)[None, :] * out_stride_t_total,
+            logits_page,
+            mask=(offs_max_kvg[:, None] < KV_GROUP) & (offs_t[None, :] >= 0),
+        )
+        j += 1
+
+    # K QBuffer after tail pages
+    mask_load_k_qbuff = (offs_t[:, None] < qbuff_count_k) & (offs_d[None, :] >= 0)
+    k_qbuff = tl.load(
+        qbuff_ptr_k + pid_b * qbuff_stride_b_k + pid_h_kv * qbuff_stride_h_k
+        + offs_t[:, None] * qbuff_stride_t_k + offs_d[None, :] * qbuff_stride_d_k,
+        mask=mask_load_k_qbuff,
+        other=0.0,
+    )
+    logits_qbuff = (tl.dot(q, tl.trans(k_qbuff)) * scaling).to(tl.float16)
+    qbuff_offset = sink_count + k_sel * PAGE_SIZE + (page_count_k - shared_page_count) * PAGE_SIZE
+    tl.store(
+        output_ptr + pid_b * out_stride_b + (pid_h_kv * KV_GROUP + offs_max_kvg[:, None]) * out_stride_hq
+        + (qbuff_offset + offs_t)[None, :] * out_stride_t_total,
+        logits_qbuff,
+        mask=(offs_t[None, :] < qbuff_count_k) & (offs_max_kvg[:, None] < KV_GROUP),
+    )
+
+
+@triton.jit
+def sv_sparse_kernel(
+    attn_score_ptr,
+    attn_score_stride_b, attn_score_stride_hq, attn_score_stride_t_total,
+    selected_pages_ptr,
+    selected_stride_b, selected_stride_h, selected_stride_k,
+    sink_ptr_v,
+    sink_stride_b_v, sink_stride_h_v, sink_stride_s_v, sink_stride_d_v,
+    qbuff_ptr_v,
+    qbuff_stride_b_v, qbuff_stride_h_v, qbuff_stride_t_v, qbuff_stride_d_v,
+    local_ptr,
+    local_stride_b, local_stride_h, local_stride_t, local_stride_d,
+    page_table_ptr_v,
+    page_table_stride_b_v, page_table_stride_p_v,
+    vcache_ptr,
+    vcache_stride_p, vcache_stride_last,
+    vcache_meta_ptr,
+    vcache_meta_stride_p, vcache_meta_stride_h, vcache_meta_stride_t, vcache_meta_stride_last,
+    output_ptr,
+    output_stride_b, output_stride_t, output_stride_hq, output_stride_d,
+    sink_count,
+    qbuff_count_v,
+    local_count_v,
+    local_offset_v,
+    page_count_v,
+    shared_page_count,
+    k_sel,
+    H_KV: tl.constexpr,
+    H_Q: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    D: tl.constexpr,
+    S: tl.constexpr,
+    MAX_KV_GROUP: tl.constexpr
+):
+    V_STRIDE_T:     tl.constexpr = D * 2 // 8
+    V_STRIDE_H_KV:  tl.constexpr = V_STRIDE_T * PAGE_SIZE
+    KV_GROUP:       tl.constexpr = H_Q // H_KV
+
+    pid_b = tl.program_id(0)
+    pid_h_kv = tl.program_id(1)
+    offs_s = tl.arange(0, S)
+    offs_max_kvg = tl.arange(0, MAX_KV_GROUP)
+    offs_d = tl.arange(0, D)
+    offs_t = tl.arange(0, PAGE_SIZE)
+    offs_pack = offs_d // 4
+    shifts = (offs_d % 4) * 2
+
+    attn_score_sink = tl.load(
+        attn_score_ptr + pid_b * attn_score_stride_b
+        + (pid_h_kv * KV_GROUP + offs_max_kvg[:, None]) * attn_score_stride_hq
+        + offs_s[None, :] * attn_score_stride_t_total,
+        mask=(offs_s[None, :] < sink_count) & (offs_max_kvg[:, None] < KV_GROUP),
+        other=0.0,
+    )
+    v_sink = tl.load(
+        sink_ptr_v + pid_b * sink_stride_b_v + pid_h_kv * sink_stride_h_v
+        + offs_s[:, None] * sink_stride_s_v + offs_d[None, :] * sink_stride_d_v,
+        mask=(offs_s[:, None] < sink_count) & (offs_d[None, :] >= 0),
+        other=0.0,
+    )
+    attn_output_acc = tl.dot(attn_score_sink, v_sink)
+
+    i = 0
+    while i < k_sel:
+        logical_page = tl.load(
+            selected_pages_ptr + pid_b * selected_stride_b + pid_h_kv * selected_stride_h + i * selected_stride_k
+        )
+        page_id = tl.load(page_table_ptr_v + pid_b * page_table_stride_b_v + logical_page * page_table_stride_p_v)
+        meta_base = vcache_meta_ptr + page_id * vcache_meta_stride_p + pid_h_kv * vcache_meta_stride_h
+        scale = tl.load(meta_base + offs_t * vcache_meta_stride_t + 0 * vcache_meta_stride_last)
+        zero_point = tl.load(meta_base + offs_t * vcache_meta_stride_t + 1 * vcache_meta_stride_last)
+        cache_base = vcache_ptr + page_id * vcache_stride_p + pid_h_kv * V_STRIDE_H_KV
+        x_uint8 = tl.load(cache_base + offs_t[:, None] * V_STRIDE_T + offs_pack[None, :])
+        x_uint8 = (x_uint8 >> shifts[None, :]) & 0x3
+        x_fp16 = x_uint8.to(tl.float16) * scale[:, None] + zero_point[:, None]
+        attn_score_page = tl.load(
+            attn_score_ptr + pid_b * attn_score_stride_b
+            + (pid_h_kv * KV_GROUP + offs_max_kvg[:, None]) * attn_score_stride_hq
+            + (sink_count + i * PAGE_SIZE + offs_t[None, :]) * attn_score_stride_t_total,
+            mask=(offs_max_kvg[:, None] < KV_GROUP) & (offs_t[None, :] >= 0),
+            other=0.0,
+        )
+        attn_output_acc = tl.dot(attn_score_page, x_fp16, attn_output_acc)
+        i += 1
+
+    j = shared_page_count
+    while j < page_count_v:
+        page_id = tl.load(page_table_ptr_v + pid_b * page_table_stride_b_v + j * page_table_stride_p_v)
+        meta_base = vcache_meta_ptr + page_id * vcache_meta_stride_p + pid_h_kv * vcache_meta_stride_h
+        scale = tl.load(meta_base + offs_t * vcache_meta_stride_t + 0 * vcache_meta_stride_last)
+        zero_point = tl.load(meta_base + offs_t * vcache_meta_stride_t + 1 * vcache_meta_stride_last)
+        cache_base = vcache_ptr + page_id * vcache_stride_p + pid_h_kv * V_STRIDE_H_KV
+        x_uint8 = tl.load(cache_base + offs_t[:, None] * V_STRIDE_T + offs_pack[None, :])
+        x_uint8 = (x_uint8 >> shifts[None, :]) & 0x3
+        x_fp16 = x_uint8.to(tl.float16) * scale[:, None] + zero_point[:, None]
+        tail_slot = j - shared_page_count
+        attn_score_page = tl.load(
+            attn_score_ptr + pid_b * attn_score_stride_b
+            + (pid_h_kv * KV_GROUP + offs_max_kvg[:, None]) * attn_score_stride_hq
+            + (sink_count + k_sel * PAGE_SIZE + tail_slot * PAGE_SIZE + offs_t[None, :]) * attn_score_stride_t_total,
+            mask=(offs_max_kvg[:, None] < KV_GROUP) & (offs_t[None, :] >= 0),
+            other=0.0,
+        )
+        attn_output_acc = tl.dot(attn_score_page, x_fp16, attn_output_acc)
+        j += 1
+
+    qbuff_offset = sink_count + k_sel * PAGE_SIZE + (page_count_v - shared_page_count) * PAGE_SIZE
+    attn_score_qbuff = tl.load(
+        attn_score_ptr + pid_b * attn_score_stride_b
+        + (pid_h_kv * KV_GROUP + offs_max_kvg[:, None]) * attn_score_stride_hq
+        + (qbuff_offset + offs_t[None, :]) * attn_score_stride_t_total,
+        mask=(offs_t[None, :] < qbuff_count_v) & (offs_max_kvg[:, None] < KV_GROUP),
+        other=0.0,
+    )
+    v_qbuff = tl.load(
+        qbuff_ptr_v + pid_b * qbuff_stride_b_v + pid_h_kv * qbuff_stride_h_v
+        + offs_t[:, None] * qbuff_stride_t_v + offs_d[None, :] * qbuff_stride_d_v,
+        mask=(offs_t[:, None] < qbuff_count_v) & (offs_d[None, :] >= 0),
+        other=0.0,
+    )
+    attn_output_acc = tl.dot(attn_score_qbuff, v_qbuff, attn_output_acc)
+
+    local_score_offset = qbuff_offset + qbuff_count_v
+    attn_score_local = tl.load(
+        attn_score_ptr + pid_b * attn_score_stride_b
+        + (pid_h_kv * KV_GROUP + offs_max_kvg[:, None]) * attn_score_stride_hq
+        + (local_score_offset + offs_t[None, :]) * attn_score_stride_t_total,
+        mask=(offs_t[None, :] < local_count_v) & (offs_max_kvg[:, None] < KV_GROUP),
+        other=0.0,
+    )
+    offs_local = (tl.arange(0, PAGE_SIZE) + local_offset_v) % PAGE_SIZE
+    v_local = tl.load(
+        local_ptr + pid_b * local_stride_b + pid_h_kv * local_stride_h
+        + offs_local[:, None] * local_stride_t + offs_d[None, :] * local_stride_d,
+        mask=(offs_t[:, None] < local_count_v) & (offs_d[None, :] >= 0),
+        other=0.0,
+    )
+    attn_output_acc = tl.dot(attn_score_local, v_local, attn_output_acc)
+
+    tl.store(
+        output_ptr + output_stride_b * pid_b + output_stride_t * 0
+        + output_stride_hq * (pid_h_kv * KV_GROUP + offs_max_kvg[:, None])
+        + output_stride_d * offs_d[None, :],
+        attn_output_acc.to(tl.float16),
+        mask=(offs_max_kvg[:, None] < KV_GROUP) & (offs_d[None, :] >= 0),
+    )
+
+
 def _unpack_int2(values: torch.Tensor, count: int) -> torch.Tensor:
     shifts = (torch.arange(count, device=values.device, dtype=torch.int64) % 4) * 2
     packed = values.index_select(0, torch.arange(count, device=values.device, dtype=torch.int64) // 4).long()
@@ -458,6 +764,49 @@ def _local_v_logical_torch(kv_cache: KVCache_Layer, batch_idx: int, head_idx: in
     return kv_cache.Local_Buffer_V[batch_idx, head_idx].index_select(0, offsets.long())
 
 
+def _resolve_quest_topk_pages(cfg, shared_page_count: int, page_size: int) -> int:
+    candidates: list[int] = []
+    topk = getattr(cfg, "topk_pages", None)
+    token_budget = getattr(cfg, "token_budget", None)
+    if topk is not None:
+        if not isinstance(topk, int) or topk < 0:
+            raise ValueError(f"quest topk_pages must be a non-negative int or None; got {topk!r}.")
+        candidates.append(topk)
+    if token_budget is not None:
+        if not isinstance(token_budget, int) or token_budget < 0:
+            raise ValueError(f"quest token_budget must be a non-negative int or None; got {token_budget!r}.")
+        candidates.append((token_budget + page_size - 1) // page_size)
+    if not candidates:
+        return int(shared_page_count)
+    return max(0, min(int(shared_page_count), min(candidates)))
+
+
+def _select_quest_pages_metadata(query: torch.Tensor, kv_cache: KVCache_Layer, shared_page_count: int, topk_pages: int) -> torch.Tensor:
+    """Select logical shared pages from stored K page bounds, without dequantizing all pages."""
+    B, H_Q, _t, D = query.shape
+    H_KV = kv_cache.H_KV
+    group = H_Q // H_KV
+    if topk_pages <= 0:
+        return torch.empty((B, H_KV, 0), dtype=torch.int64, device=query.device)
+    if topk_pages >= shared_page_count:
+        return torch.arange(shared_page_count, device=query.device, dtype=torch.int64).view(1, 1, -1).expand(B, H_KV, -1).contiguous()
+    q = query[:, :, 0, :].float().view(B, H_KV, group, D)
+    page_min = kv_cache.KeyPage_Min[:B, :, :shared_page_count, :].float()
+    page_max = kv_cache.KeyPage_Max[:B, :, :shared_page_count, :].float()
+    # QUEST page-bound score without all-page dequantization. For each channel,
+    # max(q*x) over page bounds is q*max when q>=0 and q*min when q<0.
+    # Use batched contractions instead of materializing [B,H,G,P,D].
+    q_pos = torch.clamp(q, min=0.0)
+    q_neg = torch.clamp(q, max=0.0)
+    bounds = torch.einsum("bhgd,bhpd->bhgp", q_pos, page_max) + torch.einsum("bhgd,bhpd->bhgp", q_neg, page_min)
+    scores = bounds.max(dim=2).values
+    # Stable tie handling: bias lower logical page ids slightly upward before topk.
+    # The epsilon is tiny relative to fp32 scores but deterministic for exact ties.
+    eps = torch.arange(shared_page_count, device=query.device, dtype=torch.float32) * (-1e-7)
+    _, idx = torch.topk(scores + eps.view(1, 1, -1), k=topk_pages, dim=-1)
+    return torch.sort(idx.to(torch.int64), dim=-1).values.contiguous()
+
+
 def _select_quest_pages_torch(query: torch.Tensor, kv_cache: KVCache_Layer, shared_page_count: int, topk_pages: int) -> torch.Tensor:
     B, H_Q, _t, D = query.shape
     H_KV = kv_cache.H_KV
@@ -474,7 +823,6 @@ def _select_quest_pages_torch(query: torch.Tensor, kv_cache: KVCache_Layer, shar
                 scores[b, hkv, p] = bound.max()
     if topk_pages >= shared_page_count:
         return torch.arange(shared_page_count, device=query.device, dtype=torch.long).view(1, 1, -1).expand(B, H_KV, -1).clone()
-    # deterministic tie break via CPU sort; top-k is tiny in the debug/smoke path.
     selected = torch.empty((B, H_KV, topk_pages), dtype=torch.long, device=query.device)
     cpu_scores = scores.detach().cpu()
     for b in range(B):
@@ -485,12 +833,12 @@ def _select_quest_pages_torch(query: torch.Tensor, kv_cache: KVCache_Layer, shar
 
 
 def _quest_sparse_attention_torch(module: nn.Module, query: torch.Tensor, kv_cache: KVCache_Layer, scaling: float):
+    """Explicit debug/reference path only; never counts as true QUEST+Kitty."""
     cfg = getattr(kv_cache, "quest_config", None)
-    if cfg is None or not getattr(cfg, "enabled", False):
+    if cfg is None or not getattr(cfg, "enabled", False) or not getattr(cfg, "use_python_debug", False):
         return None
     layer_idx = getattr(kv_cache, "layer_idx", 0)
     if layer_idx < getattr(cfg, "skip_layers", 0):
-        kv_cache.last_quest_path = "dense_skip_layer"
         return None
     B, H_Q, t_query, D = query.size()
     if t_query != 1 or kv_cache.PAGE_SIZE <= 0:
@@ -500,13 +848,7 @@ def _quest_sparse_attention_torch(module: nn.Module, query: torch.Tensor, kv_cac
     if shared_page_count <= 0:
         kv_cache.last_quest_path = "dense_no_shared_pages"
         return None
-    topk = getattr(cfg, "topk_pages", None)
-    token_budget = getattr(cfg, "token_budget", None)
-    if topk is None and token_budget is not None:
-        topk = (int(token_budget) + kv_cache.PAGE_SIZE - 1) // kv_cache.PAGE_SIZE
-    if topk is None:
-        topk = shared_page_count
-    topk = max(0, min(int(topk), int(shared_page_count)))
+    topk = _resolve_quest_topk_pages(cfg, int(shared_page_count), kv_cache.PAGE_SIZE)
     force = bool(getattr(cfg, "force_sparse_for_equivalence", False))
     if topk >= shared_page_count and not force:
         kv_cache.last_quest_path = "dense_full_budget"
@@ -514,10 +856,14 @@ def _quest_sparse_attention_torch(module: nn.Module, query: torch.Tensor, kv_cac
     selected = _select_quest_pages_torch(query, kv_cache, int(shared_page_count), topk)
     kv_cache.last_selected_pages = selected.detach().clone()
     kv_cache.last_selected_pages_shape = tuple(selected.shape)
+    kv_cache.last_effective_topk_pages = int(topk)
+    kv_cache.last_effective_token_budget = getattr(cfg, "token_budget", None)
     kv_cache.last_selected_tokens = int(topk * kv_cache.PAGE_SIZE)
-    kv_cache.last_quest_path = "sparse_forced_all_pages" if force and topk >= shared_page_count else "sparse_reduced_budget"
-    kv_cache.last_sparse_qk_hits = B * kv_cache.H_KV
-    kv_cache.last_sparse_sv_hits = B * kv_cache.H_KV
+    kv_cache.last_quest_path = "python_sparse_debug"
+    kv_cache.last_sparse_qk_hits = 0
+    kv_cache.last_sparse_sv_hits = 0
+    kv_cache.last_sparse_qk_pages_loaded = 0
+    kv_cache.last_sparse_sv_pages_loaded = 0
 
     group = H_Q // kv_cache.H_KV
     output = torch.empty((B, t_query, H_Q, D), dtype=query.dtype, device=query.device)
@@ -552,6 +898,122 @@ def _quest_sparse_attention_torch(module: nn.Module, query: torch.Tensor, kv_cac
     return output, None
 
 
+def _quest_sparse_attention_triton(module: nn.Module, query: torch.Tensor, kv_cache: KVCache_Layer, scaling: float):
+    cfg = getattr(kv_cache, "quest_config", None)
+    if cfg is None or not getattr(cfg, "enabled", False) or getattr(cfg, "use_python_debug", False):
+        return None
+    layer_idx = getattr(kv_cache, "layer_idx", 0)
+    if layer_idx < getattr(cfg, "skip_layers", 0):
+        return None
+    B, H_Q, t_query, D = query.size()
+    if t_query != 1 or kv_cache.PAGE_SIZE <= 0:
+        return None
+    H_KV = module.num_key_value_heads
+    KV_GROUP = H_Q // H_KV
+    MAX_KV_GROUP = 16
+    assert KV_GROUP <= MAX_KV_GROUP, f"KV_GROUP ({KV_GROUP}) exceeds MAX_KV_GROUP ({MAX_KV_GROUP})."
+    shared_page_count = min(kv_cache.PageCount_K, kv_cache.PageCount_V)
+    kv_cache.last_shared_page_count = int(shared_page_count)
+    if shared_page_count <= 0:
+        kv_cache.last_quest_path = "dense_no_shared_pages"
+        return None
+    topk = _resolve_quest_topk_pages(cfg, int(shared_page_count), kv_cache.PAGE_SIZE)
+    force = bool(getattr(cfg, "force_sparse_for_equivalence", False))
+    if topk >= shared_page_count and not force:
+        kv_cache.last_quest_path = "dense_full_budget"
+        kv_cache.last_sparse_qk_pages_loaded = 0
+        kv_cache.last_sparse_sv_pages_loaded = 0
+        return None
+
+    selected = _select_quest_pages_metadata(query, kv_cache, int(shared_page_count), topk)
+    kv_cache.last_selected_pages = selected.detach().clone()
+    kv_cache.last_selected_pages_shape = tuple(selected.shape)
+    kv_cache.last_effective_topk_pages = int(topk)
+    kv_cache.last_effective_token_budget = getattr(cfg, "token_budget", None)
+    kv_cache.last_selected_tokens = int(topk * kv_cache.PAGE_SIZE)
+
+    tail_len_k = (kv_cache.PageCount_K - shared_page_count) * kv_cache.PAGE_SIZE + kv_cache.Q_Buffer_Count_K
+    tail_len_v = (kv_cache.PageCount_V - shared_page_count) * kv_cache.PAGE_SIZE + kv_cache.Q_Buffer_Count_V + kv_cache.Local_Count_V
+    if tail_len_k != tail_len_v:
+        raise RuntimeError(f"QUEST sparse tail support mismatch: K={tail_len_k} V={tail_len_v}")
+    t_sparse = int(kv_cache.Sink_Count + topk * kv_cache.PAGE_SIZE + tail_len_k)
+    query_view = query.view(B, H_KV, KV_GROUP, 1, D)
+    attn_score = torch.empty((B, H_Q, t_sparse), dtype=query.dtype, device=query.device)
+    grid = (B, H_KV)
+    qk_sparse_kernel[grid](
+        query_view,
+        query_view.stride(0), query_view.stride(1), query_view.stride(2), query_view.stride(3), query_view.stride(4),
+        selected,
+        selected.stride(0), selected.stride(1), selected.stride(2),
+        kv_cache.Sink_Buffer_K,
+        kv_cache.Sink_Buffer_K.stride(0), kv_cache.Sink_Buffer_K.stride(1), kv_cache.Sink_Buffer_K.stride(2), kv_cache.Sink_Buffer_K.stride(3),
+        kv_cache.Q_Buffer_K,
+        kv_cache.Q_Buffer_K.stride(0), kv_cache.Q_Buffer_K.stride(1), kv_cache.Q_Buffer_K.stride(2), kv_cache.Q_Buffer_K.stride(3),
+        kv_cache.PageTable_K,
+        kv_cache.PageTable_K.stride(0), kv_cache.PageTable_K.stride(1),
+        kv_cache.KeyCache,
+        kv_cache.KeyCache.stride(0), kv_cache.KeyCache.stride(1),
+        kv_cache.KeyCache_metadata,
+        kv_cache.KeyCache_metadata.stride(0), kv_cache.KeyCache_metadata.stride(1), kv_cache.KeyCache_metadata.stride(2), kv_cache.KeyCache_metadata.stride(3),
+        scaling,
+        attn_score,
+        attn_score.stride(0), attn_score.stride(1), attn_score.stride(2),
+        kv_cache.Sink_Count,
+        kv_cache.Q_Buffer_Count_K,
+        kv_cache.PageCount_K,
+        int(shared_page_count),
+        int(topk),
+        H_KV,
+        H_Q,
+        kv_cache.PAGE_SIZE,
+        D,
+        kv_cache.S,
+        kv_cache.D_BOOSTED,
+        MAX_KV_GROUP,
+    )
+    attn_score = nn.functional.softmax(attn_score, dim=-1, dtype=torch.float32).to(query.dtype)
+    attn_output = torch.empty((B, t_query, H_Q, D), dtype=query.dtype, device=query.device)
+    sv_sparse_kernel[grid](
+        attn_score,
+        attn_score.stride(0), attn_score.stride(1), attn_score.stride(2),
+        selected,
+        selected.stride(0), selected.stride(1), selected.stride(2),
+        kv_cache.Sink_Buffer_V,
+        kv_cache.Sink_Buffer_V.stride(0), kv_cache.Sink_Buffer_V.stride(1), kv_cache.Sink_Buffer_V.stride(2), kv_cache.Sink_Buffer_V.stride(3),
+        kv_cache.Q_Buffer_V,
+        kv_cache.Q_Buffer_V.stride(0), kv_cache.Q_Buffer_V.stride(1), kv_cache.Q_Buffer_V.stride(2), kv_cache.Q_Buffer_V.stride(3),
+        kv_cache.Local_Buffer_V,
+        kv_cache.Local_Buffer_V.stride(0), kv_cache.Local_Buffer_V.stride(1), kv_cache.Local_Buffer_V.stride(2), kv_cache.Local_Buffer_V.stride(3),
+        kv_cache.PageTable_V,
+        kv_cache.PageTable_V.stride(0), kv_cache.PageTable_V.stride(1),
+        kv_cache.ValueCache,
+        kv_cache.ValueCache.stride(0), kv_cache.ValueCache.stride(1),
+        kv_cache.ValueCache_metadata,
+        kv_cache.ValueCache_metadata.stride(0), kv_cache.ValueCache_metadata.stride(1), kv_cache.ValueCache_metadata.stride(2), kv_cache.ValueCache_metadata.stride(3),
+        attn_output,
+        attn_output.stride(0), attn_output.stride(1), attn_output.stride(2), attn_output.stride(3),
+        kv_cache.Sink_Count,
+        kv_cache.Q_Buffer_Count_V,
+        kv_cache.Local_Count_V,
+        kv_cache.Write_Offset_Local_V,
+        kv_cache.PageCount_V,
+        int(shared_page_count),
+        int(topk),
+        H_KV,
+        H_Q,
+        kv_cache.PAGE_SIZE,
+        D,
+        kv_cache.S,
+        MAX_KV_GROUP,
+    )
+    kv_cache.last_quest_path = "triton_sparse_forced_all_pages" if force and topk >= shared_page_count else "triton_sparse_reduced_budget"
+    kv_cache.last_sparse_qk_hits = B * H_KV
+    kv_cache.last_sparse_sv_hits = B * H_KV
+    kv_cache.last_sparse_qk_pages_loaded = int(topk + max(0, kv_cache.PageCount_K - shared_page_count))
+    kv_cache.last_sparse_sv_pages_loaded = int(topk + max(0, kv_cache.PageCount_V - shared_page_count))
+    return attn_output, None
+
+
 def kitty_attention_forward(
     module: nn.Module,
     query: torch.Tensor,
@@ -569,10 +1031,16 @@ def kitty_attention_forward(
     sparse_result = _quest_sparse_attention_torch(module, query, kv_cache, scaling)
     if sparse_result is not None:
         return sparse_result
+    sparse_result = _quest_sparse_attention_triton(module, query, kv_cache, scaling)
+    if sparse_result is not None:
+        return sparse_result
 
-    kv_cache.last_quest_path = "dense"
+    if getattr(kv_cache, "last_quest_path", None) not in {"dense_full_budget", "dense_skip_layer", "dense_no_shared_pages"}:
+        kv_cache.last_quest_path = "dense"
     kv_cache.last_sparse_qk_hits = 0
     kv_cache.last_sparse_sv_hits = 0
+    kv_cache.last_sparse_qk_pages_loaded = 0
+    kv_cache.last_sparse_sv_pages_loaded = 0
 
     #
     MAX_KV_GROUP = 16   # Tiling config for tl.dot()
