@@ -6,6 +6,7 @@ import gc
 import hashlib
 import json
 import os
+import re
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -109,6 +110,50 @@ def _safe_tag(value: str) -> str:
     return value.strip().replace("/", "_").replace(" ", "_")
 
 
+def _layout_slug(value: str) -> str:
+    slug = value.strip().lower().replace("/", "-").replace("_", "-")
+    slug = re.sub(r"[^a-z0-9.+-]+", "-", slug)
+    slug = re.sub(r"-+", "-", slug).strip("-")
+    return slug or "model"
+
+
+def model_layout_slug(model: str, model_path: str | None = None) -> str:
+    value = model.lower()
+    source = model_path or model
+    if any(token in value for token in ("llama-3.1-8b", "llama3.1-8b", "llama31-8b", "llama31_8b")):
+        return "llama31-8b-instruct"
+    if any(token in value for token in ("llama-3.2-1b", "llama3.2-1b", "llama32-1b", "llama32_1b")):
+        return "llama32-1b-instruct"
+    if "qwen3" in value and "8b" in value:
+        return "qwen3-8b"
+    if ("glm-4" in value or "glm4" in value) and "9b" in value:
+        return "glm4-9b-chat-1m"
+    if "deepseek" in value and "r1" in value and "distill" in value and "llama" in value and "8b" in value:
+        return "deepseek-r1-distill-llama-8b"
+    return _layout_slug(Path(source).name if source else "model")
+
+
+def method_layout_slug(variant: VariantConfig | str) -> str:
+    name = variant.name if isinstance(variant, VariantConfig) else str(variant)
+    return {
+        "kitty_page16": "quest-kitty",
+        "kitty": "kitty",
+        "kitty_pro": "kitty-pro",
+        "fp16": "fp16",
+        "kivi_2": "kivi-2",
+        "kivi_star_2": "kivi-star-2",
+        "custom": "custom-kitty",
+    }.get(name.lower(), _layout_slug(name))
+
+
+def default_prediction_dir(model: str, model_path: str | None, variant: VariantConfig, max_samples: int) -> Path:
+    model_slug = model_layout_slug(model, model_path)
+    method_slug = method_layout_slug(variant)
+    if max_samples > 0:
+        return Path("longbench_out") / "smoke" / f"{model_slug}-{method_slug}" / "pred"
+    return Path("longbench_out") / f"{model_slug}-{method_slug}" / "pred"
+
+
 def model_basename(model: str, model_path: str | None = None) -> str:
     source = model_path or model
     return _safe_tag(Path(source).name if source else "model")
@@ -116,6 +161,18 @@ def model_basename(model: str, model_path: str | None = None) -> str:
 
 def output_model_dir(output_dir: str | os.PathLike[str], model_tag: str, variant: VariantConfig) -> Path:
     return Path(output_dir) / f"{_safe_tag(model_tag)}-{variant.tag}"
+
+
+def resolve_prediction_dir(
+    output_dir: str | os.PathLike[str],
+    model_tag: str,
+    variant: VariantConfig,
+    *,
+    flat_output_dir: bool = False,
+) -> Path:
+    if flat_output_dir:
+        return Path(output_dir)
+    return output_model_dir(output_dir, model_tag, variant)
 
 
 def config_hash(payload: dict[str, Any]) -> str:
@@ -330,8 +387,19 @@ def run_longbench(args: Any) -> dict[str, Any]:
     variant = build_variant(args)
     model_family = args.model_family or infer_model_family(args.model_tag or args.model, args.model_path or args.model)
     model_tag = args.model_tag or model_basename(args.model, args.model_path)
-    output_root = "pred_e" if args.e and args.output_dir == "longbench_out/pred" else args.output_dir
-    pred_dir = output_model_dir(output_root, model_tag, variant)
+    output_root = args.output_dir
+    flat_output_dir = getattr(args, "flat_output_dir", False)
+    if output_root in (None, ""):
+        output_root = default_prediction_dir(args.model, args.model_path, variant, args.max_samples)
+        flat_output_dir = True
+    elif Path(output_root) == Path("longbench_out/pred"):
+        raise ValueError("longbench_out/pred is retired; use the normalized longbench_out/<model>-<method>/pred layout")
+    pred_dir = resolve_prediction_dir(
+        output_root,
+        model_tag,
+        variant,
+        flat_output_dir=flat_output_dir,
+    )
     dataset2prompt = load_json_config("dataset2prompt.json")
     dataset2maxlen = load_json_config("dataset2maxlen.json")
     model2maxlen = load_json_config("model2maxlen.json")

@@ -29,33 +29,23 @@ MAX_SAMPLES="${MAX_SAMPLES:--1}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-32768}"
 RUN_VARIANT="${RUN_VARIANT:-kitty}"
 
-KITTY_TAG_128="kitty_g128_b128_s32_sel1_k2_v2_pb4_pr0p125"
-KITTY_TAG_PAGE16="kitty_page16_g16_b16_s32_sel1_k2_v2_pb4_pr0p125"
-KITTY_TAG="${KITTY_TAG:-${KITTY_TAG_128}}"
-
 LLAMA_GPU="${LLAMA_GPU:-0}"
 LLAMA_MODEL_ID="${LLAMA_MODEL_ID:-meta-llama/Llama-3.1-8B-Instruct}"
 LLAMA_MODEL_PATH="${LLAMA_MODEL_PATH:-${KITTY_LLAMA31_8B_PATH:-${HOME}/models/Llama-3.1-8B-Instruct}}"
 LLAMA_MODEL_TAG="${LLAMA_MODEL_TAG:-llama31-8b-instruct-gpu0-full-32k}"
-LLAMA_OUTPUT_DIR="${LLAMA_OUTPUT_DIR:-longbench_out/llama31-8b-instruct/pred}"
-LLAMA_PRED_DIR="${LLAMA_OUTPUT_DIR}/${LLAMA_MODEL_TAG}-${KITTY_TAG}"
-LLAMA_REPORT_PREFIX="${LLAMA_REPORT_PREFIX:-longbench_out/llama31-8b-instruct/logs/report_full_32k}"
-LLAMA_DATASETS=(
-  narrativeqa qasper multifieldqa_en multifieldqa_zh
-  hotpotqa 2wikimqa musique dureader
-  gov_report qmsum multi_news vcsum
-  trec triviaqa samsum lsht
-  passage_retrieval_en passage_count passage_retrieval_zh
-  lcc repobench-p
-)
+LLAMA_OUTPUT_DIR="${LLAMA_OUTPUT_DIR:-longbench_out/llama31-8b-instruct-kitty/pred}"
+LLAMA_PRED_DIR="${LLAMA_OUTPUT_DIR}"
+LLAMA_REPORT_PREFIX="${LLAMA_REPORT_PREFIX:-longbench_out/llama31-8b-instruct-kitty/logs/report_full_32k}"
+LLAMA_DATASETS=(triviaqa samsum lsht passage_retrieval_en passage_count passage_retrieval_zh lcc repobench-p)
 
 LLAMA32_GPU="${LLAMA32_GPU:-1}"
 LLAMA32_MODEL_ID="${LLAMA32_MODEL_ID:-meta-llama/Llama-3.2-1B-Instruct}"
 LLAMA32_MODEL_PATH="${LLAMA32_MODEL_PATH:-${KITTY_LLAMA32_1B_PATH:-${HOME}/models/Llama-3.2-1B-Instruct}}"
 LLAMA32_MODEL_TAG_PREFIX="${LLAMA32_MODEL_TAG_PREFIX:-llama32-1b-instruct-gpu1-page16}"
-LLAMA32_OUTPUT_DIR="${LLAMA32_OUTPUT_DIR:-longbench_out/llama32-1b-instruct-page16-smoke/pred}"
-LLAMA32_REPORT_PREFIX="${LLAMA32_REPORT_PREFIX:-longbench_out/llama32-1b-instruct-page16-smoke/logs/report_page16}"
+LLAMA32_OUTPUT_DIR="${LLAMA32_OUTPUT_DIR:-longbench_out/smoke/llama32-1b-instruct-quest-kitty/pred}"
+LLAMA32_REPORT_PREFIX="${LLAMA32_REPORT_PREFIX:-longbench_out/smoke/llama32-1b-instruct-quest-kitty/logs/report_page16}"
 LLAMA32_VARIANT="${LLAMA32_VARIANT:-kitty_page16}"
+LLAMA32_MAX_GEN="${LLAMA32_MAX_GEN:-256}"
 LLAMA32_DATASETS=(
   narrativeqa qasper multifieldqa_en multifieldqa_zh
   hotpotqa 2wikimqa musique dureader
@@ -69,26 +59,26 @@ QWEN_GPU="${QWEN_GPU:-1}"
 QWEN_MODEL_ID="${QWEN_MODEL_ID:-Qwen/Qwen3-8B}"
 QWEN_MODEL_PATH="${QWEN_MODEL_PATH:-${KITTY_QWEN3_8B_PATH:-${HOME}/models/Qwen3-8B}}"
 QWEN_MODEL_TAG="${QWEN_MODEL_TAG:-qwen3-8b-gpu1-full-32k-gen2048}"
-QWEN_OUTPUT_DIR="${QWEN_OUTPUT_DIR:-longbench_out/qwen3-8b/pred}"
-QWEN_PRED_DIR="${QWEN_OUTPUT_DIR}/${QWEN_MODEL_TAG}-${KITTY_TAG}"
-QWEN_REPORT_PREFIX="${QWEN_REPORT_PREFIX:-longbench_out/qwen3-8b/logs/report_full_32k_gen2048}"
+QWEN_OUTPUT_DIR="${QWEN_OUTPUT_DIR:-longbench_out/qwen3-8b-kitty/pred}"
+QWEN_PRED_DIR="${QWEN_OUTPUT_DIR}"
+QWEN_REPORT_PREFIX="${QWEN_REPORT_PREFIX:-longbench_out/qwen3-8b-kitty/logs/report_full_32k_gen2048}"
 QWEN_DATASETS=(hotpotqa 2wikimqa musique dureader gov_report qmsum multi_news vcsum trec triviaqa samsum lsht passage_retrieval_en passage_count passage_retrieval_zh lcc repobench-p)
 
 GLM_GPU="${GLM_GPU:-2}"
 GLM_MODEL_ID="${GLM_MODEL_ID:-THUDM/GLM-4-9B-Chat-1M}"
 GLM_MODEL_PATH="${GLM_MODEL_PATH:-${KITTY_GLM4_9B_1M_PATH:-${HOME}/models/GLM-4-9B-Chat-1M}}"
 GLM_MODEL_TAG="${GLM_MODEL_TAG:-glm4-9b-chat-1m-gpu2-full-32k}"
-GLM_OUTPUT_DIR="${GLM_OUTPUT_DIR:-longbench_out/glm4-9b-chat-1m/pred}"
-GLM_PRED_DIR="${GLM_OUTPUT_DIR}/${GLM_MODEL_TAG}-${KITTY_TAG}"
-GLM_REPORT_PREFIX="${GLM_REPORT_PREFIX:-longbench_out/glm4-9b-chat-1m/logs/report_full_32k}"
+GLM_OUTPUT_DIR="${GLM_OUTPUT_DIR:-longbench_out/glm4-9b-chat-1m-kitty/pred}"
+GLM_PRED_DIR="${GLM_OUTPUT_DIR}"
+GLM_REPORT_PREFIX="${GLM_REPORT_PREFIX:-longbench_out/glm4-9b-chat-1m-kitty/logs/report_full_32k}"
 GLM_DATASETS=(vcsum trec triviaqa samsum lsht passage_retrieval_en passage_count passage_retrieval_zh lcc repobench-p)
 
 DEEPSEEK_GPU="${DEEPSEEK_GPU:-0}"
 DEEPSEEK_MODEL_ID="${DEEPSEEK_MODEL_ID:-deepseek-ai/DeepSeek-R1-Distill-Llama-8B}"
 DEEPSEEK_MODEL_PATH="${DEEPSEEK_MODEL_PATH:-${HOME}/models/DeepSeek-R1-Distill-Llama-8B}"
 DEEPSEEK_MODEL_TAG="${DEEPSEEK_MODEL_TAG:-deepseek-r1-distill-llama-8b}"
-DEEPSEEK_OUTPUT_DIR="${DEEPSEEK_OUTPUT_DIR:-longbench_out/pred}"
-DEEPSEEK_PRED_DIR="${DEEPSEEK_PRED_DIR:-${DEEPSEEK_OUTPUT_DIR}/${DEEPSEEK_MODEL_TAG}-${KITTY_TAG}}"
+DEEPSEEK_OUTPUT_DIR="${DEEPSEEK_OUTPUT_DIR:-longbench_out/deepseek-r1-distill-llama-8b-kitty/pred}"
+DEEPSEEK_PRED_DIR="${DEEPSEEK_PRED_DIR:-${DEEPSEEK_OUTPUT_DIR}}"
 DEEPSEEK_REPORT_PREFIX="${DEEPSEEK_REPORT_PREFIX:-logs/longbench/reports/deepseek_r1_distill_llama_8b_kitty}"
 DEEPSEEK_MAX_GEN="${DEEPSEEK_MAX_GEN:-1024}"
 DEEPSEEK_DATASETS=(lsht passage_retrieval_en passage_count passage_retrieval_zh lcc repobench-p)
@@ -334,9 +324,10 @@ run_eval_dataset() {
     --model-family "${model_family}"
     --variant "${RUN_VARIANT}"
     --dataset "${dataset}"
-    --data-root "${DATA_ROOT}"
-    --output-dir "${output_dir}"
-    --max-samples "${MAX_SAMPLES}"
+	    --data-root "${DATA_ROOT}"
+	    --output-dir "${output_dir}"
+	    --flat-output-dir
+	    --max-samples "${MAX_SAMPLES}"
     --max-model-len "${MAX_MODEL_LEN}"
     --torch-dtype float16
     --local-files-only
@@ -427,11 +418,7 @@ run_llama32() {
     sample_label="smoke${MAX_SAMPLES}"
   fi
   local model_tag="${LLAMA32_MODEL_TAG_PREFIX}-${sample_label}"
-  local variant_tag="${KITTY_TAG}"
-  if [[ "${LLAMA32_VARIANT}" == "kitty_page16" && "${KITTY_TAG}" == "${KITTY_TAG_128}" ]]; then
-    variant_tag="${KITTY_TAG_PAGE16}"
-  fi
-  local pred_dir="${LLAMA32_OUTPUT_DIR}/${model_tag}-${variant_tag}"
+  local pred_dir="${LLAMA32_OUTPUT_DIR}"
 
   RUN_VARIANT="${LLAMA32_VARIANT}" \
   run_model_loop \
@@ -443,7 +430,7 @@ run_llama32() {
     "${LLAMA32_OUTPUT_DIR}" \
     "${pred_dir}" \
     "${LLAMA32_REPORT_PREFIX}_${sample_label}" \
-    "" \
+    "${LLAMA32_MAX_GEN}" \
     "" \
     "${LLAMA32_DATASETS[@]}"
 }

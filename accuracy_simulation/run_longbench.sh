@@ -35,7 +35,11 @@ if [[ -z "${MODEL_PATH}" ]]; then
   esac
 fi
 DATA_ROOT="${DATA_ROOT:-${LONGBENCH_DATA_ROOT:-data/LongBench}}"
-OUTPUT_DIR="${OUTPUT_DIR:-longbench_out/pred}"
+OUTPUT_DIR="${OUTPUT_DIR:-}"
+if [[ "${OUTPUT_DIR}" == "longbench_out/pred" || "${OUTPUT_DIR}" == "${REPO_ROOT}/longbench_out/pred" ]]; then
+  echo -e "${RED}[error] longbench_out/pred is retired; use longbench_out/<model>-<method>/pred or omit OUTPUT_DIR for normalized defaults.${NC}" >&2
+  exit 2
+fi
 LOG_DIR="${LOG_DIR:-logs/longbench_gpu1}"
 MAX_SAMPLES="${MAX_SAMPLES:--1}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-}"
@@ -54,6 +58,84 @@ VARIANTS=("kitty")
 if [[ -n "${VARIANTS_CSV:-}" ]]; then
   IFS=',' read -r -a VARIANTS <<< "${VARIANTS_CSV}"
 fi
+
+slugify() {
+  local value="${1,,}"
+  value="${value//\//-}"
+  value="${value//_/-}"
+  value="$(printf '%s' "${value}" | sed -E 's/[^a-z0-9.+-]+/-/g; s/^-+//; s/-+$//; s/-+/-/g')"
+  printf '%s\n' "${value}"
+}
+
+model_layout_slug() {
+  local value="${MODEL,,}"
+  local source="${MODEL_PATH:-${MODEL}}"
+  case "${value}" in
+    *llama-3.1-8b*|*llama3.1-8b*|*llama31*8b*)
+      printf '%s\n' "llama31-8b-instruct"
+      ;;
+    *llama-3.2-1b*|*llama3.2-1b*|*llama32*1b*)
+      printf '%s\n' "llama32-1b-instruct"
+      ;;
+    *qwen3*8b*)
+      printf '%s\n' "qwen3-8b"
+      ;;
+    *glm-4-9b*|*glm4*9b*)
+      printf '%s\n' "glm4-9b-chat-1m"
+      ;;
+    *deepseek*r1*distill*llama*8b*)
+      printf '%s\n' "deepseek-r1-distill-llama-8b"
+      ;;
+    *)
+      slugify "$(basename "${source}")"
+      ;;
+  esac
+}
+
+method_layout_slug() {
+  case "${1,,}" in
+    kitty_page16)
+      printf '%s\n' "quest-kitty"
+      ;;
+    kitty)
+      printf '%s\n' "kitty"
+      ;;
+    kitty_pro)
+      printf '%s\n' "kitty-pro"
+      ;;
+    fp16)
+      printf '%s\n' "fp16"
+      ;;
+    kivi_2)
+      printf '%s\n' "kivi-2"
+      ;;
+    kivi_star_2)
+      printf '%s\n' "kivi-star-2"
+      ;;
+    custom)
+      printf '%s\n' "custom-kitty"
+      ;;
+    *)
+      slugify "$1"
+      ;;
+  esac
+}
+
+is_smoke_run() {
+  [[ "${MAX_SAMPLES}" =~ ^[0-9]+$ && "${MAX_SAMPLES}" -gt 0 ]]
+}
+
+default_output_dir_for_variant() {
+  local variant="$1"
+  local model_slug method_slug
+  model_slug="$(model_layout_slug)"
+  method_slug="$(method_layout_slug "${variant}")"
+  if is_smoke_run; then
+    printf 'longbench_out/smoke/%s-%s/pred\n' "${model_slug}" "${method_slug}"
+  else
+    printf 'longbench_out/%s-%s/pred\n' "${model_slug}" "${method_slug}"
+  fi
+}
 
 DATASETS=(
   "narrativeqa"
@@ -96,7 +178,7 @@ echo -e "MODEL_TAG: ${GREEN}${MODEL_TAG:-<auto>}${NC}"
 echo -e "MODEL_FAMILY: ${GREEN}${MODEL_FAMILY:-<auto>}${NC}"
 echo -e "PYTHON_BIN: ${GREEN}${PYTHON_BIN}${NC}"
 echo -e "DATA_ROOT: ${GREEN}${DATA_ROOT}${NC}"
-echo -e "OUTPUT_DIR: ${GREEN}${OUTPUT_DIR}${NC}"
+echo -e "OUTPUT_DIR: ${GREEN}${OUTPUT_DIR:-<normalized per variant>}${NC}"
 echo -e "VARIANTS: ${GREEN}${VARIANTS[*]}${NC}"
 echo -e "DATASETS: ${GREEN}${#DATASETS[@]}${NC}"
 echo -e "MAX_SAMPLES: ${GREEN}${MAX_SAMPLES}${NC}"
@@ -116,6 +198,7 @@ for variant in "${VARIANTS[@]}"; do
     COUNT=$((COUNT + 1))
     safe_variant="${variant//[^A-Za-z0-9_.-]/_}"
     safe_dataset="${dataset//[^A-Za-z0-9_.-]/_}"
+    effective_output_dir="${OUTPUT_DIR:-$(default_output_dir_for_variant "${variant}")}"
     report_json="${REPORT_DIR}/report_${safe_variant}_${safe_dataset}.json"
     log_file="${LOG_DIR}/eval_${safe_variant}_${safe_dataset}.log"
 
@@ -123,7 +206,8 @@ for variant in "${VARIANTS[@]}"; do
       --variant "${variant}"
       --dataset "${dataset}"
       --data-root "${DATA_ROOT}"
-      --output-dir "${OUTPUT_DIR}"
+      --output-dir "${effective_output_dir}"
+      --flat-output-dir
       --max-samples "${MAX_SAMPLES}"
       --prompt-token-reserve "${PROMPT_TOKEN_RESERVE}"
       --torch-dtype "${TORCH_DTYPE}"
@@ -162,7 +246,8 @@ done
 
 echo -e "${YELLOW}[score] scoring generated LongBench outputs${NC}"
 for pred_dir in "${!PRED_DIRS[@]}"; do
-  model_dir=$(basename "${pred_dir}")
+  model_dir="${pred_dir//\//_}"
+  model_dir="${model_dir//[^A-Za-z0-9_.-]/_}"
   score_log="${LOG_DIR}/score_${model_dir}.log"
   echo -e "${BLUE}[score]${NC} ${model_dir}"
   PYTHONPATH="${PWD}/src:${PYTHONPATH:-}" "${PYTHON_BIN}" -m kitty_sim.cli.score_longbench --model "${pred_dir}" > "${score_log}" 2>&1

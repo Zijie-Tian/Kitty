@@ -11,7 +11,7 @@ from kitty_sim.longbench.scorer import score_directory
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Score Kitty LongBench predictions.")
     parser.add_argument("--model", required=True, help="Model tag or prediction directory")
-    parser.add_argument("--output-dir", default="longbench_out/pred", help="Prediction root directory")
+    parser.add_argument("--output-dir", default=None, help="Optional prediction root for legacy model-tag lookup")
     parser.add_argument("--e", action="store_true", help="Evaluate on LongBench-E")
     parser.add_argument("--no-strict-complete", action="store_true", help="Allow scoring partial outputs")
     return parser

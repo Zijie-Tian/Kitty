@@ -4,8 +4,24 @@ This repo provides a Kitty-native LongBench path that mirrors the LUTAttn LongBe
 
 - local JSONL data under `<data-root>/data/{dataset}.jsonl`
 - LUTAttn-compatible prompt templates and generation lengths
-- LUTAttn-compatible output files: `longbench_out/pred/<model-tag>/<dataset>.jsonl`
-- strict scoring to `longbench_out/pred/<model-tag>/result.json`
+- LUTAttn-compatible output files directly under a normalized prediction dir
+- strict scoring to `<prediction-dir>/result.json`
+
+## Normalized output layout
+
+Do not use `longbench_out/pred` for new runs.
+
+- Smoke tests: `longbench_out/smoke/<model>-<method>/pred`
+- Full/non-smoke tests: `longbench_out/<model>-<method>/pred`
+- Prediction files live directly under `pred`: `<dataset>.jsonl`,
+  `<dataset>.manifest.json`, and `result.json`.
+- Do not create another `<model-tag>-<variant>` directory below `pred`.
+
+For example, LLaMA 3.1 8B with the QUEST-aligned Kitty proxy writes directly to:
+
+```text
+longbench_out/llama31-8b-instruct-quest-kitty/pred
+```
 
 ## Hard GPU constraint
 
@@ -35,10 +51,13 @@ MODEL_FAMILY="qwen" \
 VARIANTS_CSV="kitty" \
 MAX_SAMPLES=2 \
 MAX_MODEL_LEN=3500 \
+MAX_GEN=256 \
 LOCAL_FILES_ONLY=1 \
 OVERWRITE=1 \
 bash accuracy_simulation/run_longbench.sh
 ```
+
+This writes directly under `longbench_out/smoke/qwen3-8b-kitty/pred`.
 
 Use `VARIANTS_CSV="fp16,kitty"` only when you explicitly want both baseline and Kitty smoke runs on GPU1; this doubles runtime.
 
@@ -65,8 +84,11 @@ CUDA_VISIBLE_DEVICES=1 PYTHONPATH=src "${KITTY_PYTHON_BIN:-python}" -m kitty_sim
   --variant kitty \
   --dataset trec \
   --data-root "${LONGBENCH_DATA_ROOT}" \
+  --output-dir longbench_out/smoke/qwen3-8b-kitty/pred \
+  --flat-output-dir \
   --max-samples 2 \
   --max-model-len 3500 \
+  --max-gen 256 \
   --require-gpu1 \
   --overwrite
 ```
@@ -75,7 +97,7 @@ Then score:
 
 ```bash
 PYTHONPATH=src "${KITTY_PYTHON_BIN:-python}" -m kitty_sim.cli.score_longbench \
-  --model longbench_out/pred/qwen3-8b-gpu1-smoke2-kitty_g128_b128_s32_sel1_k2_v2_pb4_pr0p125
+  --model longbench_out/smoke/qwen3-8b-kitty/pred
 ```
 
 ## Completeness checks
