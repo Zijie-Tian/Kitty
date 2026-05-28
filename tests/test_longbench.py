@@ -9,7 +9,7 @@ import torch
 from kitty_sim.kitty_simulate import KittyKVCache, KittyKVCacheConfig
 from kitty_sim.longbench.scorer import score_directory
 from kitty_sim.longbench.templates import build_chat, format_longbench_prompt
-from kitty_sim.longbench.runner import build_variant
+from kitty_sim.longbench.runner import build_variant, default_prediction_dir, resolve_prediction_dir
 from kitty_sim.utils_quant import fake_quant_groupwise_lastdim
 
 
@@ -58,6 +58,33 @@ class LongBenchTests(unittest.TestCase):
         self.assertEqual(pro.promote_ratio, 0.25)
         self.assertEqual(kitty.sink_length, 32)
         self.assertEqual(kitty.group_size, 128)
+
+    def test_flat_prediction_dir_does_not_append_variant_subdir(self):
+        variant = build_variant(SimpleNamespace(variant="kitty_page16"))
+        self.assertEqual(
+            resolve_prediction_dir(
+                "longbench_out/llama31-8b-instruct-quest-kitty/pred",
+                "ignored",
+                variant,
+                flat_output_dir=True,
+            ),
+            Path("longbench_out/llama31-8b-instruct-quest-kitty/pred"),
+        )
+        self.assertEqual(
+            resolve_prediction_dir("longbench_out/root", "model-tag", variant).name,
+            f"model-tag-{variant.tag}",
+        )
+
+    def test_default_prediction_dir_uses_normalized_smoke_and_full_layout(self):
+        variant = build_variant(SimpleNamespace(variant="kitty_page16"))
+        self.assertEqual(
+            default_prediction_dir("meta-llama/Llama-3.1-8B-Instruct", None, variant, max_samples=1),
+            Path("longbench_out/smoke/llama31-8b-instruct-quest-kitty/pred"),
+        )
+        self.assertEqual(
+            default_prediction_dir("meta-llama/Llama-3.1-8B-Instruct", None, variant, max_samples=-1),
+            Path("longbench_out/llama31-8b-instruct-quest-kitty/pred"),
+        )
 
     def test_kitty_cache_accepts_short_prefill_without_assertion(self):
         cache = KittyKVCache(
