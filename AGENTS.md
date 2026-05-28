@@ -155,7 +155,8 @@ LongBench fake-quant accuracy proxy:
 ```bash
 GPU_IDS_CSV=1 \
 VARIANTS_CSV=kitty_page16 \
-MAX_MODEL_LEN=3500 \
+MAX_MODEL_LEN=32768 \
+MAX_GEN=256 \
 LOCAL_FILES_ONLY=1 \
 OVERWRITE=1 \
 bash accuracy_simulation/run_longbench.sh
@@ -206,7 +207,7 @@ find eval_results_gsm8k_gpu1 -name '*summary.json' -print | sort
 
 ## LongBench GPU1 workflow
 
-Use the Kitty-native LongBench runner added in this checkout. Full LongBench on GPU1 for LLaMA3.1-8B-Instruct:
+Use the Kitty-native LongBench runner added in this checkout. Unless a task explicitly asks for a shorter smoke/proxy run, LongBench runs in this checkout must use `MAX_MODEL_LEN=32768` (32k context) and `MAX_GEN=256`. Do not use the old `MAX_MODEL_LEN=3500` default for full LongBench commands. LongBench outputs must use a flat path convention `longbench_out/pref/<model>-<tag>/`; do not nest under extra model-specific `.../pred/` subdirectories such as `longbench_out/<model>/pred/<model>-<tag>/`. Set each script's `*_OUTPUT_DIR=longbench_out/pref` and choose a unique `*_MODEL_TAG` / `*_MODEL_TAG_PREFIX` so the final directory is exactly one `<model>-<tag>` leaf. Full LongBench on GPU1 for LLaMA3.1-8B-Instruct:
 
 ```bash
 GPU_IDS_CSV=1 \
@@ -215,7 +216,8 @@ MODEL_TAG=llama31-8b-instruct-gpu1-full \
 MODEL_FAMILY=llama3 \
 VARIANTS_CSV=kitty \
 MAX_SAMPLES=-1 \
-MAX_MODEL_LEN=3500 \
+MAX_MODEL_LEN=32768 \
+MAX_GEN=256 \
 LOCAL_FILES_ONLY=1 \
 OVERWRITE=1 \
 bash accuracy_simulation/run_longbench.sh

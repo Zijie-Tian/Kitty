@@ -122,12 +122,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--warmup_runs",            type=int, default=2,                help="Number of warmup runs")
     parser.add_argument("--repeat_runs",            type=int, default=3,                help="Number of repeat runs for benchmarking")
     parser.add_argument("--page_size",              type=int, default=128,              help="Kitty KV-cache page size. Keep 128 for the paper default; use 16 for QUEST-aligned experiments.")
+    parser.add_argument("--promote_ratio",          type=float, default=0.125,            help="Fraction of key-cache channels promoted to INT4. Use 0.125 for paper Kitty; 0.25 for Kitty-Pro.")
+    parser.add_argument("--quest-enabled",          action="store_true",                 help="Enable correctness-first QUEST sparse page selection in the Kitty cache.")
+    parser.add_argument("--quest-topk-pages",       type=int, default=None,               help="QUEST sparse page budget in page16 logical pages.")
+    parser.add_argument("--quest-token-budget",     type=int, default=None,               help="QUEST sparse token budget; converted to pages by the cache page size.")
+    parser.add_argument("--quest-skip-layers",      type=int, default=2,                  help="Disable QUEST sparse selection for the first N layers.")
+    parser.add_argument("--force-sparse-for-equivalence", action="store_true",           help="Force sparse all-pages path for dense-equivalence tests.")
     return parser
 
 
-def benchmark_kitty(model: PreTrainedModel, tokenizer: AutoTokenizer, inputs: dict, max_seq_len, model_config: PretrainedConfig, warmup_runs: int, repeat_runs: int, page_size: int) -> None:
+def benchmark_kitty(model: PreTrainedModel, tokenizer: AutoTokenizer, inputs: dict, max_seq_len, model_config: PretrainedConfig, warmup_runs: int, repeat_runs: int, page_size: int, promote_ratio: float, quest_enabled: bool = False, quest_topk_pages: int | None = None, quest_token_budget: int | None = None, quest_skip_layers: int = 2, force_sparse_for_equivalence: bool = False) -> None:
     max_batch_size = inputs.input_ids.size(0)
     print(f"Kitty page_size: {page_size}")
+    print(f"Kitty promote_ratio: {promote_ratio}")
+    print(f"Kitty QUEST: enabled={quest_enabled}, topk_pages={quest_topk_pages}, token_budget={quest_token_budget}, skip_layers={quest_skip_layers}, force_sparse_for_equivalence={force_sparse_for_equivalence}")
     # Warm up
     for _ in range(warmup_runs):
         kitty_kv_cache = get_kvcache_kitty(
@@ -135,6 +143,12 @@ def benchmark_kitty(model: PreTrainedModel, tokenizer: AutoTokenizer, inputs: di
             max_batch_size,
             max_seq_len,
             page_size=page_size,
+            promote_ratio=promote_ratio,
+            quest_enabled=quest_enabled,
+            quest_topk_pages=quest_topk_pages,
+            quest_token_budget=quest_token_budget,
+            quest_skip_layers=quest_skip_layers,
+            force_sparse_for_equivalence=force_sparse_for_equivalence,
         )
         outputs = model.generate(
             input_ids=inputs.input_ids.cuda(),
@@ -163,6 +177,12 @@ def benchmark_kitty(model: PreTrainedModel, tokenizer: AutoTokenizer, inputs: di
             max_batch_size,
             max_seq_len,
             page_size=page_size,
+            promote_ratio=promote_ratio,
+            quest_enabled=quest_enabled,
+            quest_topk_pages=quest_topk_pages,
+            quest_token_budget=quest_token_budget,
+            quest_skip_layers=quest_skip_layers,
+            force_sparse_for_equivalence=force_sparse_for_equivalence,
         )
         outputs = model.generate(
             input_ids=inputs.input_ids.cuda(),
@@ -322,7 +342,22 @@ def main() -> None:
     else:
         assert args.cache_implementation == 0
         print("Using Kitty KV cache implementation.")
-        benchmark_kitty(model, tokenizer, inputs, args.max_seq_len, config, args.warmup_runs, args.repeat_runs, args.page_size)
+        benchmark_kitty(
+            model,
+            tokenizer,
+            inputs,
+            args.max_seq_len,
+            config,
+            args.warmup_runs,
+            args.repeat_runs,
+            args.page_size,
+            args.promote_ratio,
+            quest_enabled=args.quest_enabled,
+            quest_topk_pages=args.quest_topk_pages,
+            quest_token_budget=args.quest_token_budget,
+            quest_skip_layers=args.quest_skip_layers,
+            force_sparse_for_equivalence=args.force_sparse_for_equivalence,
+        )
 
     #
     model.to("cpu")

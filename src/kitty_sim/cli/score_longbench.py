@@ -17,12 +17,28 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def resolve_model_dir(model: str, output_dir: str, *, is_longbench_e: bool = False) -> Path:
+    """Resolve a model tag or explicit prediction directory for scoring.
+
+    Strings containing a path separator, or absolute paths, are treated as
+    explicit directories. Only bare model tags are resolved relative to the
+    prediction root. This avoids turning ``longbench_out/pref/foo`` into
+    ``longbench_out/pred/longbench_out/pref/foo`` when callers use the newer
+    flat output convention.
+    """
+
+    model_dir = Path(model).expanduser()
+    if model_dir.is_absolute() or len(model_dir.parts) > 1:
+        return model_dir
+    if model_dir.exists():
+        return model_dir
+    root = Path("pred_e" if is_longbench_e else output_dir)
+    return root / model_dir
+
+
 def main() -> None:
     args = build_parser().parse_args()
-    model_dir = Path(args.model)
-    if not model_dir.exists():
-        root = Path("pred_e" if args.e else args.output_dir)
-        model_dir = root / args.model
+    model_dir = resolve_model_dir(args.model, args.output_dir, is_longbench_e=args.e)
     scores = score_directory(model_dir, is_longbench_e=args.e, strict_complete=not args.no_strict_complete)
     print(f"[score] wrote {model_dir / 'result.json'}")
     print(scores)

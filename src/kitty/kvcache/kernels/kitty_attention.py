@@ -400,6 +400,158 @@ def sv_kernel(
 
 
 
+def _unpack_int2(values: torch.Tensor, count: int) -> torch.Tensor:
+    shifts = (torch.arange(count, device=values.device, dtype=torch.int64) % 4) * 2
+    packed = values.index_select(0, torch.arange(count, device=values.device, dtype=torch.int64) // 4).long()
+    return ((packed >> shifts) & 0x3).to(torch.float32)
+
+
+def _dequantize_k_page_torch(kv_cache: KVCache_Layer, batch_idx: int, head_idx: int, logical_page: int) -> torch.Tensor:
+    page_id = int(kv_cache.PageTable_K[batch_idx, logical_page].item())
+    page_size = kv_cache.PAGE_SIZE
+    d = kv_cache.D
+    d_boost = kv_cache.D_BOOSTED
+    k_stride_d = page_size * 2 // 8
+    k_stride_h = k_stride_d * (d + d_boost) + d
+    k_off_hi = k_stride_d * d
+    k_off_idx = k_stride_d * (d + d_boost)
+    base = kv_cache.KeyCache[page_id]
+    head_base = head_idx * k_stride_h
+    meta = kv_cache.KeyCache_metadata[page_id, head_idx]
+    out = torch.empty((page_size, d), dtype=torch.float32, device=base.device)
+    for ch in range(d):
+        boost_idx = int(base[head_base + k_off_idx + ch].item())
+        low = _unpack_int2(base[head_base + ch * k_stride_d : head_base + (ch + 1) * k_stride_d], page_size)
+        if boost_idx < d_boost:
+            high = _unpack_int2(base[head_base + k_off_hi + boost_idx * k_stride_d : head_base + k_off_hi + (boost_idx + 1) * k_stride_d], page_size)
+            q = low + high * 4.0
+        else:
+            q = low
+        out[:, ch] = q * meta[ch, 0].float() + meta[ch, 1].float()
+    return out.to(torch.float16)
+
+
+def _dequantize_v_page_torch(kv_cache: KVCache_Layer, batch_idx: int, head_idx: int, logical_page: int) -> torch.Tensor:
+    page_id = int(kv_cache.PageTable_V[batch_idx, logical_page].item())
+    page_size = kv_cache.PAGE_SIZE
+    d = kv_cache.D
+    v_stride_t = d * 2 // 8
+    v_stride_h = v_stride_t * page_size
+    base = kv_cache.ValueCache[page_id]
+    head_base = head_idx * v_stride_h
+    meta = kv_cache.ValueCache_metadata[page_id, head_idx]
+    out = torch.empty((page_size, d), dtype=torch.float32, device=base.device)
+    shifts = (torch.arange(d, device=base.device, dtype=torch.int64) % 4) * 2
+    packs = torch.arange(d, device=base.device, dtype=torch.int64) // 4
+    for t in range(page_size):
+        packed = base[head_base + t * v_stride_t + packs].long()
+        q = ((packed >> shifts) & 0x3).float()
+        out[t] = q * meta[t, 0].float() + meta[t, 1].float()
+    return out.to(torch.float16)
+
+
+def _local_v_logical_torch(kv_cache: KVCache_Layer, batch_idx: int, head_idx: int) -> torch.Tensor:
+    count = kv_cache.Local_Count_V
+    if count == 0:
+        return kv_cache.Local_Buffer_V.new_empty((0, kv_cache.D))
+    offsets = (torch.arange(count, device=kv_cache.Local_Buffer_V.device) + kv_cache.Write_Offset_Local_V) % kv_cache.PAGE_SIZE
+    return kv_cache.Local_Buffer_V[batch_idx, head_idx].index_select(0, offsets.long())
+
+
+def _select_quest_pages_torch(query: torch.Tensor, kv_cache: KVCache_Layer, shared_page_count: int, topk_pages: int) -> torch.Tensor:
+    B, H_Q, _t, D = query.shape
+    H_KV = kv_cache.H_KV
+    group = H_Q // H_KV
+    scores = torch.empty((B, H_KV, shared_page_count), dtype=torch.float32, device=query.device)
+    for b in range(B):
+        for hkv in range(H_KV):
+            q_group = query[b, hkv * group : (hkv + 1) * group, 0, :].float()
+            for p in range(shared_page_count):
+                k_page = _dequantize_k_page_torch(kv_cache, b, hkv, p).float()
+                page_min = k_page.amin(dim=0)
+                page_max = k_page.amax(dim=0)
+                bound = torch.maximum(q_group * page_min, q_group * page_max).sum(dim=-1)
+                scores[b, hkv, p] = bound.max()
+    if topk_pages >= shared_page_count:
+        return torch.arange(shared_page_count, device=query.device, dtype=torch.long).view(1, 1, -1).expand(B, H_KV, -1).clone()
+    # deterministic tie break via CPU sort; top-k is tiny in the debug/smoke path.
+    selected = torch.empty((B, H_KV, topk_pages), dtype=torch.long, device=query.device)
+    cpu_scores = scores.detach().cpu()
+    for b in range(B):
+        for h in range(H_KV):
+            order = sorted(range(shared_page_count), key=lambda idx: (-float(cpu_scores[b, h, idx]), idx))
+            selected[b, h] = torch.tensor(sorted(order[:topk_pages]), device=query.device, dtype=torch.long)
+    return selected
+
+
+def _quest_sparse_attention_torch(module: nn.Module, query: torch.Tensor, kv_cache: KVCache_Layer, scaling: float):
+    cfg = getattr(kv_cache, "quest_config", None)
+    if cfg is None or not getattr(cfg, "enabled", False):
+        return None
+    layer_idx = getattr(kv_cache, "layer_idx", 0)
+    if layer_idx < getattr(cfg, "skip_layers", 0):
+        kv_cache.last_quest_path = "dense_skip_layer"
+        return None
+    B, H_Q, t_query, D = query.size()
+    if t_query != 1 or kv_cache.PAGE_SIZE <= 0:
+        return None
+    shared_page_count = min(kv_cache.PageCount_K, kv_cache.PageCount_V)
+    kv_cache.last_shared_page_count = int(shared_page_count)
+    if shared_page_count <= 0:
+        kv_cache.last_quest_path = "dense_no_shared_pages"
+        return None
+    topk = getattr(cfg, "topk_pages", None)
+    token_budget = getattr(cfg, "token_budget", None)
+    if topk is None and token_budget is not None:
+        topk = (int(token_budget) + kv_cache.PAGE_SIZE - 1) // kv_cache.PAGE_SIZE
+    if topk is None:
+        topk = shared_page_count
+    topk = max(0, min(int(topk), int(shared_page_count)))
+    force = bool(getattr(cfg, "force_sparse_for_equivalence", False))
+    if topk >= shared_page_count and not force:
+        kv_cache.last_quest_path = "dense_full_budget"
+        return None
+    selected = _select_quest_pages_torch(query, kv_cache, int(shared_page_count), topk)
+    kv_cache.last_selected_pages = selected.detach().clone()
+    kv_cache.last_selected_pages_shape = tuple(selected.shape)
+    kv_cache.last_selected_tokens = int(topk * kv_cache.PAGE_SIZE)
+    kv_cache.last_quest_path = "sparse_forced_all_pages" if force and topk >= shared_page_count else "sparse_reduced_budget"
+    kv_cache.last_sparse_qk_hits = B * kv_cache.H_KV
+    kv_cache.last_sparse_sv_hits = B * kv_cache.H_KV
+
+    group = H_Q // kv_cache.H_KV
+    output = torch.empty((B, t_query, H_Q, D), dtype=query.dtype, device=query.device)
+    for b in range(B):
+        for hq in range(H_Q):
+            hkv = hq // group
+            k_parts = []
+            v_parts = []
+            if kv_cache.Sink_Count:
+                k_parts.append(kv_cache.Sink_Buffer_K[b, hkv, : kv_cache.Sink_Count])
+                v_parts.append(kv_cache.Sink_Buffer_V[b, hkv, : kv_cache.Sink_Count])
+            for page in selected[b, hkv].tolist():
+                k_parts.append(_dequantize_k_page_torch(kv_cache, b, hkv, int(page)))
+                v_parts.append(_dequantize_v_page_torch(kv_cache, b, hkv, int(page)))
+            for page in range(int(shared_page_count), kv_cache.PageCount_K):
+                k_parts.append(_dequantize_k_page_torch(kv_cache, b, hkv, page))
+            if kv_cache.Q_Buffer_Count_K:
+                k_parts.append(kv_cache.Q_Buffer_K[b, hkv, : kv_cache.Q_Buffer_Count_K])
+            for page in range(int(shared_page_count), kv_cache.PageCount_V):
+                v_parts.append(_dequantize_v_page_torch(kv_cache, b, hkv, page))
+            if kv_cache.Q_Buffer_Count_V:
+                v_parts.append(kv_cache.Q_Buffer_V[b, hkv, : kv_cache.Q_Buffer_Count_V])
+            if kv_cache.Local_Count_V:
+                v_parts.append(_local_v_logical_torch(kv_cache, b, hkv))
+            k_support = torch.cat(k_parts, dim=0).to(query.dtype)
+            v_support = torch.cat(v_parts, dim=0).to(query.dtype)
+            if k_support.shape[0] != v_support.shape[0]:
+                raise RuntimeError(f"QUEST sparse support mismatch: K={k_support.shape[0]} V={v_support.shape[0]}")
+            logits = torch.matmul(query[b, hq, 0].float(), k_support.float().transpose(0, 1)) * scaling
+            weights = torch.softmax(logits, dim=-1).to(query.dtype)
+            output[b, 0, hq] = torch.matmul(weights, v_support).to(query.dtype)
+    return output, None
+
+
 def kitty_attention_forward(
     module: nn.Module,
     query: torch.Tensor,
@@ -413,6 +565,14 @@ def kitty_attention_forward(
     assert H_Q == module.num_attention_heads, "H_Q must match num_attention_heads."
     H_KV = module.num_key_value_heads
     KV_GROUP = H_Q // H_KV
+
+    sparse_result = _quest_sparse_attention_torch(module, query, kv_cache, scaling)
+    if sparse_result is not None:
+        return sparse_result
+
+    kv_cache.last_quest_path = "dense"
+    kv_cache.last_sparse_qk_hits = 0
+    kv_cache.last_sparse_sv_hits = 0
 
     #
     MAX_KV_GROUP = 16   # Tiling config for tl.dot()

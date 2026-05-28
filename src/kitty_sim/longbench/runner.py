@@ -54,9 +54,13 @@ def build_variant(args: Any) -> VariantConfig:
         return VariantConfig(name="fp16", use_kitty=False, promote_ratio=0.0)
     if variant == "kitty":
         return VariantConfig(name="kitty", use_kitty=True, promote_ratio=0.125)
-    if variant == "kitty_page16":
+    if variant in {"kitty_page16", "quest_proxy_kitty_page16"}:
+        # quest_proxy_kitty_page16 is intentionally the existing fake-quant
+        # page16 accuracy proxy with a QUEST-labelled output tag. Do not expose
+        # a true QUEST/Kitty kernel variant here until a query-aware cache route
+        # exists in the runtime path.
         return VariantConfig(
-            name="kitty_page16",
+            name=variant,
             use_kitty=True,
             sink_length=32,
             buffer_length=16,

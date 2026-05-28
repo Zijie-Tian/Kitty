@@ -64,12 +64,53 @@ class RealKittyPage16Tests(unittest.TestCase):
         self.assertEqual(page16_layer.MAX_PAGE, math.ceil(96 / 16))
         self.assertEqual(page16_layer.Q_Buffer_K.shape, (1, 1, 16, 16))
         self.assertEqual(page16_layer.Local_Buffer_V.shape, (1, 1, 16, 16))
-        self.assertEqual(page16_layer.bytes_per_page_K, 96)
+        self.assertEqual(page16_cache.promote_ratio, 0.125)
+        self.assertEqual(page16_cache.d_boosted, 2)
+        self.assertEqual(page16_layer.D_BOOSTED, 2)
+        self.assertEqual(page16_layer.bytes_per_page_K, 88)
         self.assertEqual(page16_layer.bytes_per_page_V, 64)
+
+        pro_cache = get_kvcache_kitty(
+            _tiny_config(),
+            max_batch_size=1,
+            max_length=96,
+            page_size=16,
+            promote_ratio=0.25,
+        )
+        pro_layer = pro_cache.kv_cache[0]
+        self.assertEqual(pro_cache.promote_ratio, 0.25)
+        self.assertEqual(pro_cache.d_boosted, 4)
+        self.assertEqual(pro_layer.D_BOOSTED, 4)
+        self.assertEqual(pro_layer.bytes_per_page_K, 96)
+        self.assertEqual(pro_layer.bytes_per_page_V, 64)
         self.assertEqual(page16_cache.max_batch_size, 1)
         self.assertEqual(page16_cache.max_cache_len, 96)
         self.assertEqual(page16_cache.get_max_cache_shape(), 96)
         self.assertEqual(page16_cache.get_mask_sizes(torch.arange(5, device="cuda"), 0), (5, 0))
+
+    def test_real_kittycache_promote_ratio_defaults_to_0p125(self):
+        cache = self._new_cache(max_length=96, page_size=16)
+        self.assertEqual(cache.promote_ratio, 0.125)
+        self.assertEqual(cache.d_boosted, int(16 * 0.125 + 1e-6))
+        self.assertEqual(cache.kv_cache[0].D_BOOSTED, cache.d_boosted)
+
+    def test_real_kittycache_kitty_pro_promote_ratio_0p25(self):
+        assert get_kvcache_kitty is not None
+        cache = get_kvcache_kitty(
+            _tiny_config(),
+            max_batch_size=1,
+            max_length=96,
+            page_size=16,
+            promote_ratio=0.25,
+        )
+        self.assertEqual(cache.promote_ratio, 0.25)
+        self.assertEqual(cache.d_boosted, int(16 * 0.25 + 1e-6))
+        self.assertEqual(cache.kv_cache[0].D_BOOSTED, cache.d_boosted)
+
+    def test_invalid_promote_ratio_is_rejected(self):
+        assert get_kvcache_kitty is not None
+        with self.assertRaisesRegex(ValueError, "promote_ratio"):
+            get_kvcache_kitty(_tiny_config(), max_batch_size=1, max_length=96, promote_ratio=1.5)
 
     def test_invalid_page_size_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "multiple of 4"):

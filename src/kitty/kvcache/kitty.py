@@ -19,7 +19,23 @@ from transformers.configuration_utils import PretrainedConfig
 #
 from .kernels.kitty_quant_pack import quantize_pack_k, quantize_pack_v
 from .utils_kv_per_layer import KVCache_Layer
-        
+
+
+@dataclass(frozen=True)
+class QuestConfig:
+    """Runtime controls for query-aware QUEST selection over Kitty pages.
+
+    The first implementation uses a correctness-first PyTorch sparse path for
+    page16. It selects logical quantized middle pages and consumes Kitty's
+    quantized K/V cache for the selected support.
+    """
+
+    enabled: bool = False
+    topk_pages: int | None = None
+    token_budget: int | None = None
+    skip_layers: int = 2
+    force_sparse_for_equivalence: bool = False
+
 
 class KittyCache(Cache):
     """
@@ -33,6 +49,13 @@ class KittyCache(Cache):
         max_batch_size: int,
         max_length: int,
         page_size: int = 128,
+        promote_ratio: float = 0.125,
+        quest_config: QuestConfig | None = None,
+        quest_enabled: bool = False,
+        quest_topk_pages: int | None = None,
+        quest_token_budget: int | None = None,
+        quest_skip_layers: int = 2,
+        force_sparse_for_equivalence: bool = False,
     ) -> None:
         try:
             # transformers>=4.57 requires explicit layer storage at Cache init time.
@@ -48,15 +71,25 @@ class KittyCache(Cache):
         self.head_dim = config.head_dim
         self.num_key_value_heads = config.num_key_value_heads
         ######################## Kitty Specific Configurations ########################
+        if not math.isfinite(promote_ratio) or not 0 <= promote_ratio <= 1:
+            raise ValueError(f"promote_ratio must be finite and in [0, 1]; got {promote_ratio}.")
         self.page_size = page_size              # PAGE_SIZE=128 by default; page_size=16 for QUEST-aligned experiments.
-        self.d_boosted = self.head_dim // 4     # 25% channels are boosted to INT4
+        self.promote_ratio = promote_ratio      # 0.125 for paper Kitty; 0.25 for Kitty-Pro.
+        self.d_boosted = int(self.head_dim * promote_ratio + 1e-6)
+        self.quest_config = quest_config or QuestConfig(
+            enabled=quest_enabled,
+            topk_pages=quest_topk_pages,
+            token_budget=quest_token_budget,
+            skip_layers=quest_skip_layers,
+            force_sparse_for_equivalence=force_sparse_for_equivalence,
+        )
         self.sink_length = 32                   # SINK_LENGTH=32
         self.low_bit = 2                        # LOW_BIT=2
         self.high_bit = 4                       # HIGH_BIT=4
         ###################################################################################
         # Initialize KV Cache for each layer
-        for _ in range(self.num_hidden_layers):
-            self.kv_cache.append(KVCache_Layer(
+        for layer_idx in range(self.num_hidden_layers):
+            layer = KVCache_Layer(
                 MAX_BS = max_batch_size,
                 MAX_LEN = max_length,
                 H_KV = self.num_key_value_heads,
@@ -66,7 +99,10 @@ class KittyCache(Cache):
                 HIGH_BIT = self.high_bit,
                 PAGE_SIZE = self.page_size,
                 S = self.sink_length
-            ))
+            )
+            layer.layer_idx = layer_idx
+            layer.quest_config = self.quest_config
+            self.kv_cache.append(layer)
 
     def update(
         self,
@@ -277,7 +313,14 @@ def get_kvcache_kitty(
         config: PretrainedConfig,
         max_batch_size: int,
         max_length: int,
-        page_size: int = 128,) -> KittyCache:
+        page_size: int = 128,
+        promote_ratio: float = 0.125,
+        quest_config: QuestConfig | None = None,
+        quest_enabled: bool = False,
+        quest_topk_pages: int | None = None,
+        quest_token_budget: int | None = None,
+        quest_skip_layers: int = 2,
+        force_sparse_for_equivalence: bool = False,) -> KittyCache:
     """
     Get the KittyCache object.
     Returns:
@@ -289,4 +332,11 @@ def get_kvcache_kitty(
         max_batch_size=max_batch_size,
         max_length=max_length,
         page_size=page_size,
+        promote_ratio=promote_ratio,
+        quest_config=quest_config,
+        quest_enabled=quest_enabled,
+        quest_topk_pages=quest_topk_pages,
+        quest_token_budget=quest_token_budget,
+        quest_skip_layers=quest_skip_layers,
+        force_sparse_for_equivalence=force_sparse_for_equivalence,
     )

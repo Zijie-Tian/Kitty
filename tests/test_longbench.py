@@ -3,14 +3,19 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
+import sys
 
 import torch
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from kitty_sim.kitty_simulate import KittyKVCache, KittyKVCacheConfig
+from kitty_sim.cli.eval_longbench import build_parser
 from kitty_sim.longbench.scorer import score_directory
 from kitty_sim.longbench.templates import build_chat, format_longbench_prompt
-from kitty_sim.longbench.runner import build_variant
+from kitty_sim.longbench.runner import build_variant, output_model_dir
 from kitty_sim.utils_quant import fake_quant_groupwise_lastdim
+from latency_benchmarking.benchmark_kitty import build_parser as build_latency_parser
 
 
 class DummyEncoding:
@@ -65,6 +70,64 @@ class LongBenchTests(unittest.TestCase):
         self.assertEqual(page16.group_size, 16)
         self.assertEqual(page16.promote_ratio, 0.125)
         self.assertIn("g16_b16_s32", page16.tag)
+
+    def test_quest_proxy_page16_variant_uses_proxy_name(self):
+        variant = build_variant(SimpleNamespace(variant="quest_proxy_kitty_page16"))
+
+        self.assertTrue(variant.use_kitty)
+        self.assertEqual(variant.name, "quest_proxy_kitty_page16")
+        self.assertEqual(variant.sink_length, 32)
+        self.assertEqual(variant.buffer_length, 16)
+        self.assertEqual(variant.group_size, 16)
+        self.assertTrue(variant.tag.startswith("quest_proxy_kitty_page16_"))
+
+    def test_output_model_dir_uses_quest_proxy_page16_variant_tag(self):
+        variant = build_variant(SimpleNamespace(variant="quest_proxy_kitty_page16"))
+
+        pred_dir = output_model_dir("longbench_out/pred", "qwen3-8b-gpu1-smoke2", variant)
+
+        self.assertEqual(
+            pred_dir.name,
+            "qwen3-8b-gpu1-smoke2-quest_proxy_kitty_page16_g16_b16_s32_sel1_k2_v2_pb4_pr0p125",
+        )
+
+    def test_longbench_cli_accepts_quest_proxy_page16_variant(self):
+        args = build_parser().parse_args(["Qwen/Qwen3-8B", "--variant", "quest_proxy_kitty_page16"])
+
+        self.assertEqual(args.variant, "quest_proxy_kitty_page16")
+
+    def test_longbench_cli_rejects_unimplemented_quest_kernel_variant(self):
+        with self.assertRaises(SystemExit):
+            build_parser().parse_args(["Qwen/Qwen3-8B", "--variant", "quest_kitty_page16_kernel"])
+
+    def test_latency_parser_accepts_page16_smoke_plumbing(self):
+        args = build_latency_parser().parse_args(
+            [
+                "--cache_implementation",
+                "0",
+                "--page_size",
+                "16",
+                "--warmup_runs",
+                "1",
+                "--repeat_runs",
+                "1",
+                "--batch_size",
+                "1",
+                "--promote_ratio",
+                "0.125",
+                "--quest-enabled",
+                "--quest-token-budget",
+                "2048",
+                "--quest-skip-layers",
+                "2",
+            ]
+        )
+
+        self.assertEqual(args.page_size, 16)
+        self.assertEqual(args.promote_ratio, 0.125)
+        self.assertTrue(args.quest_enabled)
+        self.assertEqual(args.quest_token_budget, 2048)
+        self.assertEqual(args.quest_skip_layers, 2)
 
     def test_kitty_cache_accepts_short_prefill_without_assertion(self):
         cache = KittyKVCache(

@@ -89,6 +89,17 @@ class KVCache_Layer:
         )
         self.Local_Count_V = 0
         self.Write_Offset_Local_V = 0       # To track the write offset in the local buffer, circular buffer.
+        # QUEST sparse debug/evidence fields. They are written by the optional
+        # correctness-first sparse attention path and ignored by dense Kitty.
+        self.layer_idx = 0
+        self.quest_config = None
+        self.last_quest_path = "dense"
+        self.last_selected_pages_shape = None
+        self.last_shared_page_count = 0
+        self.last_selected_pages = None
+        self.last_selected_tokens = 0
+        self.last_sparse_qk_hits = 0
+        self.last_sparse_sv_hits = 0
         # Legacy for compatibility of prefills
         self.key_states: Optional[torch.Tensor] = None
         self.value_states: Optional[torch.Tensor] = None

@@ -15,7 +15,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-path", default=None, help="Override model path for loading")
     parser.add_argument("--model-tag", default=None, help="Output model tag (variant suffix is added automatically)")
     parser.add_argument("--model-family", default=None, help="Prompt family override, e.g. qwen, llama3, llama2")
-    parser.add_argument("--variant", default="kitty", choices=["fp16", "kitty", "kitty_page16", "kitty_pro", "kivi_2", "kivi_star_2", "custom"])
+    parser.add_argument(
+        "--variant",
+        default="kitty",
+        choices=[
+            "fp16",
+            "kitty",
+            "kitty_page16",
+            "quest_proxy_kitty_page16",
+            "kitty_pro",
+            "kivi_2",
+            "kivi_star_2",
+            "custom",
+        ],
+    )
     parser.add_argument("--dataset", default=None, help="Run one LongBench dataset only")
     parser.add_argument("--e", action="store_true", help="Evaluate LongBench-E")
     parser.add_argument("--data-root", default=None, help="LongBench root containing data/*.jsonl")

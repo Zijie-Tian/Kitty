@@ -40,7 +40,14 @@ LLAMA_MODEL_TAG="${LLAMA_MODEL_TAG:-llama31-8b-instruct-gpu0-full-32k}"
 LLAMA_OUTPUT_DIR="${LLAMA_OUTPUT_DIR:-longbench_out/llama31-8b-instruct/pred}"
 LLAMA_PRED_DIR="${LLAMA_OUTPUT_DIR}/${LLAMA_MODEL_TAG}-${KITTY_TAG}"
 LLAMA_REPORT_PREFIX="${LLAMA_REPORT_PREFIX:-longbench_out/llama31-8b-instruct/logs/report_full_32k}"
-LLAMA_DATASETS=(triviaqa samsum lsht passage_retrieval_en passage_count passage_retrieval_zh lcc repobench-p)
+LLAMA_DATASETS=(
+  narrativeqa qasper multifieldqa_en multifieldqa_zh
+  hotpotqa 2wikimqa musique dureader
+  gov_report qmsum multi_news vcsum
+  trec triviaqa samsum lsht
+  passage_retrieval_en passage_count passage_retrieval_zh
+  lcc repobench-p
+)
 
 LLAMA32_GPU="${LLAMA32_GPU:-1}"
 LLAMA32_MODEL_ID="${LLAMA32_MODEL_ID:-meta-llama/Llama-3.2-1B-Instruct}"
@@ -420,7 +427,11 @@ run_llama32() {
     sample_label="smoke${MAX_SAMPLES}"
   fi
   local model_tag="${LLAMA32_MODEL_TAG_PREFIX}-${sample_label}"
-  local pred_dir="${LLAMA32_OUTPUT_DIR}/${model_tag}-${KITTY_TAG_PAGE16}"
+  local variant_tag="${KITTY_TAG}"
+  if [[ "${LLAMA32_VARIANT}" == "kitty_page16" && "${KITTY_TAG}" == "${KITTY_TAG_128}" ]]; then
+    variant_tag="${KITTY_TAG_PAGE16}"
+  fi
+  local pred_dir="${LLAMA32_OUTPUT_DIR}/${model_tag}-${variant_tag}"
 
   RUN_VARIANT="${LLAMA32_VARIANT}" \
   run_model_loop \
