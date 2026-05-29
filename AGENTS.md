@@ -191,8 +191,15 @@ page_size=16
 promote_ratio=0.125
 quest_enabled=True
 quest_token_budget=2048  # default when no explicit QUEST budget is supplied
-quest_skip_layers=2
+quest_skip_layers=0      # default: every decode layer uses QUEST sparse selection
 ```
+
+`quest_skip_layers=0` is the current default: all decode layers use query-aware
+QUEST page selection. Older builds defaulted to `2` (the QUEST-paper convention
+of keeping the first two layers dense). The skip fallback is still available via
+`--quest-skip-layers N` / `quest_skip_layers=N`, but each skipped layer runs
+dense full attention with an O(context) cost, and the fallback has not been
+accuracy-validated in this repo.
 
 Budget mapping for page16:
 
@@ -207,6 +214,12 @@ Budget mapping for page16:
 Use this command shape to prove the real QUEST + Kitty implementation on a
 32k input. It compares pure Kitty page16 against QUEST + Kitty page16 using
 only decode-token timing; prefill is excluded from the reported ms/token.
+
+Note: the benchmark loads the model with `attn_implementation="flash_attention_2"`,
+which is used only for prefill — decode runs the Triton Kitty kernel, so the
+reported decode ms/token is independent of the prefill backend. The documented
+`kitty` conda env does not ship `flash_attn`; either install it, or override the
+prefill backend to `sdpa` (decode numbers are unchanged).
 
 Default GPU1 command:
 
@@ -224,7 +237,7 @@ CUDA_VISIBLE_DEVICES=1 PYTHONPATH=src:. python latency_benchmarking/benchmark_ki
   --compare-quest-kitty \
   --quest-enabled \
   --quest-token-budget 2048 \
-  --quest-skip-layers 2
+  --quest-skip-layers 0
 ```
 
 Use GPU0 only when the user explicitly overrides the GPU1-only evaluation rule:
@@ -243,31 +256,46 @@ CUDA_VISIBLE_DEVICES=0 PYTHONPATH=src:. python latency_benchmarking/benchmark_ki
   --compare-quest-kitty \
   --quest-enabled \
   --quest-token-budget 2048 \
-  --quest-skip-layers 2
+  --quest-skip-layers 0
 ```
 
 Expected evidence in output:
 
 ```text
-paths={'dense': <skip-layer count>, 'triton_sparse_reduced_budget': <nonzero>}
+paths={'triton_sparse_reduced_budget': <eligible decode layer-steps>}
 selected_pages=128
 selected_tokens=2048
 decode_speedup=<pure Kitty page16 ms/token / QUEST+Kitty ms/token>
 ```
 
-A real implementation should be materially faster than pure Kitty page16 on a
-32k decode. If `decode_speedup < 1.5`, first suspect dense fallback, Python
-debug fallback, selector-side all-page dequantization, or unselected pages
-still being loaded by the sparse kernels.
+With `quest_skip_layers=0` there should be no `'dense'` skip-layer entries; a
+`'dense_full_budget'` entry only appears when the context has fewer logical
+pages than the budget (nothing to drop). A real implementation should be
+materially faster than pure Kitty page16 on a long decode (e.g. roughly 3x at
+16k and ~20x at 128k with budget 2048). If `decode_speedup` is unexpectedly low
+(e.g. `< 1.5` at 32k+), first suspect dense fallback, Python debug fallback,
+selector-side all-page dequantization, or unselected pages still being loaded by
+the sparse kernels.
 
-Recent local GPU1 sample evidence with Qwen3-8B, 32768-token prompt,
-`max_new_tokens=32`, `warmup_runs=0`, `repeat_runs=1`:
+Recent local GPU0 sample evidence with Qwen3-8B, page16, `quest_token_budget=2048`,
+`quest_skip_layers=0`, `max_new_tokens=32`, `warmup_runs=1`, `repeat_runs=2`,
+decode-only ms/token across context lengths:
 
-| QUEST budget | Selected pages | QUEST ms/token | QUEST tok/s | Pure Kitty ms/token | Speedup |
-| ---: | ---: | ---: | ---: | ---: | ---: |
-| 512 | 32 | 47.0848 | 21.24 | 228.0413 | 4.843x |
-| 1024 | 64 | 49.3885 | 20.25 | 227.7278 | 4.611x |
-| 2048 | 128 | 55.0113 | 18.18 | 227.8943 | 4.143x |
+| Context | QUEST ms/token | QUEST tok/s | Shared pages |
+| ---: | ---: | ---: | ---: |
+| 8k | 40.41 | 24.75 | ~509 |
+| 16k | 41.47 | 24.11 | ~1021 |
+| 32k | 42.84 | 23.34 | ~2045 |
+| 64k | 45.16 | 22.14 | ~4093 |
+| 96k | 47.15 | 21.21 | ~6141 |
+| 128k | 49.18 | 20.33 | ~8189 |
+
+With `quest_skip_layers=0` the decode cost is nearly flat in context length
+(linear fit roughly `40.3 ms + 0.07 ms per 1k context tokens`); the small
+residual is the O(context) page-selection scan over all logical pages, not the
+budget-bound sparse attention. For reference, pure Kitty page16 decode is about
+`139.5 ms/token` at 16k and about `1013 ms/token` at 128k, so QUEST+Kitty decode
+speedup grows with context (about 3.4x at 16k and about 20x at 128k).
 
 Treat these as environment-specific smoke numbers, not a formal benchmark.
 
@@ -276,13 +304,14 @@ Treat these as environment-specific smoke numbers, not a formal benchmark.
 When a task explicitly says to restrict this QUEST + Kitty work to GPU0, use:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 PYTHONPATH=src:. pytest -q tests/test_kitty_quest_sparse.py
+CUDA_VISIBLE_DEVICES=0 PYTHONPATH=src python -m unittest tests.test_kitty_quest_sparse -v
 ```
 
 These tests require `CUDA_VISIBLE_DEVICES=0` and exactly one visible CUDA
 device. They assert true Triton sparse path labels, budget behavior, dense
 full-budget fallback behavior, and that `python_sparse_debug` is not accepted as
-real kernel evidence.
+real kernel evidence. The documented `kitty` conda env has no `pytest`, so use
+`unittest` (or run from an env that provides `pytest`).
 
 ## GSM8K LLaMA3.1-8B-Instruct GPU1 reproduction
 

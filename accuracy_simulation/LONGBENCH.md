@@ -59,6 +59,10 @@ bash accuracy_simulation/run_longbench.sh
 
 This writes directly under `longbench_out/smoke/qwen3-8b-kitty/pred`.
 
+The short `MAX_MODEL_LEN=3500` here is for fast smoke only. Full/non-smoke
+LongBench runs use `MAX_MODEL_LEN=32768` (32k); see the LongBench workflow notes
+in `AGENTS.md` / `CLAUDE.md`.
+
 Use `VARIANTS_CSV="fp16,kitty"` only when you explicitly want both baseline and Kitty smoke runs on GPU1; this doubles runtime.
 
 ## Variants
