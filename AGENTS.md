@@ -37,7 +37,7 @@ GPU_ID=1
   scripts source `accuracy_simulation/env.sh`, which loads repo-root `.env`.
   Direct Python commands must either source `.env` first or pass paths explicitly.
 - Explicit command-line environment variables take precedence over `.env`
-  values. Example: `MODEL_PATH=/some/model bash accuracy_simulation/run_longbench.sh`
+  values. Example: `MAX_MODEL_LEN=4096 bash scripts/run_exp.sh llama32`
   must override `.env`.
 - `.env.example` is the only tracked template for local path variables. Keep it
   generic; never add host-specific paths to it.
@@ -150,16 +150,11 @@ CUDA_VISIBLE_DEVICES=1 PYTHONPATH=src python latency_benchmarking/benchmark_kitt
   --repeat_runs 2
 ```
 
-LongBench fake-quant accuracy proxy:
+LongBench fake-quant accuracy proxy (sole entry point is `scripts/run_exp.sh`;
+a smoke run uses `--max-samples N`, a full run omits it):
 
 ```bash
-GPU_IDS_CSV=1 \
-VARIANTS_CSV=kitty_page16 \
-MAX_MODEL_LEN=32768 \
-MAX_GEN=256 \
-LOCAL_FILES_ONLY=1 \
-OVERWRITE=1 \
-bash accuracy_simulation/run_longbench.sh
+bash scripts/run_exp.sh llama32 --gpu 1 --max-samples 2
 ```
 
 Important reporting caveat: `kitty_page16` in `kitty_sim` is a fake-quant
@@ -352,55 +347,54 @@ find eval_results_gsm8k_gpu1 -name '*summary.json' -print | sort
 
 ## LongBench GPU1 workflow
 
-Use the Kitty-native LongBench runner added in this checkout. Unless a task explicitly asks for a shorter smoke/proxy run, LongBench runs in this checkout must use `MAX_MODEL_LEN=32768` (32k context) and `MAX_GEN=256`. Do not use the old `MAX_MODEL_LEN=3500` default for full LongBench commands.
+`scripts/run_exp.sh` is the **sole entry point** for LongBench in this repo. Do
+not launch LongBench through any other script. It sources `.env` automatically
+and owns a deterministic, smoke/full-separated output layout.
 
-### Normalized LongBench output layout
+### Output layout
 
-- Do not write new LongBench predictions under `longbench_out/pred`.
-- Smoke tests must write under `longbench_out/smoke/<model>-<method>/pred`.
-- Full/non-smoke runs must write directly under
-  `longbench_out/<model>-<method>/pred`.
-- The `pred` directory is the prediction directory itself: write
-  `<dataset>.jsonl`, `<dataset>.manifest.json`, and `result.json` directly
-  inside it. Do not create an extra `<model-tag>-<variant>/` subdirectory under
-  `pred`.
-- For the QUEST-aligned Kitty LongBench proxy, use method name `quest-kitty`
-  and variant `kitty_page16`; for paper-style Kitty, use method name `kitty`
-  and variant `kitty`.
+- full (no `--max-samples`, or `--max-samples -1`):
+  `longbench_out/<model>_<method>/{pred,logs}`
+- smoke (`--max-samples N`, N > 0):
+  `longbench_out/smoke/<model>_<method>/{pred,logs}`
+- `pred/` holds `<dataset>.jsonl`, `<dataset>.manifest.json`, and `result.json`;
+  `logs/` holds the per-dataset `report_<dataset>.json`.
+- `<model>` / `<method>` are the slugs from `src/kitty_sim/longbench/runner.py`
+  (`model_layout_slug` / `method_layout_slug`) joined by an underscore, e.g.
+  `llama31-8b-instruct_kitty`, `qwen3-8b_quest-kitty`.
 
-Full QUEST-aligned Kitty LongBench on GPU1 for LLaMA3.1-8B-Instruct:
+Unless a task explicitly asks for a shorter smoke/proxy run, full LongBench runs
+must use `MAX_MODEL_LEN=32768` (32k context) and the per-target generation
+length. Use `--max-samples N` only for smoke runs. Do not use the old
+`MAX_MODEL_LEN=3500` default for full runs.
+
+Full paper-style Kitty LongBench on GPU1 for LLaMA3.1-8B-Instruct:
 
 ```bash
-GPU_IDS_CSV=1 \
-MODEL=meta-llama/Llama-3.1-8B-Instruct \
-MODEL_TAG=llama31-8b-instruct-gpu1-quest-kitty-full-32k \
-MODEL_FAMILY=llama3 \
-VARIANTS_CSV=kitty_page16 \
-MAX_SAMPLES=-1 \
-MAX_MODEL_LEN=32768 \
-MAX_GEN=256 \
-LOCAL_FILES_ONLY=1 \
-OVERWRITE=1 \
-bash accuracy_simulation/run_longbench.sh
+bash scripts/run_exp.sh llama --gpu 1
+# -> longbench_out/llama31-8b-instruct_kitty/{pred,logs}
 ```
 
-With the normalized default layout, that command writes directly to:
+QUEST-aligned Kitty (page16 fake-quant proxy) for Qwen3-8B, full on GPU1:
 
-```text
-longbench_out/llama31-8b-instruct-quest-kitty/pred
+```bash
+bash scripts/run_exp.sh qwen --gpu 1 --variant kitty_page16
+# -> longbench_out/qwen3-8b_quest-kitty/{pred,logs}
 ```
 
-For Qwen3-8B full LongBench on GPU1, use `MODEL=Qwen/Qwen3-8B`,
-`MODEL_FAMILY=qwen`, and an appropriate Qwen model tag. Paper-style Kitty
-outputs should go directly under `longbench_out/qwen3-8b-kitty/pred`; local
-model paths should come from `.env` (`KITTY_QWEN3_8B_PATH`) or an explicit
-`MODEL_PATH` environment variable.
+Smoke example (LLaMA3.2-1B, 2 samples each, GPU1):
 
-Smoke example layout:
-
-```text
-longbench_out/smoke/llama31-8b-instruct-quest-kitty/pred
+```bash
+bash scripts/run_exp.sh llama32 --gpu 1 --max-samples 2
+# -> longbench_out/smoke/llama32-1b-instruct_quest-kitty/{pred,logs}
 ```
+
+Scope datasets with `DATASETS_CSV`, and force the layout independently of the
+sample count with `RUN_MODE=smoke|full` (e.g. a few-sample correctness check
+that still writes to the full layout:
+`RUN_MODE=full bash scripts/run_exp.sh llama32 --gpu 1 --max-samples 2`).
+Local model paths come from `.env` (`KITTY_*_PATH`) or per-target `*_MODEL_PATH`
+overrides; never hardcode host paths in tracked files.
 
 ## 32k memory probe evidence
 

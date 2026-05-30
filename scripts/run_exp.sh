@@ -1,52 +1,50 @@
 #!/usr/bin/env bash
-# Run the current 32k LongBench Kitty experiments with checkpoint-style continuation.
-# It only runs subtasks that were partial or not started when this script was created.
+# Sole entry point for LongBench experiments in this repo.
 #
-# Default: run Llama, Qwen3, and GLM loops concurrently on GPU 0/1/2.
-# DeepSeek is an explicit target for completing the existing Distill-Llama run.
+# Do NOT launch LongBench through any other script. run_exp.sh owns the
+# deterministic output layout and the smoke/full separation:
+#
+#   full  (MAX_SAMPLES <= 0)  -> longbench_out/<model>_<method>/{pred,logs}
+#   smoke (MAX_SAMPLES  > 0)  -> longbench_out/smoke/<model>_<method>/{pred,logs}
+#
+# Predictions (<dataset>.jsonl, <dataset>.manifest.json, result.json) live under
+# pred/; per-dataset report json lives under logs/. <model> and <method> match
+# the slugs used by src/kitty_sim/longbench/runner.py (model_layout_slug /
+# method_layout_slug), separated by an underscore.
+#
 # Usage:
 #   bash scripts/run_exp.sh [all|llama|qwen|glm|deepseek|llama32] [--gpu GPU] [--max-samples N]
 #   SERIAL=1 bash scripts/run_exp.sh all
-#   bash scripts/run_exp.sh deepseek --gpu 0
-#   bash scripts/run_exp.sh llama32 --gpu 1 --max-samples 1
+#   bash scripts/run_exp.sh llama32 --gpu 1 --max-samples 2
 #
 # Notes:
-# - No nohup is used; keep the terminal/session alive.
-# - Completed subtasks are skipped.
-# - Partial subtasks in the list are deleted and rerun from scratch.
-# - When a model finishes its listed subtasks, strict score_longbench regenerates result.json.
-# - If any generated jsonl is still partial, scoring fails and writes result.partial.json.
+# - .env is sourced automatically (KITTY_PYTHON_BIN, KITTY_*_PATH, LONGBENCH_DATA_ROOT).
+# - Completed datasets are skipped; partial datasets are deleted and rerun.
+# - A more-complete existing output is never silently shrunk (set FORCE=1 to override).
+# - RUN_MODE=auto|smoke|full forces the layout independently of MAX_SAMPLES.
+# - DATASETS_CSV overrides the default full 21-dataset list.
 
 set -Eeuo pipefail
+trap 'echo "[run_exp] failed at ${BASH_SOURCE[0]}:${LINENO} (exit $?)" >&2' ERR
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
+
+# Load repo-local .env (KITTY_PYTHON_BIN, KITTY_*_PATH, LONGBENCH_DATA_ROOT, ...).
+# env.sh preserves explicit environment/CLI values over .env values.
+# shellcheck source=accuracy_simulation/env.sh
+source "${REPO_ROOT}/accuracy_simulation/env.sh"
 
 PYTHON_BIN="${PYTHON_BIN:-${KITTY_PYTHON_BIN:-${HOME}/anaconda3/envs/kitty/bin/python}}"
 DATA_ROOT="${DATA_ROOT:-${LONGBENCH_DATA_ROOT:-${HOME}/data/LongBench}}"
 GPU_OVERRIDE="${GPU_OVERRIDE:-}"
 MAX_SAMPLES="${MAX_SAMPLES:--1}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-32768}"
-RUN_VARIANT="${RUN_VARIANT:-kitty}"
+RUN_VARIANT="${RUN_VARIANT:-}"        # empty => per-target default; --variant/RUN_VARIANT overrides
+RUN_MODE="${RUN_MODE:-auto}"          # auto|smoke|full -- forces layout independently of MAX_SAMPLES
 
-LLAMA_GPU="${LLAMA_GPU:-0}"
-LLAMA_MODEL_ID="${LLAMA_MODEL_ID:-meta-llama/Llama-3.1-8B-Instruct}"
-LLAMA_MODEL_PATH="${LLAMA_MODEL_PATH:-${KITTY_LLAMA31_8B_PATH:-${HOME}/models/Llama-3.1-8B-Instruct}}"
-LLAMA_MODEL_TAG="${LLAMA_MODEL_TAG:-llama31-8b-instruct-gpu0-full-32k}"
-LLAMA_OUTPUT_DIR="${LLAMA_OUTPUT_DIR:-longbench_out/llama31-8b-instruct-kitty/pred}"
-LLAMA_PRED_DIR="${LLAMA_OUTPUT_DIR}"
-LLAMA_REPORT_PREFIX="${LLAMA_REPORT_PREFIX:-longbench_out/llama31-8b-instruct-kitty/logs/report_full_32k}"
-LLAMA_DATASETS=(triviaqa samsum lsht passage_retrieval_en passage_count passage_retrieval_zh lcc repobench-p)
-
-LLAMA32_GPU="${LLAMA32_GPU:-1}"
-LLAMA32_MODEL_ID="${LLAMA32_MODEL_ID:-meta-llama/Llama-3.2-1B-Instruct}"
-LLAMA32_MODEL_PATH="${LLAMA32_MODEL_PATH:-${KITTY_LLAMA32_1B_PATH:-${HOME}/models/Llama-3.2-1B-Instruct}}"
-LLAMA32_MODEL_TAG_PREFIX="${LLAMA32_MODEL_TAG_PREFIX:-llama32-1b-instruct-gpu1-page16}"
-LLAMA32_OUTPUT_DIR="${LLAMA32_OUTPUT_DIR:-longbench_out/smoke/llama32-1b-instruct-quest-kitty/pred}"
-LLAMA32_REPORT_PREFIX="${LLAMA32_REPORT_PREFIX:-longbench_out/smoke/llama32-1b-instruct-quest-kitty/logs/report_page16}"
-LLAMA32_VARIANT="${LLAMA32_VARIANT:-kitty_page16}"
-LLAMA32_MAX_GEN="${LLAMA32_MAX_GEN:-256}"
-LLAMA32_DATASETS=(
+# Canonical full LongBench dataset list (21). Override with DATASETS_CSV.
+LONGBENCH_DATASETS=(
   narrativeqa qasper multifieldqa_en multifieldqa_zh
   hotpotqa 2wikimqa musique dureader
   gov_report qmsum multi_news vcsum
@@ -55,64 +53,70 @@ LLAMA32_DATASETS=(
   lcc repobench-p
 )
 
+# Per-target config. model_slug values must match runner.py model_layout_slug.
+LLAMA_GPU="${LLAMA_GPU:-0}"
+LLAMA_MODEL_ID="${LLAMA_MODEL_ID:-meta-llama/Llama-3.1-8B-Instruct}"
+LLAMA_MODEL_PATH="${LLAMA_MODEL_PATH:-${KITTY_LLAMA31_8B_PATH:-${HOME}/models/Llama-3.1-8B-Instruct}}"
+LLAMA_MODEL_SLUG="llama31-8b-instruct"
+LLAMA_MAX_GEN="${LLAMA_MAX_GEN:-}"
+LLAMA_DEFAULT_VARIANT="${LLAMA_DEFAULT_VARIANT:-kitty}"
+
+LLAMA32_GPU="${LLAMA32_GPU:-1}"
+LLAMA32_MODEL_ID="${LLAMA32_MODEL_ID:-meta-llama/Llama-3.2-1B-Instruct}"
+LLAMA32_MODEL_PATH="${LLAMA32_MODEL_PATH:-${KITTY_LLAMA32_1B_PATH:-${HOME}/models/Llama-3.2-1B-Instruct}}"
+LLAMA32_MODEL_SLUG="llama32-1b-instruct"
+LLAMA32_MAX_GEN="${LLAMA32_MAX_GEN:-256}"
+LLAMA32_DEFAULT_VARIANT="${LLAMA32_DEFAULT_VARIANT:-kitty_page16}"
+
 QWEN_GPU="${QWEN_GPU:-1}"
 QWEN_MODEL_ID="${QWEN_MODEL_ID:-Qwen/Qwen3-8B}"
 QWEN_MODEL_PATH="${QWEN_MODEL_PATH:-${KITTY_QWEN3_8B_PATH:-${HOME}/models/Qwen3-8B}}"
-QWEN_MODEL_TAG="${QWEN_MODEL_TAG:-qwen3-8b-gpu1-full-32k-gen2048}"
-QWEN_OUTPUT_DIR="${QWEN_OUTPUT_DIR:-longbench_out/qwen3-8b-kitty/pred}"
-QWEN_PRED_DIR="${QWEN_OUTPUT_DIR}"
-QWEN_REPORT_PREFIX="${QWEN_REPORT_PREFIX:-longbench_out/qwen3-8b-kitty/logs/report_full_32k_gen2048}"
-QWEN_DATASETS=(hotpotqa 2wikimqa musique dureader gov_report qmsum multi_news vcsum trec triviaqa samsum lsht passage_retrieval_en passage_count passage_retrieval_zh lcc repobench-p)
+QWEN_MODEL_SLUG="qwen3-8b"
+QWEN_MAX_GEN="${QWEN_MAX_GEN:-2048}"
+QWEN_DEFAULT_VARIANT="${QWEN_DEFAULT_VARIANT:-kitty}"
 
 GLM_GPU="${GLM_GPU:-2}"
 GLM_MODEL_ID="${GLM_MODEL_ID:-THUDM/GLM-4-9B-Chat-1M}"
 GLM_MODEL_PATH="${GLM_MODEL_PATH:-${KITTY_GLM4_9B_1M_PATH:-${HOME}/models/GLM-4-9B-Chat-1M}}"
-GLM_MODEL_TAG="${GLM_MODEL_TAG:-glm4-9b-chat-1m-gpu2-full-32k}"
-GLM_OUTPUT_DIR="${GLM_OUTPUT_DIR:-longbench_out/glm4-9b-chat-1m-kitty/pred}"
-GLM_PRED_DIR="${GLM_OUTPUT_DIR}"
-GLM_REPORT_PREFIX="${GLM_REPORT_PREFIX:-longbench_out/glm4-9b-chat-1m-kitty/logs/report_full_32k}"
-GLM_DATASETS=(vcsum trec triviaqa samsum lsht passage_retrieval_en passage_count passage_retrieval_zh lcc repobench-p)
+GLM_MODEL_SLUG="glm4-9b-chat-1m"
+GLM_MAX_GEN="${GLM_MAX_GEN:-}"
+GLM_DEFAULT_VARIANT="${GLM_DEFAULT_VARIANT:-kitty}"
 
 DEEPSEEK_GPU="${DEEPSEEK_GPU:-0}"
 DEEPSEEK_MODEL_ID="${DEEPSEEK_MODEL_ID:-deepseek-ai/DeepSeek-R1-Distill-Llama-8B}"
-DEEPSEEK_MODEL_PATH="${DEEPSEEK_MODEL_PATH:-${HOME}/models/DeepSeek-R1-Distill-Llama-8B}"
-DEEPSEEK_MODEL_TAG="${DEEPSEEK_MODEL_TAG:-deepseek-r1-distill-llama-8b}"
-DEEPSEEK_OUTPUT_DIR="${DEEPSEEK_OUTPUT_DIR:-longbench_out/deepseek-r1-distill-llama-8b-kitty/pred}"
-DEEPSEEK_PRED_DIR="${DEEPSEEK_PRED_DIR:-${DEEPSEEK_OUTPUT_DIR}}"
-DEEPSEEK_REPORT_PREFIX="${DEEPSEEK_REPORT_PREFIX:-logs/longbench/reports/deepseek_r1_distill_llama_8b_kitty}"
+DEEPSEEK_MODEL_PATH="${DEEPSEEK_MODEL_PATH:-${KITTY_DEEPSEEK_R1_DISTILL_LLAMA8B_PATH:-${HOME}/models/DeepSeek-R1-Distill-Llama-8B}}"
+DEEPSEEK_MODEL_SLUG="deepseek-r1-distill-llama-8b"
 DEEPSEEK_MAX_GEN="${DEEPSEEK_MAX_GEN:-1024}"
-DEEPSEEK_DATASETS=(lsht passage_retrieval_en passage_count passage_retrieval_zh lcc repobench-p)
+DEEPSEEK_DEFAULT_VARIANT="${DEEPSEEK_DEFAULT_VARIANT:-kitty}"
 
 usage() {
   cat <<USAGE
 Usage: bash scripts/run_exp.sh [all|llama|qwen|glm|deepseek|llama32] [--gpu GPU] [--max-samples N]
 
-Default target is: all
-Default all-mode runs three model loops concurrently on GPU 0/1/2.
-Set SERIAL=1 to run all targets one by one.
-DeepSeek is opt-in and is not included in the default all target.
-Llama32 runs Llama-3.2-1B-Instruct on GPU1 by default with the kitty_page16 smoke variant.
+run_exp.sh is the ONLY supported entry point for LongBench in this repo.
+
+Output layout (deterministic, smoke/full separated):
+  full  -> longbench_out/<model>_<method>/{pred,logs}
+  smoke -> longbench_out/smoke/<model>_<method>/{pred,logs}
+
+Default target is: all (llama+qwen+glm concurrently on GPU 0/1/2; SERIAL=1 for serial).
+DeepSeek is opt-in and not part of the default all target.
+Llama32 runs Llama-3.2-1B-Instruct on GPU1 by default with the kitty_page16 variant.
 
 Examples:
-  bash scripts/run_exp.sh deepseek --gpu 0
-  SERIAL=1 bash scripts/run_exp.sh all --gpu 0
-  bash scripts/run_exp.sh llama32 --gpu 1 --max-samples 1
-  bash scripts/run_exp.sh llama32 2
+  bash scripts/run_exp.sh llama32 --gpu 1 --max-samples 2     # smoke (2 samples)
+  bash scripts/run_exp.sh llama --gpu 1                       # full
+  bash scripts/run_exp.sh qwen --variant kitty_page16         # full, quest-kitty proxy
+  RUN_MODE=full bash scripts/run_exp.sh llama32 --gpu 1 --max-samples 2   # full layout, few samples
+  DATASETS_CSV=trec,samsum bash scripts/run_exp.sh llama32 --gpu 1        # scope datasets
 
 Environment overrides:
   PYTHON_BIN=${PYTHON_BIN}
   DATA_ROOT=${DATA_ROOT}
   GPU_OVERRIDE=${GPU_OVERRIDE:-<unset>}
-  MAX_SAMPLES=${MAX_SAMPLES}
-  MAX_MODEL_LEN=${MAX_MODEL_LEN}
-  RUN_VARIANT=${RUN_VARIANT}
-  LLAMA_GPU=${LLAMA_GPU}
-  LLAMA32_GPU=${LLAMA32_GPU}
-  LLAMA32_MODEL_PATH=${LLAMA32_MODEL_PATH}
-  QWEN_GPU=${QWEN_GPU}
-  GLM_GPU=${GLM_GPU}
-  DEEPSEEK_GPU=${DEEPSEEK_GPU}
-  DEEPSEEK_MODEL_PATH=${DEEPSEEK_MODEL_PATH}
+  MAX_SAMPLES=${MAX_SAMPLES}    MAX_MODEL_LEN=${MAX_MODEL_LEN}    RUN_MODE=${RUN_MODE}
+  RUN_VARIANT=${RUN_VARIANT:-<per-target default>}
+  DATASETS_CSV=${DATASETS_CSV:-<full 21>}    FORCE=${FORCE:-0}
 USAGE
 }
 
@@ -216,6 +220,52 @@ select_gpu() {
   printf '%s\n' "${GPU_OVERRIDE:-${default_gpu}}"
 }
 
+# Map a variant name to its output method slug (mirrors runner.py method_layout_slug).
+method_slug() {
+  case "${1,,}" in
+    kitty_page16|quest_proxy_kitty_page16) printf 'quest-kitty\n' ;;
+    kitty) printf 'kitty\n' ;;
+    kitty_pro) printf 'kitty-pro\n' ;;
+    fp16) printf 'fp16\n' ;;
+    kivi_2) printf 'kivi-2\n' ;;
+    kivi_star_2) printf 'kivi-star-2\n' ;;
+    custom) printf 'custom-kitty\n' ;;
+    *) printf '%s\n' "${1//_/-}" ;;
+  esac
+}
+
+is_smoke() {
+  case "${RUN_MODE:-auto}" in
+    full) return 1 ;;
+    smoke) return 0 ;;
+    *) [[ "${MAX_SAMPLES}" =~ ^[0-9]+$ && "${MAX_SAMPLES}" -gt 0 ]] ;;
+  esac
+}
+
+# Deterministic base dir for a (model_slug, variant): underscore-separated,
+# smoke runs nested under longbench_out/smoke/.
+resolve_base_dir() {
+  local model_slug="$1" variant="$2" method
+  method="$(method_slug "${variant}")"
+  if is_smoke; then
+    printf 'longbench_out/smoke/%s_%s\n' "${model_slug}" "${method}"
+  else
+    printf 'longbench_out/%s_%s\n' "${model_slug}" "${method}"
+  fi
+}
+
+# Emit the datasets to run (DATASETS_CSV override, else the canonical full 21).
+resolve_datasets() {
+  if [[ -n "${DATASETS_CSV:-}" ]]; then
+    local IFS=','
+    local -a parsed
+    read -r -a parsed <<< "${DATASETS_CSV}"
+    printf '%s\n' "${parsed[@]}"
+  else
+    printf '%s\n' "${LONGBENCH_DATASETS[@]}"
+  fi
+}
+
 count_rows() {
   local file="$1"
   if [[ ! -f "${file}" ]]; then
@@ -228,10 +278,12 @@ count_rows() {
 check_prereqs() {
   if [[ ! -x "${PYTHON_BIN}" ]]; then
     echo "ERROR: Python not executable: ${PYTHON_BIN}" >&2
+    echo "Hint: set KITTY_PYTHON_BIN in .env (sourced automatically) or pass PYTHON_BIN=/path/to/python." >&2
     return 2
   fi
   if [[ ! -d "${DATA_ROOT}/data" ]]; then
     echo "ERROR: LongBench data dir not found: ${DATA_ROOT}/data" >&2
+    echo "Hint: set LONGBENCH_DATA_ROOT in .env or pass DATA_ROOT=/path/to/LongBench." >&2
     return 2
   fi
 }
@@ -281,8 +333,19 @@ prepare_dataset() {
     return 10
   fi
 
-  if [[ "${current}" -gt 0 ]]; then
-    echo "[rerun] ${dataset}: partial/corrupt ${current}/${expected}; deleting ${out_file}"
+  # Never silently shrink a more-complete existing output (e.g. full results when
+  # asked for a smaller sample count). Require FORCE=1 to override.
+  if [[ "${current}" -gt "${expected}" ]]; then
+    if [[ "${FORCE:-0}" == "1" ]]; then
+      echo "[force] ${dataset}: existing ${current} > target ${expected}; FORCE=1 deleting ${out_file}"
+      rm -f "${out_file}" "${manifest_file}"
+    else
+      echo "ERROR: ${dataset}: existing output has ${current} rows (> target ${expected}) at ${out_file}." >&2
+      echo "Refusing to shrink/delete it. Set FORCE=1 to override, or choose a different output mode." >&2
+      return 2
+    fi
+  elif [[ "${current}" -gt 0 ]]; then
+    echo "[rerun] ${dataset}: partial ${current}/${expected}; deleting ${out_file}"
     rm -f "${out_file}" "${manifest_file}"
   else
     echo "[run] ${dataset}: missing 0/${expected}"
@@ -298,11 +361,12 @@ run_eval_dataset() {
   local model_path="$3"
   local model_tag="$4"
   local model_family="$5"
-  local output_dir="$6"
-  local report_json="$7"
-  local dataset="$8"
-  local max_gen="${9:-}"
-  local transformers_verbosity="${10:-}"
+  local variant="$6"
+  local pred_dir="$7"
+  local report_json="$8"
+  local dataset="$9"
+  local max_gen="${10:-}"
+  local transformers_verbosity="${11:-}"
 
   local -a env_cmd=(
     env
@@ -322,12 +386,12 @@ run_eval_dataset() {
     --model-path "${model_path}"
     --model-tag "${model_tag}"
     --model-family "${model_family}"
-    --variant "${RUN_VARIANT}"
+    --variant "${variant}"
     --dataset "${dataset}"
-	    --data-root "${DATA_ROOT}"
-	    --output-dir "${output_dir}"
-	    --flat-output-dir
-	    --max-samples "${MAX_SAMPLES}"
+    --data-root "${DATA_ROOT}"
+    --output-dir "${pred_dir}"
+    --flat-output-dir
+    --max-samples "${MAX_SAMPLES}"
     --max-model-len "${MAX_MODEL_LEN}"
     --torch-dtype float16
     --local-files-only
@@ -340,7 +404,7 @@ run_eval_dataset() {
     cmd+=(--max-gen "${max_gen}")
   fi
 
-  echo "[start] GPU${gpu} ${model_tag} dataset=${dataset} variant=${RUN_VARIANT} max_samples=${MAX_SAMPLES} max_model_len=${MAX_MODEL_LEN}"
+  echo "[start] GPU${gpu} ${model_tag} dataset=${dataset} variant=${variant} max_samples=${MAX_SAMPLES} max_model_len=${MAX_MODEL_LEN}"
   "${env_cmd[@]}" "${cmd[@]}"
   echo "[done]  GPU${gpu} ${model_tag} dataset=${dataset}"
 }
@@ -352,22 +416,32 @@ score_pred_dir() {
     "${PYTHON_BIN}" -m kitty_sim.cli.score_longbench --model "${pred_dir}"
 }
 
+# run_model_loop label gpu model_id model_path model_family model_slug default_variant max_gen verbosity
 run_model_loop() {
   local label="$1"
   local gpu="$2"
   local model_id="$3"
   local model_path="$4"
-  local model_tag="$5"
-  local model_family="$6"
-  local output_dir="$7"
-  local pred_dir="$8"
-  local report_prefix="$9"
-  local max_gen="${10}"
-  local transformers_verbosity="${11}"
-  shift 11
-  local -a datasets=("$@")
+  local model_family="$5"
+  local model_slug="$6"
+  local default_variant="$7"
+  local max_gen="$8"
+  local transformers_verbosity="$9"
 
-  echo "========== ${label}: GPU${gpu}, datasets=${datasets[*]} =========="
+  # --variant / RUN_VARIANT wins; otherwise this target's default.
+  local variant="${RUN_VARIANT:-${default_variant}}"
+  local base pred_dir report_prefix mode model_tag
+  base="$(resolve_base_dir "${model_slug}" "${variant}")"
+  pred_dir="${base}/pred"
+  report_prefix="${base}/logs/report"
+  if is_smoke; then mode="smoke${MAX_SAMPLES}"; else mode="full"; fi
+  model_tag="${model_slug}_$(method_slug "${variant}")_${mode}"
+  mkdir -p "${pred_dir}" "${base}/logs"
+
+  local -a datasets
+  mapfile -t datasets < <(resolve_datasets)
+
+  echo "========== ${label}: GPU${gpu} variant=${variant} mode=${mode} datasets=${#datasets[@]} out=${pred_dir} =========="
   ensure_no_running_eval "${model_tag}"
 
   local dataset rc
@@ -379,7 +453,8 @@ run_model_loop() {
         "${model_path}" \
         "${model_tag}" \
         "${model_family}" \
-        "${output_dir}" \
+        "${variant}" \
+        "${pred_dir}" \
         "${report_prefix}_${dataset}.json" \
         "${dataset}" \
         "${max_gen}" \
@@ -394,90 +469,42 @@ run_model_loop() {
   done
 
   score_pred_dir "${pred_dir}"
-  echo "========== ${label}: complete =========="
+  echo "========== ${label}: complete -> ${pred_dir} =========="
 }
 
 run_llama() {
   run_model_loop \
     llama "$(select_gpu "${LLAMA_GPU}")" \
-    "${LLAMA_MODEL_ID}" \
-    "${LLAMA_MODEL_PATH}" \
-    "${LLAMA_MODEL_TAG}" \
-    llama3 \
-    "${LLAMA_OUTPUT_DIR}" \
-    "${LLAMA_PRED_DIR}" \
-    "${LLAMA_REPORT_PREFIX}" \
-    "" \
-    "" \
-    "${LLAMA_DATASETS[@]}"
+    "${LLAMA_MODEL_ID}" "${LLAMA_MODEL_PATH}" llama3 \
+    "${LLAMA_MODEL_SLUG}" "${LLAMA_DEFAULT_VARIANT}" "${LLAMA_MAX_GEN}" ""
 }
 
 run_llama32() {
-  local sample_label="full"
-  if [[ "${MAX_SAMPLES}" -gt 0 ]]; then
-    sample_label="smoke${MAX_SAMPLES}"
-  fi
-  local model_tag="${LLAMA32_MODEL_TAG_PREFIX}-${sample_label}"
-  local pred_dir="${LLAMA32_OUTPUT_DIR}"
-
-  RUN_VARIANT="${LLAMA32_VARIANT}" \
   run_model_loop \
     llama32 "$(select_gpu "${LLAMA32_GPU}")" \
-    "${LLAMA32_MODEL_ID}" \
-    "${LLAMA32_MODEL_PATH}" \
-    "${model_tag}" \
-    llama3 \
-    "${LLAMA32_OUTPUT_DIR}" \
-    "${pred_dir}" \
-    "${LLAMA32_REPORT_PREFIX}_${sample_label}" \
-    "${LLAMA32_MAX_GEN}" \
-    "" \
-    "${LLAMA32_DATASETS[@]}"
+    "${LLAMA32_MODEL_ID}" "${LLAMA32_MODEL_PATH}" llama3 \
+    "${LLAMA32_MODEL_SLUG}" "${LLAMA32_DEFAULT_VARIANT}" "${LLAMA32_MAX_GEN}" ""
 }
 
 run_qwen() {
   run_model_loop \
     qwen3 "$(select_gpu "${QWEN_GPU}")" \
-    "${QWEN_MODEL_ID}" \
-    "${QWEN_MODEL_PATH}" \
-    "${QWEN_MODEL_TAG}" \
-    qwen \
-    "${QWEN_OUTPUT_DIR}" \
-    "${QWEN_PRED_DIR}" \
-    "${QWEN_REPORT_PREFIX}" \
-    2048 \
-    "" \
-    "${QWEN_DATASETS[@]}"
+    "${QWEN_MODEL_ID}" "${QWEN_MODEL_PATH}" qwen \
+    "${QWEN_MODEL_SLUG}" "${QWEN_DEFAULT_VARIANT}" "${QWEN_MAX_GEN}" ""
 }
 
 run_glm() {
   run_model_loop \
     glm4 "$(select_gpu "${GLM_GPU}")" \
-    "${GLM_MODEL_ID}" \
-    "${GLM_MODEL_PATH}" \
-    "${GLM_MODEL_TAG}" \
-    glm4 \
-    "${GLM_OUTPUT_DIR}" \
-    "${GLM_PRED_DIR}" \
-    "${GLM_REPORT_PREFIX}" \
-    "" \
-    error \
-    "${GLM_DATASETS[@]}"
+    "${GLM_MODEL_ID}" "${GLM_MODEL_PATH}" glm4 \
+    "${GLM_MODEL_SLUG}" "${GLM_DEFAULT_VARIANT}" "${GLM_MAX_GEN}" error
 }
 
 run_deepseek() {
   run_model_loop \
     deepseek "$(select_gpu "${DEEPSEEK_GPU}")" \
-    "${DEEPSEEK_MODEL_ID}" \
-    "${DEEPSEEK_MODEL_PATH}" \
-    "${DEEPSEEK_MODEL_TAG}" \
-    llama3 \
-    "${DEEPSEEK_OUTPUT_DIR}" \
-    "${DEEPSEEK_PRED_DIR}" \
-    "${DEEPSEEK_REPORT_PREFIX}" \
-    "${DEEPSEEK_MAX_GEN}" \
-    "" \
-    "${DEEPSEEK_DATASETS[@]}"
+    "${DEEPSEEK_MODEL_ID}" "${DEEPSEEK_MODEL_PATH}" llama3 \
+    "${DEEPSEEK_MODEL_SLUG}" "${DEEPSEEK_DEFAULT_VARIANT}" "${DEEPSEEK_MAX_GEN}" ""
 }
 
 run_all_parallel() {
@@ -514,6 +541,13 @@ main() {
     echo "ERROR: max model length must be a positive integer, got: ${MAX_MODEL_LEN}" >&2
     return 2
   fi
+  case "${RUN_MODE}" in
+    auto|smoke|full) ;;
+    *)
+      echo "ERROR: RUN_MODE must be auto|smoke|full, got: ${RUN_MODE}" >&2
+      return 2
+      ;;
+  esac
   case "${target}" in
     help)
       usage
