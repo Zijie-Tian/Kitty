@@ -1,67 +1,83 @@
-# LongBench Evaluation (GPU1-only)
+# LongBench Evaluation
 
-This repo provides a Kitty-native LongBench path that mirrors the LUTAttn LongBench flow:
+`scripts/run_exp.sh` is the **sole entry point** for LongBench in this repo. Do
+not launch LongBench through any other script or by calling
+`kitty_sim.cli.eval_longbench` directly. The script owns:
 
 - local JSONL data under `<data-root>/data/{dataset}.jsonl`
 - LUTAttn-compatible prompt templates and generation lengths
-- LUTAttn-compatible output files directly under a normalized prediction dir
-- strict scoring to `<prediction-dir>/result.json`
+- a deterministic, smoke/full-separated output layout
+- strict scoring to `<pred-dir>/result.json`
 
-## Normalized output layout
+It sources the repo-root `.env` automatically (via
+`accuracy_simulation/env.sh`), so `KITTY_PYTHON_BIN`, `KITTY_*_PATH`, and
+`LONGBENCH_DATA_ROOT` are picked up without any manual `source`.
 
-Do not use `longbench_out/pred` for new runs.
+## Output layout (deterministic, smoke vs full)
 
-- Smoke tests: `longbench_out/smoke/<model>-<method>/pred`
-- Full/non-smoke tests: `longbench_out/<model>-<method>/pred`
-- Prediction files live directly under `pred`: `<dataset>.jsonl`,
-  `<dataset>.manifest.json`, and `result.json`.
-- Do not create another `<model-tag>-<variant>` directory below `pred`.
+The layout is decided by the sample count, and the two never mix:
 
-For example, LLaMA 3.1 8B with the QUEST-aligned Kitty proxy writes directly to:
+- **full** (no `--max-samples`, or `--max-samples -1`):
+  `longbench_out/<model>_<method>/{pred,logs}`
+- **smoke** (`--max-samples N`, N > 0):
+  `longbench_out/smoke/<model>_<method>/{pred,logs}`
 
-```text
-longbench_out/llama31-8b-instruct-quest-kitty/pred
-```
+Within each base directory:
 
-## Hard GPU constraint
+- `pred/` holds the predictions: `<dataset>.jsonl`, `<dataset>.manifest.json`,
+  and the scored `result.json`.
+- `logs/` holds the per-dataset run metadata: `report_<dataset>.json`.
 
-For this workflow, all evaluation and smoke commands are **physical GPU1 only**. The scheduler validates this and launches Python with `CUDA_VISIBLE_DEVICES=1`. Do not use GPU0 or multi-GPU examples for this workflow.
+`<model>` and `<method>` are the slugs from
+`src/kitty_sim/longbench/runner.py` (`model_layout_slug` / `method_layout_slug`)
+joined by an underscore, e.g. `llama31-8b-instruct_kitty`,
+`qwen3-8b_quest-kitty`, `glm4-9b-chat-1m_kivi-star-2`.
+
+To force the layout independently of the sample count (e.g. a few-sample
+correctness check that should still land in the full tree), set
+`RUN_MODE=smoke|full`.
+
+## GPU selection
+
+Pass `--gpu N` (or set the per-target `*_GPU`). When the GPU is `1`, the script
+adds `--require-gpu1` so the run aborts unless `CUDA_VISIBLE_DEVICES=1`. The
+default `all` target fans out llama/qwen/glm across GPU 0/1/2; use `SERIAL=1`
+to run them one at a time on a single GPU.
 
 ## Local paths via `.env`
 
-Do not hardcode host-local model, Python, or dataset paths in tracked files. Copy `.env.example` to `.env` and fill in local values there:
+Do not hardcode host-local model, Python, or dataset paths in tracked files.
+Copy `.env.example` to `.env` and fill in local values there:
 
 ```bash
 cp .env.example .env
 ```
 
-The scheduler explicitly sources the ignored `.env` file. Existing command-line environment variables still take precedence over `.env` values.
+Per-target overrides (`LLAMA32_MODEL_PATH`, `QWEN_MODEL_PATH`, ...) and the
+shared `DATA_ROOT` still take precedence over `.env` values.
 
-Tracked LongBench config does not contain a model-to-local-path map. Use `MODEL`
-for a Hugging Face id and use `MODEL_PATH` or `.env` variables such as
-`KITTY_QWEN3_8B_PATH` only for local filesystem paths.
-
-## Smoke example: all LongBench subtasks, 2 samples each
+## Smoke example: LLaMA 3.2 1B, all subtasks, 2 samples each (GPU1)
 
 ```bash
-GPU_IDS_CSV=1 \
-MODEL="Qwen/Qwen3-8B" \
-MODEL_TAG="qwen3-8b-gpu1-smoke2" \
-MODEL_FAMILY="qwen" \
-VARIANTS_CSV="kitty" \
-MAX_SAMPLES=2 \
-MAX_MODEL_LEN=3500 \
-MAX_GEN=256 \
-LOCAL_FILES_ONLY=1 \
-OVERWRITE=1 \
-bash accuracy_simulation/run_longbench.sh
+bash scripts/run_exp.sh llama32 --gpu 1 --max-samples 2
 ```
 
-This writes directly under `longbench_out/smoke/qwen3-8b-kitty/pred`.
+This writes under `longbench_out/smoke/llama32-1b-instruct_quest-kitty/{pred,logs}`.
 
-Use `VARIANTS_CSV="fp16,kitty"` only when you explicitly want both baseline and Kitty smoke runs on GPU1; this doubles runtime.
+## Full example: paper-style Kitty, LLaMA 3.1 8B (GPU1)
 
-## Variants
+```bash
+bash scripts/run_exp.sh llama --gpu 1
+# -> longbench_out/llama31-8b-instruct_kitty/{pred,logs}
+```
+
+## Targets and variants
+
+Targets: `llama` (LLaMA3.1-8B), `llama32` (LLaMA3.2-1B), `qwen` (Qwen3-8B),
+`glm` (GLM-4-9B-Chat-1M), `deepseek` (R1-Distill-Llama-8B), and `all`.
+
+The variant defaults per target (`llama32` → `kitty_page16`, others → `kitty`)
+and is overridden with `--variant`:
 
 - `fp16`: HuggingFace default KV cache.
 - `kitty`: paper-style Kitty, K2V2 with 12.5% Key channels promoted to INT4 (`sink=32`, `buffer=128`, `group=128`).
@@ -71,35 +87,20 @@ Use `VARIANTS_CSV="fp16,kitty"` only when you explicitly want both baseline and 
 - `kivi_star_2`: K2V2 with first 32 sink tokens kept in full precision, no promoted channels.
 - `custom`: use CLI Kitty parameters directly.
 
-## Direct single-dataset command
+## Scoping datasets
+
+By default all 21 LongBench datasets run. Restrict the set with `DATASETS_CSV`:
 
 ```bash
-set -a
-source .env
-set +a
-CUDA_VISIBLE_DEVICES=1 PYTHONPATH=src "${KITTY_PYTHON_BIN:-python}" -m kitty_sim.cli.eval_longbench \
-  "${KITTY_QWEN3_8B_PATH:-Qwen/Qwen3-8B}" \
-  --model-tag qwen3-8b-gpu1-smoke2 \
-  --model-family qwen \
-  --variant kitty \
-  --dataset trec \
-  --data-root "${LONGBENCH_DATA_ROOT}" \
-  --output-dir longbench_out/smoke/qwen3-8b-kitty/pred \
-  --flat-output-dir \
-  --max-samples 2 \
-  --max-model-len 3500 \
-  --max-gen 256 \
-  --require-gpu1 \
-  --overwrite
-```
-
-Then score:
-
-```bash
-PYTHONPATH=src "${KITTY_PYTHON_BIN:-python}" -m kitty_sim.cli.score_longbench \
-  --model longbench_out/smoke/qwen3-8b-kitty/pred
+DATASETS_CSV=trec,samsum bash scripts/run_exp.sh llama32 --gpu 1 --max-samples 2
 ```
 
 ## Completeness checks
 
-Every dataset writes a sibling `<dataset>.manifest.json` with expected and actual row counts. The scorer is strict by default: incomplete outputs create `result.partial.json` and fail instead of silently writing `result.json`.
+Every dataset writes a sibling `<dataset>.manifest.json` with expected and
+actual row counts. Scoring is strict: incomplete predictions create
+`result.partial.json` and fail instead of silently writing `result.json`. A
+dataset whose `pred/<dataset>.jsonl` already has the expected row count is
+skipped; a partial file is deleted and rerun. The script refuses to shrink an
+output that already has **more** rows than the current target (e.g. a full
+result when you ask for `--max-samples 2`) unless you pass `FORCE=1`.

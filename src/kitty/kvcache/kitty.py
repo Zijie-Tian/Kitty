@@ -33,7 +33,7 @@ class QuestConfig:
     enabled: bool = False
     topk_pages: int | None = None
     token_budget: int | None = None
-    skip_layers: int = 2
+    skip_layers: int = 0
     force_sparse_for_equivalence: bool = False
     use_python_debug: bool = False
 
@@ -64,7 +64,7 @@ class KittyCache(Cache):
         quest_enabled: bool = False,
         quest_topk_pages: int | None = None,
         quest_token_budget: int | None = None,
-        quest_skip_layers: int = 2,
+        quest_skip_layers: int = 0,
         force_sparse_for_equivalence: bool = False,
     ) -> None:
         try:
@@ -339,7 +339,7 @@ def get_kvcache_kitty(
         quest_enabled: bool = False,
         quest_topk_pages: int | None = None,
         quest_token_budget: int | None = None,
-        quest_skip_layers: int = 2,
+        quest_skip_layers: int = 0,
         force_sparse_for_equivalence: bool = False,) -> KittyCache:
     """
     Get the KittyCache object.

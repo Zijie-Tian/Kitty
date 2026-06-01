@@ -25,7 +25,7 @@ class QuestConfig:
     page_size: int = 16
     token_budget: Optional[int] = None
     topk_pages: Optional[int] = None
-    skip_layers: int = 2
+    skip_layers: int = 0
     keep_sink: bool = True
     keep_recent: bool = True
     score_reduce: str = "max_gqa"
