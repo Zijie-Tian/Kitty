@@ -15,8 +15,8 @@ build/
 .env.*
 !.env.example
 /.omx
+/.claude
 /longbench_out
 logs/longbench_gpu0
 logs/longbench
 /logs/longbench_gpu1
-/.claude/worktrees
