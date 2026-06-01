@@ -19,7 +19,10 @@
 #
 # Notes:
 # - .env is sourced automatically (KITTY_PYTHON_BIN, KITTY_*_PATH, LONGBENCH_DATA_ROOT).
-# - Completed datasets are skipped; partial datasets are deleted and rerun.
+# - smoke: the target's previous smoke output dir is wiped on every launch
+#          (clean slate -- smoke results are never resumed).
+# - full:  completed datasets are kept; partial/missing datasets are (deleted and)
+#          rerun, so an interrupted full run resumes and fills in the rest.
 # - A more-complete existing output is never silently shrunk (set FORCE=1 to override).
 # - RUN_MODE=auto|smoke|full forces the layout independently of MAX_SAMPLES.
 # - DATASETS_CSV overrides the default full 21-dataset list.
@@ -303,6 +306,23 @@ MSG
   fi
 }
 
+# smoke clean slate: remove this target's previous smoke output dir so every
+# smoke launch starts fresh. Guarded to only ever touch longbench_out/smoke/*.
+wipe_smoke_base() {
+  local base="$1"
+  case "${base}" in
+    longbench_out/smoke/?*) ;;
+    *)
+      echo "ERROR: refusing to wipe non-smoke base dir: ${base}" >&2
+      return 2
+      ;;
+  esac
+  if [[ -d "${base}" ]]; then
+    echo "[smoke] clean slate: removing previous smoke output ${base}"
+    rm -rf "${base}"
+  fi
+}
+
 prepare_dataset() {
   local pred_dir="$1"
   local dataset="$2"
@@ -436,6 +456,10 @@ run_model_loop() {
   report_prefix="${base}/logs/report"
   if is_smoke; then mode="smoke${MAX_SAMPLES}"; else mode="full"; fi
   model_tag="${model_slug}_$(method_slug "${variant}")_${mode}"
+  # smoke: start each launch from a clean slate; full: keep/resume existing output.
+  if is_smoke; then
+    wipe_smoke_base "${base}"
+  fi
   mkdir -p "${pred_dir}" "${base}/logs"
 
   local -a datasets
