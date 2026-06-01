@@ -196,6 +196,14 @@ of keeping the first two layers dense). The skip fallback is still available via
 dense full attention with an O(context) cost, and the fallback has not been
 accuracy-validated in this repo.
 
+QUEST budget rule: always set the QUEST token budget explicitly to `2048` for
+QUEST + Kitty experiments and commands. Do not rely on an implicit default, do
+not substitute `MAX_GEN`/generation length for the QUEST budget, and do not use
+other QUEST budgets unless the user explicitly requests a budget sweep or a
+different budget. For CLI paths, pass the interface-specific equivalent such as
+`--quest-token-budget 2048` or `QUEST_BUDGET=2048` when that path supports true
+QUEST selection.
+
 Budget mapping for page16:
 
 | QUEST token budget | Selected logical pages |
@@ -367,6 +375,13 @@ Unless a task explicitly asks for a shorter smoke/proxy run, full LongBench runs
 must use `MAX_MODEL_LEN=32768` (32k context) and the per-target generation
 length. Use `--max-samples N` only for smoke runs. Do not use the old
 `MAX_MODEL_LEN=3500` default for full runs.
+
+LongBench command-answer rule: when the user asks for LongBench test commands, always provide both a smoke-test command and a full-test command. Both commands must be complete, directly runnable shell blocks with all relevant environment variables included; do not abbreviate with phrases like "change MAX_SAMPLES to -1" or omit paths, model tags, output dirs, report prefixes, GPU selection, variant, `MAX_MODEL_LEN`, `MAX_GEN`/runner-specific generation cap, or QUEST budget settings.
+
+- For true QUEST + Kitty LongBench/runtime paths, the QUEST budget must be
+  explicitly fixed at `2048` tokens (`QUEST_BUDGET=2048` or
+  `--quest-token-budget 2048`, depending on the runner). The `MAX_GEN=256`
+  generation cap is separate and must not be confused with the QUEST budget.
 
 Full paper-style Kitty LongBench on GPU1 for LLaMA3.1-8B-Instruct:
 

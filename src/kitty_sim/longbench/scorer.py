@@ -124,4 +124,7 @@ def score_directory(
         raise RuntimeError(f"Incomplete LongBench predictions under {path}; wrote {partial_path}")
 
     result_path.write_text(json.dumps(scores, ensure_ascii=False, indent=4), encoding="utf-8")
+    stale_partial_path = path / "result.partial.json"
+    if output_name == "result.json" and stale_partial_path.exists():
+        stale_partial_path.unlink()
     return scores
