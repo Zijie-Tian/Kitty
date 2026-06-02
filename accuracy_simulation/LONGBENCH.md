@@ -76,12 +76,13 @@ bash scripts/run_exp.sh llama --gpu 1
 Targets: `llama` (LLaMA3.1-8B), `llama32` (LLaMA3.2-1B), `qwen` (Qwen3-8B),
 `glm` (GLM-4-9B-Chat-1M), `deepseek` (R1-Distill-Llama-8B), and `all`.
 
-The variant defaults per target (`llama32` → `kitty_page16`, others → `kitty`)
+The variant defaults per target (`llama32` → `quest_kitty_page16_sim`, others → `kitty`)
 and is overridden with `--variant`:
 
 - `fp16`: HuggingFace default KV cache.
 - `kitty`: paper-style Kitty, K2V2 with 12.5% Key channels promoted to INT4 (`sink=32`, `buffer=128`, `group=128`).
-- `kitty_page16`: fake-quant accuracy proxy for the 16-token page-size experiment (`sink=32`, `buffer=16`, `group=16`). This is not a real Triton-kernel accuracy proof.
+- `quest_kitty_page16_sim`: pure-PyTorch (no-Triton) QUEST + Kitty. The sim KittyKVCache applies page16 fake-quant (`sink=32`, `buffer=16`, `group=16`) and a per-arch attention hook runs the gather-based QUEST oracle on decode (budget 2048 → 128 pages). Architecture-portable accuracy + relative-timing proxy; not a kernel-speed proof.
+- `quest_kitty_page16_kernel`: real Triton QUEST + Kitty decode kernel (Llama/Qwen only). The genuine speed path.
 - `kitty_pro`: K2V2 with 25% Key channels promoted to INT4.
 - `kivi_2`: K2V2 without sink or promoted channels.
 - `kivi_star_2`: K2V2 with first 32 sink tokens kept in full precision, no promoted channels.

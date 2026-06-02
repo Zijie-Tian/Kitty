@@ -21,13 +21,26 @@ def build_parser() -> argparse.ArgumentParser:
         choices=[
             "fp16",
             "kitty",
-            "kitty_page16",
-            "quest_proxy_kitty_page16",
+            "quest_kitty_page16_kernel",
+            "quest_kitty_page16_sim",
             "kitty_pro",
             "kivi_2",
             "kivi_star_2",
             "custom",
         ],
+    )
+    # Real QUEST+Kitty kernel controls (variant=quest_kitty_page16_kernel only).
+    parser.add_argument(
+        "--quest-token-budget",
+        type=int,
+        default=None,
+        help="QUEST token budget for the real kernel (page16: 2048 -> 128 pages). Defaults to 2048.",
+    )
+    parser.add_argument(
+        "--quest-skip-layers",
+        type=int,
+        default=0,
+        help="Number of leading decode layers to run dense instead of QUEST sparse (default 0).",
     )
     parser.add_argument("--dataset", default=None, help="Run one LongBench dataset only")
     parser.add_argument("--e", action="store_true", help="Evaluate LongBench-E")

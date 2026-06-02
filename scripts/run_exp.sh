@@ -69,7 +69,7 @@ LLAMA32_MODEL_ID="${LLAMA32_MODEL_ID:-meta-llama/Llama-3.2-1B-Instruct}"
 LLAMA32_MODEL_PATH="${LLAMA32_MODEL_PATH:-${KITTY_LLAMA32_1B_PATH:-${HOME}/models/Llama-3.2-1B-Instruct}}"
 LLAMA32_MODEL_SLUG="llama32-1b-instruct"
 LLAMA32_MAX_GEN="${LLAMA32_MAX_GEN:-256}"
-LLAMA32_DEFAULT_VARIANT="${LLAMA32_DEFAULT_VARIANT:-kitty_page16}"
+LLAMA32_DEFAULT_VARIANT="${LLAMA32_DEFAULT_VARIANT:-quest_kitty_page16_sim}"
 
 QWEN_GPU="${QWEN_GPU:-1}"
 QWEN_MODEL_ID="${QWEN_MODEL_ID:-Qwen/Qwen3-8B}"
@@ -104,12 +104,15 @@ Output layout (deterministic, smoke/full separated):
 
 Default target is: all (llama+qwen+glm concurrently on GPU 0/1/2; SERIAL=1 for serial).
 DeepSeek is opt-in and not part of the default all target.
-Llama32 runs Llama-3.2-1B-Instruct on GPU1 by default with the kitty_page16 variant.
+Llama32 runs Llama-3.2-1B-Instruct on GPU1 by default with the quest_kitty_page16_sim variant.
+
+QUEST variants: quest_kitty_page16_sim (pure-torch QUEST+Kitty accuracy proxy, any arch)
+and quest_kitty_page16_kernel (real Triton QUEST kernel, Llama/Qwen only).
 
 Examples:
-  bash scripts/run_exp.sh llama32 --gpu 1 --max-samples 2     # smoke (2 samples)
+  bash scripts/run_exp.sh llama32 --gpu 0 --max-samples 2     # smoke (2 samples, sim QUEST)
   bash scripts/run_exp.sh llama --gpu 1                       # full
-  bash scripts/run_exp.sh qwen --variant kitty_page16         # full, quest-kitty proxy
+  bash scripts/run_exp.sh qwen --variant quest_kitty_page16_sim   # full, pure-torch QUEST
   RUN_MODE=full bash scripts/run_exp.sh llama32 --gpu 1 --max-samples 2   # full layout, few samples
   DATASETS_CSV=trec,samsum bash scripts/run_exp.sh llama32 --gpu 1        # scope datasets
 
@@ -181,7 +184,7 @@ parse_args() {
         ;;
       --variant)
         if [[ "$#" -lt 2 || -z "${2:-}" || "${2:-}" == -* ]]; then
-          echo "ERROR: --variant requires a variant name, for example: --variant kitty_page16" >&2
+          echo "ERROR: --variant requires a variant name, for example: --variant quest_kitty_page16_sim" >&2
           return 2
         fi
         RUN_VARIANT="$2"
@@ -226,7 +229,8 @@ select_gpu() {
 # Map a variant name to its output method slug (mirrors runner.py method_layout_slug).
 method_slug() {
   case "${1,,}" in
-    kitty_page16|quest_proxy_kitty_page16) printf 'quest-kitty\n' ;;
+    quest_kitty_page16_kernel|quest_kitty_kernel) printf 'quest-kitty-kernel\n' ;;
+    quest_kitty_page16_sim|quest_kitty_sim) printf 'quest-kitty-sim\n' ;;
     kitty) printf 'kitty\n' ;;
     kitty_pro) printf 'kitty-pro\n' ;;
     fp16) printf 'fp16\n' ;;
@@ -422,6 +426,14 @@ run_eval_dataset() {
   fi
   if [[ -n "${max_gen}" ]]; then
     cmd+=(--max-gen "${max_gen}")
+  fi
+  # Real QUEST+Kitty kernel controls (only meaningful for the
+  # quest_kitty_page16_kernel variant; ignored by other variants).
+  if [[ -n "${QUEST_BUDGET:-}" ]]; then
+    cmd+=(--quest-token-budget "${QUEST_BUDGET}")
+  fi
+  if [[ -n "${QUEST_SKIP_LAYERS:-}" ]]; then
+    cmd+=(--quest-skip-layers "${QUEST_SKIP_LAYERS}")
   fi
 
   echo "[start] GPU${gpu} ${model_tag} dataset=${dataset} variant=${variant} max_samples=${MAX_SAMPLES} max_model_len=${MAX_MODEL_LEN}"

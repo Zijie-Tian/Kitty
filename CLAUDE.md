@@ -150,29 +150,39 @@ CUDA_VISIBLE_DEVICES=1 PYTHONPATH=src python latency_benchmarking/benchmark_kitt
   --repeat_runs 2
 ```
 
-LongBench fake-quant accuracy proxy (sole entry point is `scripts/run_exp.sh`;
+LongBench QUEST accuracy proxy (sole entry point is `scripts/run_exp.sh`;
 a smoke run uses `--max-samples N`, a full run omits it):
 
 ```bash
-bash scripts/run_exp.sh llama32 --gpu 1 --max-samples 2
+bash scripts/run_exp.sh llama32 --gpu 1 --max-samples 2   # default variant: quest_kitty_page16_sim
 ```
 
-Important reporting caveat: `kitty_page16` in `kitty_sim` is a fake-quant
-accuracy proxy (`sink=32`, `buffer=16`, `group=16`). It is useful for quick
-accuracy smoke testing, but it is not by itself a proof of real Triton page16
-accuracy. Real page16 correctness must be validated with GPU1 kernel/cache
-smoke tests, and latency claims must come from the real Triton path.
+The temporary `kitty_page16` / `quest_proxy_kitty_page16` fake-quant proxy
+(dense KV quant, NO query-aware selection) has been REMOVED. There are now two
+QUEST variants, both genuinely query-aware:
+
+- `quest_kitty_page16_sim`: pure-PyTorch (no-Triton) QUEST + Kitty. The sim
+  `KittyKVCache` applies page16 fake-quant (`sink=32`, `buffer=16`, `group=16`)
+  and a per-arch attention hook (`kitty_sim/sim_quest.py`) runs the gather-based
+  QUEST oracle (`kitty_sim/quest_sparse.py`) on decode (budget 2048 -> 128
+  pages). Architecture-portable accuracy + relative-timing proxy; it does NOT
+  save KV memory and is not a kernel-speed proof. Verify it is real QUEST (not
+  pure Kitty) by comparing 16k vs 128k decode ms/token: sim QUEST stays
+  near-flat (bounded to budget) while pure dense Kitty grows with context.
+- `quest_kitty_page16_kernel`: the real Triton kernel path (below), Llama/Qwen
+  only, the genuine speed proof.
 
 ## True QUEST + Kitty page16 kernel usage
 
-The true QUEST + Kitty path is the real Qwen3 Kitty decode path with 16-token
-pages, query-aware page selection, and Triton sparse QK/SV kernels. It is not
-the same as the `kitty_sim` fake proxy.
+The true QUEST + Kitty kernel path is the real Qwen3/Llama Kitty decode path with
+16-token pages, query-aware page selection, and Triton sparse QK/SV kernels. It is
+not the same as the `quest_kitty_page16_sim` pure-torch proxy.
 
 Naming rules:
 
-- `quest_proxy_kitty_page16` is a fake-quant/dense LongBench accuracy proxy.
-  Do not use it for kernel-speed claims.
+- `quest_kitty_page16_sim` is the pure-PyTorch QUEST accuracy/relative-timing
+  proxy. It performs real query-aware selection but on a dense gather (no Triton);
+  do not use it for kernel-speed claims.
 - A real `quest+kitty` / `quest_kitty_page16_kernel` result must show
   `last_quest_path` values like `triton_sparse_reduced_budget` or
   `triton_sparse_forced_all_pages`.
@@ -378,10 +388,37 @@ length. Use `--max-samples N` only for smoke runs. Do not use the old
 
 LongBench command-answer rule: when the user asks for LongBench test commands, always provide both a smoke-test command and a full-test command. Both commands must be complete, directly runnable shell blocks with all relevant environment variables included; do not abbreviate with phrases like "change MAX_SAMPLES to -1" or omit paths, model tags, output dirs, report prefixes, GPU selection, variant, `MAX_MODEL_LEN`, `MAX_GEN`/runner-specific generation cap, or QUEST budget settings.
 
-- For true QUEST + Kitty LongBench/runtime paths, the QUEST budget must be
+- The canonical QUEST + Kitty LongBench accuracy test is the pure-torch sim
+  variant `quest_kitty_page16_sim` (real query-aware page selection on Kitty
+  fake-quant, architecture-portable, no Triton). When asked for "QUEST + Kitty"
+  LongBench test commands, default to this variant and provide both smoke and
+  full forms. The real Triton variant `quest_kitty_page16_kernel` is the
+  latency/speed proof only (Llama/Qwen) and need not be the default test command.
+- For any QUEST + Kitty LongBench/runtime path, the QUEST budget must be
   explicitly fixed at `2048` tokens (`QUEST_BUDGET=2048` or
   `--quest-token-budget 2048`, depending on the runner). The `MAX_GEN=256`
   generation cap is separate and must not be confused with the QUEST budget.
+
+Canonical QUEST + Kitty LongBench test commands (sim variant, Llama-3.2-1B; the
+`.env` here has no `KITTY_LLAMA32_1B_PATH`, so pass `LLAMA32_MODEL_PATH=`):
+
+```bash
+# smoke (2 samples/dataset)
+cd /mnt/data/tzj/Code/Kitty
+LLAMA32_MODEL_PATH=/mnt/data/tzj/models/Llama-3.2-1B-Instruct \
+MAX_MODEL_LEN=32768 LLAMA32_MAX_GEN=256 QUEST_BUDGET=2048 QUEST_SKIP_LAYERS=0 \
+bash scripts/run_exp.sh llama32 --gpu 0 --variant quest_kitty_page16_sim --max-samples 2
+# -> longbench_out/smoke/llama32-1b-instruct_quest-kitty-sim/{pred,logs}
+```
+
+```bash
+# full (all 21 datasets, 32k context)
+cd /mnt/data/tzj/Code/Kitty
+LLAMA32_MODEL_PATH=/mnt/data/tzj/models/Llama-3.2-1B-Instruct \
+MAX_MODEL_LEN=32768 LLAMA32_MAX_GEN=256 QUEST_BUDGET=2048 QUEST_SKIP_LAYERS=0 \
+bash scripts/run_exp.sh llama32 --gpu 0 --variant quest_kitty_page16_sim
+# -> longbench_out/llama32-1b-instruct_quest-kitty-sim/{pred,logs}
+```
 
 Full paper-style Kitty LongBench on GPU1 for LLaMA3.1-8B-Instruct:
 
@@ -390,18 +427,18 @@ bash scripts/run_exp.sh llama --gpu 1
 # -> longbench_out/llama31-8b-instruct_kitty/{pred,logs}
 ```
 
-QUEST-aligned Kitty (page16 fake-quant proxy) for Qwen3-8B, full on GPU1:
+Pure-torch QUEST + Kitty (no Triton) for Qwen3-8B, full on GPU1:
 
 ```bash
-bash scripts/run_exp.sh qwen --gpu 1 --variant kitty_page16
-# -> longbench_out/qwen3-8b_quest-kitty/{pred,logs}
+bash scripts/run_exp.sh qwen --gpu 1 --variant quest_kitty_page16_sim
+# -> longbench_out/qwen3-8b_quest-kitty-sim/{pred,logs}
 ```
 
-Smoke example (LLaMA3.2-1B, 2 samples each, GPU1):
+Smoke example (LLaMA3.2-1B, 2 samples each, GPU1; llama32 defaults to quest_kitty_page16_sim):
 
 ```bash
 bash scripts/run_exp.sh llama32 --gpu 1 --max-samples 2
-# -> longbench_out/smoke/llama32-1b-instruct_quest-kitty/{pred,logs}
+# -> longbench_out/smoke/llama32-1b-instruct_quest-kitty-sim/{pred,logs}
 ```
 
 Scope datasets with `DATASETS_CSV`, and force the layout independently of the
@@ -410,6 +447,95 @@ that still writes to the full layout:
 `RUN_MODE=full bash scripts/run_exp.sh llama32 --gpu 1 --max-samples 2`).
 Local model paths come from `.env` (`KITTY_*_PATH`) or per-target `*_MODEL_PATH`
 overrides; never hardcode host paths in tracked files.
+
+### Real QUEST + Kitty kernel on LongBench (variant `quest_kitty_page16_kernel`)
+
+`--variant quest_kitty_page16_kernel` is the REAL Triton Kitty + QUEST sparse
+decode path on LongBench, NOT the `kitty_page16` fake-quant proxy. The runner
+loads the architecture-specific `*_Kitty` model class (`kitty.models.llama`
+`LlamaForCausalLM_Kitty` or `kitty.models.qwen3` `Qwen3ForCausalLM_Kitty`) and
+builds the real paged `kitty.kvcache` cache per sample; decode runs the Triton
+sparse QK/SV kernels with query-aware page selection.
+
+Supported model families: `llama` and `qwen` only. Other families raise (no
+`kitty/models/<arch>` port exists). The Llama port reuses stock HF Llama and
+replaces only the attention forward (`src/kitty/models/llama/modeling_llama.py`).
+
+Always pass the QUEST budget explicitly: `QUEST_BUDGET=2048` (page16 -> 128
+logical pages). `QUEST_SKIP_LAYERS` defaults to 0 (every decode layer uses QUEST
+selection). The runner has a first-sample guardrail that refuses to proceed
+unless decode shows real kernel evidence (`last_quest_path` =
+`triton_sparse_reduced_budget` / `triton_sparse_forced_all_pages`, or
+`dense_full_budget` / `dense_no_shared_pages` when a context is smaller than the
+budget). A bare `dense` with `quest_skip_layers=0`, `python_sparse_debug`, or
+`unknown` is rejected as a silent degradation to dense fp16.
+
+Real QUEST+Kitty smoke for Llama-3.2-1B on GPU0 (scoped to long-context
+datasets so the sparse path is exercised):
+
+```bash
+cd /mnt/data/tzj/Code/Kitty
+LLAMA32_MODEL_PATH=/mnt/data/tzj/models/Llama-3.2-1B-Instruct \
+MAX_MODEL_LEN=32768 LLAMA32_MAX_GEN=256 \
+QUEST_BUDGET=2048 QUEST_SKIP_LAYERS=0 \
+DATASETS_CSV=multifieldqa_en,hotpotqa \
+bash scripts/run_exp.sh llama32 --gpu 0 --variant quest_kitty_page16_kernel --max-samples 2
+# -> longbench_out/smoke/llama32-1b-instruct_quest-kitty-kernel/{pred,logs}
+```
+
+Full real QUEST+Kitty for Llama-3.2-1B on GPU0 (all 21 datasets, 32k context):
+
+```bash
+cd /mnt/data/tzj/Code/Kitty
+LLAMA32_MODEL_PATH=/mnt/data/tzj/models/Llama-3.2-1B-Instruct \
+MAX_MODEL_LEN=32768 LLAMA32_MAX_GEN=256 \
+QUEST_BUDGET=2048 QUEST_SKIP_LAYERS=0 \
+bash scripts/run_exp.sh llama32 --gpu 0 --variant quest_kitty_page16_kernel
+# -> longbench_out/llama32-1b-instruct_quest-kitty-kernel/{pred,logs}
+```
+
+The `.env` here has no `KITTY_LLAMA32_1B_PATH`, so the model path must be passed
+explicitly via `LLAMA32_MODEL_PATH=` (otherwise it falls back to a non-existent
+`$HOME/models/...`). For Qwen3-8B, use `qwen --variant quest_kitty_page16_kernel`
+(the `kitty` env already resolves `KITTY_QWEN3_8B_PATH`).
+
+### Pure-torch QUEST + Kitty on LongBench (variant `quest_kitty_page16_sim`)
+
+`quest_kitty_page16_sim` is the no-Triton QUEST accuracy proxy and the default
+for the `llama32` target. The sim `KittyKVCache` supplies the Kitty page16
+fake-quant; a per-arch attention hook (`kitty_sim/sim_quest.py`, covers Llama and
+Qwen3 via a `q_norm` attribute check) runs the gather-based QUEST oracle
+(`kitty_sim/quest_sparse.py`) on decode. It does genuine query-aware page
+selection (unlike the removed `kitty_page16`), is architecture-portable, but does
+not save KV memory and is not a kernel-speed proof.
+
+Smoke for Llama-3.2-1B on GPU0 (`llama32` already defaults to this variant):
+
+```bash
+cd /mnt/data/tzj/Code/Kitty
+LLAMA32_MODEL_PATH=/mnt/data/tzj/models/Llama-3.2-1B-Instruct \
+MAX_MODEL_LEN=32768 LLAMA32_MAX_GEN=256 \
+QUEST_BUDGET=2048 QUEST_SKIP_LAYERS=0 \
+bash scripts/run_exp.sh llama32 --gpu 0 --variant quest_kitty_page16_sim --max-samples 2
+# -> longbench_out/smoke/llama32-1b-instruct_quest-kitty-sim/{pred,logs}
+```
+
+Full (all 21 datasets, 32k context):
+
+```bash
+cd /mnt/data/tzj/Code/Kitty
+LLAMA32_MODEL_PATH=/mnt/data/tzj/models/Llama-3.2-1B-Instruct \
+MAX_MODEL_LEN=32768 LLAMA32_MAX_GEN=256 \
+QUEST_BUDGET=2048 QUEST_SKIP_LAYERS=0 \
+bash scripts/run_exp.sh llama32 --gpu 0 --variant quest_kitty_page16_sim
+# -> longbench_out/llama32-1b-instruct_quest-kitty-sim/{pred,logs}
+```
+
+To confirm it is real QUEST (not pure Kitty), compare decode ms/token at 16k vs
+128k: sim QUEST stays near-flat (attention bounded to the 2048-token budget)
+while pure dense Kitty grows roughly linearly with context. The runner's
+first-sample guardrail also prints `[sim-quest] ... decode_calls=... last_selected_pages=...`
+and refuses to proceed if the QUEST hook never ran.
 
 ## 32k memory probe evidence
 

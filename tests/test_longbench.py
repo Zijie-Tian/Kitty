@@ -63,47 +63,61 @@ class LongBenchTests(unittest.TestCase):
 
     def test_variant_defaults_match_plan(self):
         kitty = build_variant(SimpleNamespace(variant="kitty"))
-        page16 = build_variant(SimpleNamespace(variant="kitty_page16"))
         pro = build_variant(SimpleNamespace(variant="kitty_pro"))
         self.assertEqual(kitty.promote_ratio, 0.125)
         self.assertEqual(pro.promote_ratio, 0.25)
         self.assertEqual(kitty.sink_length, 32)
         self.assertEqual(kitty.buffer_length, 128)
         self.assertEqual(kitty.group_size, 128)
-        self.assertEqual(page16.sink_length, 32)
-        self.assertEqual(page16.buffer_length, 16)
-        self.assertEqual(page16.group_size, 16)
-        self.assertEqual(page16.promote_ratio, 0.125)
-        self.assertIn("g16_b16_s32", page16.tag)
 
-    def test_quest_proxy_page16_variant_uses_proxy_name(self):
-        variant = build_variant(SimpleNamespace(variant="quest_proxy_kitty_page16"))
-
+    def test_quest_sim_variant_is_pure_torch_quest(self):
+        variant = build_variant(
+            SimpleNamespace(variant="quest_kitty_page16_sim", quest_token_budget=2048, quest_skip_layers=0)
+        )
         self.assertTrue(variant.use_kitty)
-        self.assertEqual(variant.name, "quest_proxy_kitty_page16")
+        self.assertTrue(variant.sim_quest)
+        self.assertFalse(variant.real_kernel)
+        self.assertEqual(variant.name, "quest_kitty_page16_sim")
+        # page16 fake-quant config the sim KittyKVCache is built from.
         self.assertEqual(variant.sink_length, 32)
         self.assertEqual(variant.buffer_length, 16)
         self.assertEqual(variant.group_size, 16)
-        self.assertTrue(variant.tag.startswith("quest_proxy_kitty_page16_"))
+        self.assertEqual(variant.page_size, 16)
+        self.assertTrue(variant.quest_enabled)
+        self.assertEqual(variant.quest_token_budget, 2048)
+        self.assertTrue(variant.tag.endswith("_sim"))
 
-    def test_output_model_dir_uses_quest_proxy_page16_variant_tag(self):
-        variant = build_variant(SimpleNamespace(variant="quest_proxy_kitty_page16"))
+    def test_quest_kernel_variant_is_real_kernel(self):
+        variant = build_variant(
+            SimpleNamespace(variant="quest_kitty_page16_kernel", quest_token_budget=2048, quest_skip_layers=0)
+        )
+        self.assertTrue(variant.real_kernel)
+        self.assertFalse(variant.sim_quest)
+        self.assertEqual(variant.page_size, 16)
+        self.assertEqual(variant.quest_token_budget, 2048)
+        self.assertTrue(variant.tag.endswith("_kernel"))
+
+    def test_output_model_dir_uses_quest_sim_variant_tag(self):
+        variant = build_variant(
+            SimpleNamespace(variant="quest_kitty_page16_sim", quest_token_budget=2048, quest_skip_layers=0)
+        )
 
         pred_dir = output_model_dir("longbench_out/pred", "qwen3-8b-gpu1-smoke2", variant)
 
         self.assertEqual(
             pred_dir.name,
-            "qwen3-8b-gpu1-smoke2-quest_proxy_kitty_page16_g16_b16_s32_sel1_k2_v2_pb4_pr0p125",
+            "qwen3-8b-gpu1-smoke2-quest_kitty_page16_sim_p16_pr0p125_qb2048_qsl0_sim",
         )
 
-    def test_longbench_cli_accepts_quest_proxy_page16_variant(self):
-        args = build_parser().parse_args(["Qwen/Qwen3-8B", "--variant", "quest_proxy_kitty_page16"])
+    def test_longbench_cli_accepts_quest_sim_and_kernel_variants(self):
+        for v in ("quest_kitty_page16_sim", "quest_kitty_page16_kernel"):
+            args = build_parser().parse_args(["Qwen/Qwen3-8B", "--variant", v])
+            self.assertEqual(args.variant, v)
 
-        self.assertEqual(args.variant, "quest_proxy_kitty_page16")
-
-    def test_longbench_cli_rejects_unimplemented_quest_kernel_variant(self):
-        with self.assertRaises(SystemExit):
-            build_parser().parse_args(["Qwen/Qwen3-8B", "--variant", "quest_kitty_page16_kernel"])
+    def test_longbench_cli_rejects_removed_page16_proxy_variant(self):
+        for v in ("kitty_page16", "quest_proxy_kitty_page16"):
+            with self.assertRaises(SystemExit):
+                build_parser().parse_args(["Qwen/Qwen3-8B", "--variant", v])
 
     def test_latency_parser_accepts_page16_smoke_plumbing(self):
         args = build_latency_parser().parse_args(
@@ -135,15 +149,15 @@ class LongBenchTests(unittest.TestCase):
         self.assertEqual(args.quest_skip_layers, 2)
 
     def test_flat_prediction_dir_does_not_append_variant_subdir(self):
-        variant = build_variant(SimpleNamespace(variant="kitty_page16"))
+        variant = build_variant(SimpleNamespace(variant="quest_kitty_page16_sim"))
         self.assertEqual(
             resolve_prediction_dir(
-                "longbench_out/llama31-8b-instruct-quest-kitty/pred",
+                "longbench_out/llama31-8b-instruct-quest-kitty-sim/pred",
                 "ignored",
                 variant,
                 flat_output_dir=True,
             ),
-            Path("longbench_out/llama31-8b-instruct-quest-kitty/pred"),
+            Path("longbench_out/llama31-8b-instruct-quest-kitty-sim/pred"),
         )
         self.assertEqual(
             resolve_prediction_dir("longbench_out/root", "model-tag", variant).name,
@@ -151,14 +165,14 @@ class LongBenchTests(unittest.TestCase):
         )
 
     def test_default_prediction_dir_uses_normalized_smoke_and_full_layout(self):
-        variant = build_variant(SimpleNamespace(variant="kitty_page16"))
+        variant = build_variant(SimpleNamespace(variant="quest_kitty_page16_sim"))
         self.assertEqual(
             default_prediction_dir("meta-llama/Llama-3.1-8B-Instruct", None, variant, max_samples=1),
-            Path("longbench_out/smoke/llama31-8b-instruct-quest-kitty/pred"),
+            Path("longbench_out/smoke/llama31-8b-instruct-quest-kitty-sim/pred"),
         )
         self.assertEqual(
             default_prediction_dir("meta-llama/Llama-3.1-8B-Instruct", None, variant, max_samples=-1),
-            Path("longbench_out/llama31-8b-instruct-quest-kitty/pred"),
+            Path("longbench_out/llama31-8b-instruct-quest-kitty-sim/pred"),
         )
 
     def test_kitty_cache_accepts_short_prefill_without_assertion(self):
