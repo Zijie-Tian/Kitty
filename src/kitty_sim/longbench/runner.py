@@ -18,6 +18,11 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from kitty_sim import get_kvcache_kitty
+from kitty_sim.glm_kitty_patch import (
+    cache_config_from_variant,
+    install_glm_kitty_fakequant,
+    is_glm_family,
+)
 
 from .config import LONG_BENCH_DATASETS, LONG_BENCH_E_DATASETS, load_json_config
 from .data import load_longbench_dataset
@@ -251,6 +256,8 @@ def generate_dataset(
     prompt_token_reserve: int = 0,
     overwrite: bool = False,
     strict_complete: bool = True,
+    legacy_cache_model: bool = False,
+    kitty_stats: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     if overwrite:
@@ -279,6 +286,7 @@ def generate_dataset(
 
     failed: list[dict[str, Any]] = []
     written_now = 0
+    kitty_engagement_checked = False
     device = getattr(model, "device", torch.device("cuda" if torch.cuda.is_available() else "cpu"))
 
     for local_idx, json_obj in enumerate(tqdm(records, desc=dataset)):
@@ -295,7 +303,11 @@ def generate_dataset(
         try:
             inputs = tokenizer(prompt, truncation=False, return_tensors="pt").to(device)
             context_length = inputs.input_ids.shape[-1]
-            kv_cache = _cache_factory(variant)
+            # GLM-family models ignore an HF Cache object (legacy tuple cache); for
+            # them Kitty fake-quant is applied by the SelfAttention patch installed
+            # in run_longbench, so we pass past_key_values=None and let GLM build
+            # its own (now-quantized) cache. All other models use the KittyKVCache.
+            kv_cache = None if legacy_cache_model else _cache_factory(variant)
             eos_token_id: int | list[int] | None = tokenizer.eos_token_id
             if dataset == "samsum" and tokenizer.eos_token_id is not None:
                 newline_ids = tokenizer.encode("\n", add_special_tokens=False)
@@ -319,6 +331,27 @@ def generate_dataset(
                     **inputs,
                     **gen_kwargs,
                 )[0]
+            # Guardrail: refuse to silently report dense fp16 as Kitty. Verify the
+            # KV quantization path actually engaged on the first generated sample.
+            if variant.use_kitty and not kitty_engagement_checked:
+                if legacy_cache_model:
+                    engaged = bool(kitty_stats and kitty_stats.get("calls", 0) > 0)
+                    detail = f"glm fake-quant patch calls={kitty_stats.get('calls') if kitty_stats else None}"
+                else:
+                    engaged = kv_cache is not None and kv_cache.get_seq_length() > 0
+                    detail = (
+                        f"KittyKVCache.get_seq_length()="
+                        f"{kv_cache.get_seq_length() if kv_cache is not None else None}"
+                    )
+                if not engaged:
+                    raise RuntimeError(
+                        f"Kitty variant '{variant.name}' was requested but KV quantization "
+                        f"never engaged for model_family='{model_family}' ({detail}). The model "
+                        f"bypassed the KittyKVCache (e.g. a legacy tuple-cache remote modeling), "
+                        f"so results would be plain dense fp16 mislabelled as Kitty. Refusing to "
+                        f"proceed. See kitty_sim/glm_kitty_patch.py."
+                    )
+                kitty_engagement_checked = True
             pred = tokenizer.decode(output[context_length:], skip_special_tokens=True)
             pred = post_process(pred, model_family)
             row = {
@@ -436,6 +469,22 @@ def run_longbench(args: Any) -> dict[str, Any]:
         local_files_only=args.local_files_only,
     )
 
+    # GLM-family remote modeling uses a legacy tuple KV cache and never calls
+    # Cache.update(), so a KittyKVCache passed via past_key_values is a no-op
+    # (it silently runs dense fp16). For Kitty variants on GLM, install a
+    # SelfAttention forward patch that fake-quantizes the cached KV with the same
+    # KittyKVCache logic used for HF-Cache models.
+    legacy_cache_model = is_glm_family(model_family)
+    kitty_stats: dict[str, Any] | None = None
+    if variant.use_kitty and legacy_cache_model:
+        kitty_stats = install_glm_kitty_fakequant(
+            model_obj, cache_config_from_variant(variant)
+        )
+        print(
+            f"[kitty] GLM legacy-cache model: installed SelfAttention fake-quant on "
+            f"{kitty_stats['installed']} layers (variant={variant.tag})"
+        )
+
     manifests: list[dict[str, Any]] = []
     try:
         for dataset in datasets:
@@ -459,6 +508,8 @@ def run_longbench(args: Any) -> dict[str, Any]:
                 prompt_token_reserve=args.prompt_token_reserve,
                 overwrite=args.overwrite,
                 strict_complete=args.strict_complete,
+                legacy_cache_model=legacy_cache_model,
+                kitty_stats=kitty_stats,
             )
             manifests.append(manifest)
     finally:
