@@ -47,8 +47,9 @@ def _sim_quest_attention_forward(
     hidden_states: torch.Tensor,
     position_embeddings: tuple[torch.Tensor, torch.Tensor],
     attention_mask: torch.Tensor | None = None,
-    past_key_values: Any = None,
+    past_key_value: Any = None,
     cache_position: torch.LongTensor | None = None,
+    past_key_values: Any = None,
     **kwargs,
 ):
     input_shape = hidden_states.shape[:-1]
@@ -68,12 +69,16 @@ def _sim_quest_attention_forward(
     cos, sin = position_embeddings
     query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-    assert past_key_values is not None, (
+    # Transformers attention modules receive the cache as `past_key_value`
+    # (singular), while model/generate APIs use `past_key_values` (plural).
+    # Accept both so the hook remains compatible across HF call sites.
+    kv_cache = past_key_value if past_key_value is not None else past_key_values
+    assert kv_cache is not None, (
         "sim QUEST requires a sim KittyKVCache via past_key_values (kitty_sim fake-quant)."
     )
     # Kitty fake-quant: returns the fake-quantized FULL K/V history for this layer.
     cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-    key_q, value_q = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
+    key_q, value_q = kv_cache.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
     stats = self._sim_quest_stats
     q_len = query_states.shape[2]

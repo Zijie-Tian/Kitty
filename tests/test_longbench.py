@@ -175,6 +175,47 @@ class LongBenchTests(unittest.TestCase):
             Path("longbench_out/llama31-8b-instruct-quest-kitty-sim/pred"),
         )
 
+    def test_sim_quest_hook_accepts_hf_singular_cache_argument(self):
+        from transformers import LlamaConfig, LlamaForCausalLM
+
+        from kitty_sim import get_kvcache_kitty
+        from kitty_sim.quest_sparse import QuestConfig
+        from kitty_sim.sim_quest import install_sim_quest
+
+        model = LlamaForCausalLM(
+            LlamaConfig(
+                vocab_size=64,
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=1,
+                num_attention_heads=4,
+                num_key_value_heads=4,
+                max_position_embeddings=64,
+            )
+        ).eval()
+        stats = install_sim_quest(
+            model,
+            QuestConfig(page_size=16, token_budget=16, skip_layers=0, sink_length=0, recent_length=0),
+        )
+        cache = get_kvcache_kitty(
+            SimpleNamespace(
+                sink_length=0,
+                buffer_length=16,
+                group_size=16,
+                kbits=2,
+                vbits=2,
+                promote_ratio=0.125,
+                promote_bit=4,
+                channel_selection=1,
+            )
+        )
+
+        with torch.inference_mode():
+            model(input_ids=torch.tensor([[1, 2, 3, 4]]), past_key_values=cache, use_cache=True)
+
+        self.assertEqual(cache.get_seq_length(), 4)
+        self.assertEqual(stats["prefill_calls"], 1)
+
     def test_kitty_cache_accepts_short_prefill_without_assertion(self):
         cache = KittyKVCache(
             KittyKVCacheConfig(
