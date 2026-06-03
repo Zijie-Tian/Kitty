@@ -32,6 +32,7 @@ from types import MethodType
 import torch
 
 from kitty_sim.kitty_simulate import KittyKVCache, KittyKVCacheConfig
+from kitty_sim.kv_offload import pinned_pool
 
 
 def is_glm_family(model_family: str | None) -> bool:
@@ -68,6 +69,79 @@ def _split_new_kv(new_kv):
 
 
 # --------------------------------------------------------------------------- #
+# Layer-wise CPU KV offload for GLM (the de-fragmented per-layer-tuple cache).
+#
+# GLM does not thread KV through a shared HF Cache; each SelfAttention owns a
+# private single-layer KittyKVCache, and the cross-layer cumulative KV lives in
+# the ``presents`` tuple the patched GLMTransformer builds (fed back next step as
+# ``kv_caches[index]`` and re-cat'd inside the vendored attention BEFORE our
+# update runs). So offload is driven from the GLMTransformer loop, not the cache:
+#   * before ``layer(index)``: H2D the previous KV so the vendored cat sees GPU,
+#     and rebind both ``kv_caches[index]`` and the module's ``_kitty_cache[0]``.
+#   * after appending to ``presents``: D2H the new KV, rebind ``presents[index]``
+#     AND ``_kitty_cache[0]`` to the host mirror so the GPU tensor is freed.
+# Synchronous (no overlap) to keep the working set at ~1 layer (max memory win,
+# which is the whole point for GLM's 128k OOM).
+# --------------------------------------------------------------------------- #
+class GLMOffloadManager:
+    def __init__(self, max_length: int) -> None:
+        if max_length is None or int(max_length) <= 0:
+            raise ValueError("GLM KV offload requires a positive max_length.")
+        self.max_length = int(max_length)
+        self.device: torch.device | None = None
+        self._pool = pinned_pool()
+
+    @staticmethod
+    def _attn(layer):
+        return getattr(layer, "self_attention", None) or getattr(layer, "self_attn", None)
+
+    def prefetch(self, layer, index: int, kv_tuple):
+        """H2D the previous step's KV for ``index`` and sync the module cache."""
+        if kv_tuple is None:
+            return kv_tuple
+        k, v = kv_tuple
+        if k.device.type != "cpu":
+            return kv_tuple
+        assert self.device is not None, "GLM offload device not captured yet"
+        gk = k.to(self.device, non_blocking=False).contiguous()
+        gv = v.to(self.device, non_blocking=False).contiguous()
+        attn = self._attn(layer)
+        kc = getattr(attn, "_kitty_cache", None) if attn is not None else None
+        if kc is not None and len(kc.key_cache) > 0:
+            kc.key_cache[0] = gk
+            kc.value_cache[0] = gv
+        return (gk, gv)
+
+    def evict(self, layer, index: int, kv_tuple):
+        """D2H the new KV for ``index`` to its pinned host mirror; sync caches."""
+        if kv_tuple is None:
+            return kv_tuple
+        k, v = kv_tuple
+        if k.device.type == "cpu":
+            return kv_tuple
+        if self.device is None:
+            self.device = k.device
+        cur = k.shape[-2]
+        if cur > self.max_length:
+            raise RuntimeError(
+                f"GLM KV offload: layer {index} length {cur} exceeds max_length "
+                f"{self.max_length}; raise MAX_MODEL_LEN + MAX_GEN."
+            )
+        hk = self._pool.mirror(index, "K", k, self.max_length)
+        hv = self._pool.mirror(index, "V", v, self.max_length)
+        hk[:, :, :cur, :].copy_(k)
+        hv[:, :, :cur, :].copy_(v)
+        host_k = hk[:, :, :cur, :]
+        host_v = hv[:, :, :cur, :]
+        attn = self._attn(layer)
+        kc = getattr(attn, "_kitty_cache", None) if attn is not None else None
+        if kc is not None and len(kc.key_cache) > 0:
+            kc.key_cache[0] = host_k
+            kc.value_cache[0] = host_v
+        return (host_k, host_v)
+
+
+# --------------------------------------------------------------------------- #
 # (2) De-fragmentation: GLMTransformer.forward that appends per-layer tuples
 #     instead of torch.cat-stacking them along the layer axis.
 # --------------------------------------------------------------------------- #
@@ -75,9 +149,13 @@ def _patched_glmtransformer_forward(
     self, hidden_states, attention_mask, rotary_pos_emb, kv_caches=None,
     use_cache=True, output_hidden_states=False,
 ):
+    offloader = getattr(self, "_kitty_offloader", None)
     if not kv_caches:
         kv_caches = [None for _ in range(self.num_layers)]
-    presents = () if use_cache else None
+    elif offloader is not None and not isinstance(kv_caches, list):
+        # Need mutability so prefetch can rebind a layer's host KV to GPU.
+        kv_caches = list(kv_caches)
+    presents = [] if use_cache else None
     if self.gradient_checkpointing and self.training and use_cache:
         use_cache = False
 
@@ -88,6 +166,11 @@ def _patched_glmtransformer_forward(
             all_hidden_states = all_hidden_states + (hidden_states,)
 
         layer = self._get_layer(index)
+        # Offload: bring this layer's previous KV back to GPU before the vendored
+        # attention re-cats it (kv_caches[index] was evicted to host last step).
+        if offloader is not None and kv_caches[index] is not None:
+            kv_caches[index] = offloader.prefetch(layer, index, kv_caches[index])
+
         if self.gradient_checkpointing and self.training:
             layer_ret = torch.utils.checkpoint.checkpoint(
                 layer, hidden_states, attention_mask, rotary_pos_emb,
@@ -100,10 +183,16 @@ def _patched_glmtransformer_forward(
             )
         hidden_states, kv_cache = layer_ret
         if use_cache:
+            # Offload: move this layer's new KV to host so `presents` holds the
+            # host mirror and the GPU tensor is freed (the memory win).
+            if offloader is not None:
+                kv_cache = offloader.evict(layer, index, kv_cache)
             # Always append per-layer (key, value); never torch.cat along the layer
             # axis. This is the de-fragmentation fix (matches Llama/Qwen).
-            presents = presents + (kv_cache,)
+            presents.append(kv_cache)
 
+    if use_cache:
+        presents = tuple(presents)
     if output_hidden_states:
         all_hidden_states = all_hidden_states + (hidden_states,)
     if self.post_layer_norm:
@@ -175,10 +264,21 @@ def install_glm_cache_plumbing(model) -> None:
         gen_cls._kitty_prepare_inputs_installed = True
 
 
-def install_glm_kitty_fakequant(model, cache_config: KittyKVCacheConfig, stats=None):
+def install_glm_kitty_fakequant(
+    model,
+    cache_config: KittyKVCacheConfig,
+    stats=None,
+    *,
+    offloading: bool = False,
+    max_length: int | None = None,
+):
     """Install all GLM fixes (fake-quant + de-fragmentation + generate shim) on a
     loaded GLM model. Returns a stats dict and raises if the expected modules are
-    not found (so a layout change cannot silently disable Kitty quantization)."""
+    not found (so a layout change cannot silently disable Kitty quantization).
+
+    When ``offloading`` is True, a GLMOffloadManager is attached to the
+    GLMTransformer so each layer's KV is mirrored to pinned host RAM (layer-wise
+    CPU offload) — this is what lets GLM-9B fit long contexts on a 40 GB card."""
     if stats is None:
         stats = {"installed": 0, "calls": 0, "prefill_calls": 0, "decode_calls": 0}
 
@@ -231,6 +331,16 @@ def install_glm_kitty_fakequant(model, cache_config: KittyKVCacheConfig, stats=N
 
     # (2)+(3) de-fragmentation + generate() compat (shared plumbing).
     install_glm_cache_plumbing(model)
+
+    # (2b) Attach the layer-wise CPU KV offload manager (per GLMTransformer
+    #      instance) when offload is enabled. _patched_glmtransformer_forward
+    #      (installed by the plumbing) reads ``self._kitty_offloader``.
+    if offloading:
+        manager = GLMOffloadManager(max_length)
+        for tm in (m for m in model.modules() if type(m).__name__ == "GLMTransformer"):
+            tm._kitty_offloader = manager
+        stats["offloading"] = True
+        stats["offload_max_length"] = manager.max_length
 
     stats["installed"] = len(attn_modules)
     return stats

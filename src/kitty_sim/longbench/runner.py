@@ -146,7 +146,14 @@ def build_variant(args: Any) -> VariantConfig:
     raise ValueError(f"Unknown variant: {args.variant}")
 
 
-def _cache_factory(config: VariantConfig):
+def _cache_factory(
+    config: VariantConfig,
+    *,
+    offloading: bool = False,
+    max_length: int | None = None,
+    resident_layers: int = 2,
+    offload_prefetch: bool = False,
+):
     if not config.use_kitty:
         return None
     ns = SimpleNamespace(
@@ -158,6 +165,10 @@ def _cache_factory(config: VariantConfig):
         promote_ratio=config.promote_ratio,
         promote_bit=config.promote_bit,
         channel_selection=config.channel_selection,
+        offloading=offloading,
+        max_length=max_length,
+        resident_layers=resident_layers,
+        offload_prefetch=offload_prefetch,
     )
     return get_kvcache_kitty(ns)
 
@@ -404,6 +415,24 @@ def generate_dataset(
     kitty_engagement_checked = False
     device = getattr(model, "device", torch.device("cuda" if torch.cuda.is_available() else "cpu"))
 
+    # Layer-wise CPU KV offload opt-in for the plain sim KittyKVCache path (not the
+    # real-kernel paged cache, not GLM which uses its own offload manager).
+    offload_enabled = (
+        variant.use_kitty
+        and not legacy_cache_model
+        and not variant.real_kernel
+        and os.environ.get("KITTY_OFFLOAD", "0").lower() not in ("0", "", "false", "no")
+    )
+    offload_resident_layers = int(os.environ.get("KITTY_RESIDENT_LAYERS", "2"))
+    offload_prefetch = os.environ.get("KITTY_OFFLOAD_PREFETCH", "0").lower() not in ("0", "", "false", "no")
+    offload_max_length = max_model_len + max_gen
+    if offload_enabled:
+        print(
+            f"[offload] layer-wise CPU KV offload ENABLED "
+            f"(max_length={offload_max_length}, resident_layers={offload_resident_layers}, "
+            f"prefetch={offload_prefetch})"
+        )
+
     for local_idx, json_obj in enumerate(tqdm(records, desc=dataset)):
         sample_idx = completed + local_idx
         prompt = prompt_format.format(**json_obj)
@@ -435,7 +464,13 @@ def generate_dataset(
                 # to this prompt; decode runs the sparse Triton kernels.
                 kv_cache = _real_kernel_cache(variant, model, context_length, max_gen)
             else:
-                kv_cache = _cache_factory(variant)
+                kv_cache = _cache_factory(
+                    variant,
+                    offloading=offload_enabled,
+                    max_length=offload_max_length,
+                    resident_layers=offload_resident_layers,
+                    offload_prefetch=offload_prefetch,
+                )
             eos_token_id: int | list[int] | None = tokenizer.eos_token_id
             if dataset == "samsum" and tokenizer.eos_token_id is not None:
                 newline_ids = tokenizer.encode("\n", add_special_tokens=False)
@@ -775,13 +810,23 @@ def run_longbench(args: Any) -> dict[str, Any]:
             f"(variant={variant.tag}, budget={variant.quest_token_budget}, skip_layers={variant.quest_skip_layers})"
         )
     elif variant.use_kitty and legacy_cache_model:
+        glm_offload = os.environ.get("KITTY_OFFLOAD", "0").lower() not in ("0", "", "false", "no")
+        glm_offload_max_length = max_model_len + (args.max_gen or 1024)
         kitty_stats = install_glm_kitty_fakequant(
-            model_obj, cache_config_from_variant(variant)
+            model_obj,
+            cache_config_from_variant(variant),
+            offloading=glm_offload,
+            max_length=glm_offload_max_length,
         )
         print(
             f"[kitty] GLM legacy-cache model: installed SelfAttention fake-quant on "
             f"{kitty_stats['installed']} layers (variant={variant.tag})"
         )
+        if glm_offload:
+            print(
+                f"[offload] GLM layer-wise CPU KV offload ENABLED "
+                f"(max_length={glm_offload_max_length})"
+            )
 
     manifests: list[dict[str, Any]] = []
     try:

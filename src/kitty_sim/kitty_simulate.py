@@ -16,6 +16,7 @@ except ImportError:  # transformers>=4.57 removed CacheConfig from cache_utils
             self.cache_implementation = cache_implementation
 
 from .utils_quant import build_promote_mask, fake_quant_groupwise_lastdim
+from .kv_offload import LayerKVOffloader
 
 
 @dataclass
@@ -39,6 +40,10 @@ class KittyKVCacheConfig(CacheConfig):
         channel_selection: int = 1,               # -1: Unspecified, 0: Random, 1: Magnitude-based
         VCache_BitDecoding: bool = False,         # The behavior of Value Cache, set to True means BitDecoding, otherwise KIVI Style Value Cache
         PostQuant: bool = True,                   # Post Quantization is always enabled
+        offloading: bool = False,                 # Layer-wise CPU KV offload (opt-in; default off = no behavior change)
+        max_length: int | None = None,            # Pinned host mirror ceiling = MAX_MODEL_LEN + MAX_GEN (required when offloading)
+        resident_layers: int = 2,                 # Working-window size for the double-buffered offload milestone
+        offload_prefetch: bool = False,           # Opt-in double-buffered prefetch (overlap next-layer H2D with compute)
     ):
         super().__init__("kitty_kv")
         self.sink_length = sink_length
@@ -51,6 +56,10 @@ class KittyKVCacheConfig(CacheConfig):
         self.channel_selection = channel_selection
         self.VCache_BitDecoding = VCache_BitDecoding
         self.PostQuant = PostQuant
+        self.offloading = offloading
+        self.max_length = max_length
+        self.resident_layers = resident_layers
+        self.offload_prefetch = offload_prefetch
         #
         self.validate()
 
@@ -148,7 +157,16 @@ class KittyKVCacheConfig(CacheConfig):
                     found_value=self.group_size,
                 ),
             )
-        
+        if self.offloading:
+            # Offload evicts the stored slot after update() returns; that is only
+            # safe when PostQuant returns independent clones for the current step.
+            if not self.PostQuant:
+                raise ValueError("KV offload requires PostQuant=True (it returns clones).")
+            if self.max_length is None or self.max_length <= 0:
+                raise ValueError(
+                    "KV offload requires a positive max_length (MAX_MODEL_LEN + MAX_GEN)."
+                )
+
 class KittyKVCache(DynamicCache):
     """
     A quantizer cache that supports Kitty quantization.
@@ -175,6 +193,17 @@ class KittyKVCache(DynamicCache):
         self.VCache_BitDecoding = cache_config.VCache_BitDecoding
         self.PostQuant = cache_config.PostQuant
         self.cache_implementation = cache_config.cache_implementation
+        # Layer-wise CPU KV offload (opt-in). When disabled this stays None and
+        # update() runs exactly as before (no behavior change).
+        self._offloader = (
+            LayerKVOffloader(
+                cache_config.max_length,
+                cache_config.resident_layers,
+                prefetch=getattr(cache_config, "offload_prefetch", False),
+            )
+            if getattr(cache_config, "offloading", False)
+            else None
+        )
         #
         #self.query_cache: list[torch.Tensor] = []
         #self.query_score: list[torch.Tensor] = []
@@ -238,6 +267,9 @@ class KittyKVCache(DynamicCache):
         
         #query_states = cache_kwargs.get("query_states", None) if cache_kwargs is not None else None
 
+        if self._offloader is not None:
+            self._offloader.capture_device(key_states)
+
         if len(self.key_cache) < layer_idx:
             raise ValueError("QuantizedCache does not support model usage where layers are skipped. Use DynamicCache.")
         ################################################## Prefill Phase ##################################################
@@ -278,6 +310,12 @@ class KittyKVCache(DynamicCache):
                 current_value_cache[:, :, start_idx:end_idx, :] = value_slice
         ################################################## Decoding Phase ##################################################
         else:
+            # Offload: this layer was evicted to host after the previous step;
+            # bring it back to the compute device before the cat reads it, and
+            # kick off the next layer's H2D so it overlaps this layer's compute.
+            if self._offloader is not None:
+                self._offloader.ensure_resident(self.key_cache, self.value_cache, layer_idx)
+                self._offloader.prefetch_next(self.key_cache, self.value_cache, layer_idx)
             # update the key and value caches
             self.key_cache[layer_idx] = torch.cat([self.key_cache[layer_idx], key_states], dim=-2)
             self.value_cache[layer_idx] = torch.cat([self.value_cache[layer_idx], value_states], dim=-2)
@@ -309,6 +347,10 @@ class KittyKVCache(DynamicCache):
                     value_slice = fake_quant_groupwise_lastdim(value_slice, self.group_size, self.vbits)
                     current_value_cache[:, :, -self.buffer_length-1:-self.buffer_length, :] = value_slice
         ####################################################################################################################
+        # Offload: PostQuant returned independent clones above, so the stored
+        # slot can be moved to pinned host RAM now (frees this layer's GPU KV).
+        if self._offloader is not None:
+            self._offloader.evict(self.key_cache, self.value_cache, layer_idx)
         if self.PostQuant:
             return keys_to_return, values_to_return
         else:
@@ -332,6 +374,10 @@ def get_kvcache_kitty(args: argparse.Namespace) -> KittyKVCache:
         channel_selection   = args.channel_selection,
         VCache_BitDecoding  = False,  # Using KIVI Style V Cache
         PostQuant           = True,  # Post Quantization is always enabled for Kitty KV Cache
+        offloading          = bool(getattr(args, "offloading", False)),
+        max_length          = getattr(args, "max_length", None),
+        resident_layers     = int(getattr(args, "resident_layers", 2)),
+        offload_prefetch    = bool(getattr(args, "offload_prefetch", False)),
     )
     #
     return KittyKVCache(cache_config=cache_config)
