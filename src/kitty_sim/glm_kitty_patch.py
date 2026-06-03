@@ -398,6 +398,7 @@ def _glm_real_kitty_attention_forward(
             page_size=cfg["page_size"], promote_ratio=cfg["promote_ratio"],
             quest_enabled=cfg["quest_enabled"], quest_token_budget=cfg["quest_token_budget"],
             quest_skip_layers=cfg["quest_skip_layers"],
+            offloading=cfg.get("offloading", False),
         )
     kc = self._kitty_cache
     is_prefill = kc.update(key_layer, value_layer, 0, None)
@@ -446,6 +447,7 @@ def install_glm_real_kitty_kernel(
     quest_token_budget: int | None = 2048,
     quest_skip_layers: int = 0,
     stats=None,
+    offloading: bool = False,
 ):
     """Install the REAL Triton QUEST+Kitty decode kernel on a loaded GLM model.
 
@@ -479,6 +481,7 @@ def install_glm_real_kitty_kernel(
         "page_size": page_size, "promote_ratio": promote_ratio,
         "quest_enabled": quest_enabled, "quest_token_budget": quest_token_budget,
         "quest_skip_layers": quest_skip_layers,
+        "offloading": offloading,
     }
 
     for attn in attn_modules:

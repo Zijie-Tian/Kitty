@@ -186,6 +186,7 @@ def _real_kernel_cache(variant: VariantConfig, model: Any, context_length: int, 
     if getattr(config, "head_dim", None) is None:
         config.head_dim = config.hidden_size // config.num_attention_heads
     max_length = int(context_length) + int(max_gen)
+    offloading = os.environ.get("KITTY_OFFLOAD", "0").lower() not in ("0", "", "false", "no")
     return get_real_kvcache_kitty(
         config,
         1,
@@ -195,6 +196,7 @@ def _real_kernel_cache(variant: VariantConfig, model: Any, context_length: int, 
         quest_enabled=variant.quest_enabled,
         quest_token_budget=variant.quest_token_budget,
         quest_skip_layers=variant.quest_skip_layers,
+        offloading=offloading,
     )
 
 
@@ -786,6 +788,7 @@ def run_longbench(args: Any) -> dict[str, Any]:
             quest_enabled=variant.quest_enabled,
             quest_token_budget=variant.quest_token_budget,
             quest_skip_layers=variant.quest_skip_layers,
+            offloading=os.environ.get("KITTY_OFFLOAD", "0").lower() not in ("0", "", "false", "no"),
         )
         print(
             f"[glm-quest-kernel] installed real Triton QUEST+Kitty on {kitty_stats['installed']} layers "

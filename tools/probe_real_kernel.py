@@ -39,6 +39,8 @@ def main() -> None:
     p.add_argument("--promote-ratio", type=float, default=0.125)
     p.add_argument("--quest-token-budget", type=int, default=2048)
     p.add_argument("--quest-skip-layers", type=int, default=0)
+    p.add_argument("--offload", action="store_true",
+                   help="layer-wise CPU offload of the packed 2-bit KV buffers")
     p.add_argument("--seed", type=int, default=1234)
     args = p.parse_args()
 
@@ -73,6 +75,7 @@ def main() -> None:
         quest_enabled=True,
         quest_token_budget=args.quest_token_budget,
         quest_skip_layers=args.quest_skip_layers,
+        offloading=args.offload,
     )
 
     vocab = int(config.vocab_size)
@@ -98,11 +101,14 @@ def main() -> None:
     gen = out[0, input_ids.shape[-1]:].detach().cpu().tolist()
     peak_alloc = torch.cuda.max_memory_allocated() / 2**30
     peak_resv = torch.cuda.max_memory_reserved() / 2**30
-    last_path = getattr(cache, "last_quest_path", None)
+    # QUEST path is recorded per-layer on each KVCache_Layer.
+    from collections import Counter
+    paths = Counter(getattr(l, "last_quest_path", None) for l in cache.kv_cache)
+    sel_pages = getattr(cache.kv_cache[0], "last_selected_pages_shape", None)
     print(f"  ctx={args.context_len} gen={args.max_new_tokens} budget={args.quest_token_budget}")
     print(f"  WEIGHTS={weights:.2f}  peak_alloc={peak_alloc:.2f} GiB  peak_reserved={peak_resv:.2f} GiB  "
           f"transient(peak-weights)={peak_alloc - weights:.2f} GiB  time={dt:.2f}s")
-    print(f"  last_quest_path={last_path}")
+    print(f"  quest_paths={dict(paths)}  selected_pages_shape={sel_pages}")
     print(f"GENIDS: {gen}")
 
 

@@ -66,6 +66,7 @@ class KittyCache(Cache):
         quest_token_budget: int | None = None,
         quest_skip_layers: int = 0,
         force_sparse_for_equivalence: bool = False,
+        offloading: bool = False,
     ) -> None:
         try:
             # transformers>=4.57 requires explicit layer storage at Cache init time.
@@ -120,6 +121,54 @@ class KittyCache(Cache):
             layer.quest_config = self.quest_config
             self.kv_cache.append(layer)
 
+        # Layer-wise CPU offload of the packed 2-bit KV (opt-in). The big
+        # statically-allocated per-layer buffers below are mirrored to pinned host
+        # RAM after prefill and brought back on first decode use; KeyPage_Min/Max
+        # stay GPU-resident (the QUEST selector scans them). Keeps the prefill peak
+        # low (only ~1 layer's packed KV resident while the MLP transient is live).
+        self._offloading = bool(offloading)
+        self._offload_device = self.kv_cache[0].KeyCache.device if self._offloading else None
+        self._offload_host: dict[tuple[int, str], torch.Tensor] = {}
+        self._offload_evicted: set[int] = set()
+        if self._offloading:
+            # The packed buffers are statically allocated on GPU above. Move them
+            # ALL to host up front so the prefill peak (a single layer's MLP
+            # transient) does not carry the other layers' ~114 MiB packed KV each.
+            # quantize_prefill pages each layer back to GPU only to pack, then evicts.
+            for _li in range(self.num_hidden_layers):
+                self._offload_evict_layer(_li)
+
+    _OFFLOAD_ATTRS = ("KeyCache", "KeyCache_metadata", "ValueCache", "ValueCache_metadata")
+
+    def _offload_evict_layer(self, layer_idx: int) -> None:
+        """D2H this layer's packed KV buffers to their pinned host mirror."""
+        if not self._offloading:
+            return
+        layer = self.kv_cache[layer_idx]
+        for attr in self._OFFLOAD_ATTRS:
+            t = getattr(layer, attr)
+            if t.device.type == "cpu":
+                continue
+            key = (layer_idx, attr)
+            host = self._offload_host.get(key)
+            if host is None or host.shape != t.shape or host.dtype != t.dtype:
+                host = torch.empty(t.shape, dtype=t.dtype, device="cpu", pin_memory=True)
+                self._offload_host[key] = host
+            host.copy_(t)  # synchronous D2H; frees the GPU buffer on rebind
+            setattr(layer, attr, host)
+        self._offload_evicted.add(layer_idx)
+
+    def _offload_ensure_resident(self, layer_idx: int) -> None:
+        """H2D this layer's packed KV buffers back to the compute device."""
+        if not self._offloading or layer_idx not in self._offload_evicted:
+            return
+        layer = self.kv_cache[layer_idx]
+        for attr in self._OFFLOAD_ATTRS:
+            t = getattr(layer, attr)
+            if t.device.type == "cpu":
+                setattr(layer, attr, t.to(self._offload_device, non_blocking=False))
+        self._offload_evicted.discard(layer_idx)
+
     def update(
         self,
         key_states: torch.Tensor,
@@ -154,6 +203,11 @@ class KittyCache(Cache):
             kvcache.value_states = value_states.contiguous()
             return True
         # Decode
+        # Offload: bring this layer's packed KV back to GPU before the decode
+        # kernel reads it (it was evicted to host after prefill). It then stays
+        # resident for the rest of decode (the prefill MLP peak is already past).
+        if self._offloading:
+            self._offload_ensure_resident(layer_idx)
         assert key_states.shape[-2] == 1 and value_states.shape[-2] == 1, \
             "Decode: key_states and value_states should have sequence length of 1."
         #  
@@ -185,6 +239,11 @@ class KittyCache(Cache):
 
     def quantize_prefill(self, layer_idx: int = 0) -> None:
         kvcache = self.kv_cache[layer_idx]
+        # Offload: bring this layer's packed buffers to GPU so quantize_pack can
+        # write them; they are evicted again at the end of this method, so the
+        # subsequent MLP of this layer runs without this layer's packed KV resident.
+        if self._offloading:
+            self._offload_ensure_resident(layer_idx)
         #
         if kvcache.key_states is None or kvcache.value_states is None:
             raise ValueError("No key_states or value_states to quantize. Please call update() first.")
@@ -251,6 +310,10 @@ class KittyCache(Cache):
         # Clear the legacy states
         kvcache.key_states = None
         kvcache.value_states = None
+        # Offload: this layer's packed KV is now built; move it to host so its
+        # ~114 MiB of GPU buffers free while the remaining prefill layers run.
+        if self._offloading:
+            self._offload_evict_layer(layer_idx)
         return
 
     def quantize_decode(self, layer_idx: int = 0) -> None:
@@ -340,7 +403,8 @@ def get_kvcache_kitty(
         quest_topk_pages: int | None = None,
         quest_token_budget: int | None = None,
         quest_skip_layers: int = 0,
-        force_sparse_for_equivalence: bool = False,) -> KittyCache:
+        force_sparse_for_equivalence: bool = False,
+        offloading: bool = False,) -> KittyCache:
     """
     Get the KittyCache object.
     Returns:
@@ -359,4 +423,5 @@ def get_kvcache_kitty(
         quest_token_budget=quest_token_budget,
         quest_skip_layers=quest_skip_layers,
         force_sparse_for_equivalence=force_sparse_for_equivalence,
+        offloading=offloading,
     )
