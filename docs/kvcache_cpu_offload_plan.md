@@ -512,6 +512,46 @@ tight GLM-128k peak (38.96/40) keeps the minimal ~1-layer working set.
 
 ---
 
+## Appendix C — Real Triton QUEST+Kitty kernel KV offload (2026-06-03)
+
+After rebasing onto the updated `tzj/kitty` (which added the real Triton QUEST+Kitty
+kernel for Llama AND GLM), the offload was adapted to the **real** `KittyCache`
+(`src/kitty/kvcache/kitty.py`). The real cache stores **2-bit packed** KV in
+statically-allocated per-layer buffers (`KeyCache`, `KeyCache_metadata`,
+`ValueCache`, `ValueCache_metadata`); these are offloaded to pinned host RAM, while
+`KeyPage_Min/Max` (the QUEST page-selection bounds) stay GPU-resident.
+
+**Implementation is entirely in `kitty.py` (no modeling-file edits).** The decode
+kernel reads the packed buffers *between* `update()` and `quantize_decode()`, so the
+hooks are: ensure-resident at `update()`-top (decode) + `quantize_prefill()`-top;
+evict at `quantize_prefill()`-end. **Key subtlety:** the buffers are allocated upfront
+on GPU at cache construction, so a naive progressive evict still leaves the *first*
+layer's MLP peak carrying the other layers' packed KV (first attempt saved only
+0.22 GiB). The fix evicts **all** layers at `__init__`, then `quantize_prefill` pages
+each layer back only to pack and immediately evicts — so any layer's MLP transient
+runs with ~0 of the other layers' packed KV resident.
+
+Opt-in: `KITTY_OFFLOAD=1` (runner real-kernel + GLM real-kernel paths) /
+`offloading=` (`get_kvcache_kitty`) / `--offload` (`tools/probe_real_kernel.py`).
+
+**Measured @128k, GPU0 (bit-identical off/on; QUEST stays `triton_sparse_reduced_budget`,
+128 pages; one-time transfer so no per-token latency cost):**
+
+| Config @128k | peak_alloc | time | fits 40 GB? |
+|---|---|---|---|
+| Qwen3-8B sim + offload | 28.33 | 295 s | yes |
+| Qwen3-8B real kernel, no offload | 33.41 | 48 s | yes |
+| **Qwen3-8B real kernel + offload** | **29.47** | 50 s | yes |
+| GLM-9B real kernel, no offload | — | — | **OOM (~38.7, swiglu)** |
+| **GLM-9B real kernel + offload** | **36.70** | 94 s | **yes** (expandable_segments) |
+
+**Takeaways:**
+- Qwen real+offload (29.47, fast) is the sweet spot — low peak AND ~6× faster than sim+offload.
+- **GLM real kernel @128k OOMs without offload but FITS (36.70) with it** — the offload is load-bearing for the GLM real kernel.
+- The floor is the per-layer **MLP transient** (Qwen ~13, GLM ~19 GiB) + resident `KeyPage` QUEST metadata (~1.15). KV offload removes only the packed KV; it does **not** cut the MLP floor (only chunked prefill does). So GLM real+offload (36.70) ≈ GLM sim+offload (36.57), both MLP-bound — but the real kernel makes long **decode** sparse/fast.
+
+---
+
 ## Appendix A — Corrections folded in from adversarial review
 
 | # | First-draft claim | Correction (source) |
