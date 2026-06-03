@@ -20,7 +20,7 @@
 from __future__ import annotations
 
 import types
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 import torch
 from transformers.cache_utils import Cache
@@ -40,8 +40,9 @@ def _llama_kitty_attention_forward(
     hidden_states: torch.Tensor,
     position_embeddings: tuple[torch.Tensor, torch.Tensor],
     attention_mask: Optional[torch.Tensor] = None,
-    past_key_values: Optional[Cache] = None,
+    past_key_value: Any = None,
     cache_position: Optional[torch.LongTensor] = None,
+    past_key_values: Any = None,
     **kwargs,
 ):
     """Kitty attention forward for a stock Llama attention module.
@@ -61,7 +62,13 @@ def _llama_kitty_attention_forward(
     cos, sin = position_embeddings
     query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-    assert past_key_values is not None, (
+    # Transformers attention modules receive the cache as `past_key_value`
+    # (singular) on some versions/call sites, while model/generate APIs use
+    # `past_key_values` (plural). Accept both so the KittyCache is never lost
+    # (otherwise a singular-keyword call site silently passes None and decode would
+    # be mislabelled). Mirrors the sim hook fix in kitty_sim/sim_quest.py.
+    kv_cache = past_key_value if past_key_value is not None else past_key_values
+    assert kv_cache is not None, (
         "LlamaForCausalLM_Kitty requires a KittyCache passed via past_key_values; "
         "got None. Build it with kitty.kvcache.get_kvcache_kitty(...)."
     )
@@ -69,7 +76,7 @@ def _llama_kitty_attention_forward(
     # KittyCache.update() returns a bool IsPrefill flag (NOT the (k, v) tuple a
     # stock HF cache returns), which is exactly why the attention forward must be
     # replaced rather than reused.
-    is_prefill = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
+    is_prefill = kv_cache.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
     if is_prefill:  # Prefill: dense attention over the full freshly-computed K/V.
         attention_interface: Callable = eager_attention_forward
@@ -85,15 +92,15 @@ def _llama_kitty_attention_forward(
             scaling=self.scaling,
             **kwargs,
         )
-        past_key_values.quantize_prefill(self.layer_idx)
+        kv_cache.quantize_prefill(self.layer_idx)
     else:  # Decode: real Triton Kitty kernel + QUEST query-aware page selection.
         attn_output, attn_weights = kitty_attention_forward(
             self,
             query_states,
-            past_key_values.kv_cache[self.layer_idx],
+            kv_cache.kv_cache[self.layer_idx],
             scaling=self.scaling,
         )
-        past_key_values.quantize_decode(self.layer_idx)
+        kv_cache.quantize_decode(self.layer_idx)
 
     attn_output = attn_output.reshape(*input_shape, -1).contiguous()
     attn_output = self.o_proj(attn_output)

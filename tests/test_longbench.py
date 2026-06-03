@@ -216,6 +216,19 @@ class LongBenchTests(unittest.TestCase):
         self.assertEqual(cache.get_seq_length(), 4)
         self.assertEqual(stats["prefill_calls"], 1)
 
+    def test_real_kernel_llama_hook_accepts_singular_and_plural_cache(self):
+        # Regression: HF passes the cache as `past_key_value` (singular) to attention
+        # modules on some transformers versions/call sites, and `past_key_values`
+        # (plural) on others. The real-kernel Llama hook must accept BOTH, else the
+        # KittyCache is silently lost ("requires a KittyCache ... got None").
+        import inspect
+
+        from kitty.models.llama.modeling_llama import _llama_kitty_attention_forward
+
+        params = inspect.signature(_llama_kitty_attention_forward).parameters
+        self.assertIn("past_key_value", params)
+        self.assertIn("past_key_values", params)
+
     def test_glm_real_kitty_kernel_install_is_importable(self):
         # No-GPU wiring check: the GLM real-kernel installer + shared plumbing are
         # importable and the GLM family is recognized (GPU smoke covers behavior).
