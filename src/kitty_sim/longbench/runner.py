@@ -307,10 +307,11 @@ def load_model_and_tokenizer(
     )
     if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
         tokenizer.pad_token = tokenizer.eos_token
-    if real_kernel:
+    if real_kernel and not is_glm_family(model_family):
+        # Llama/Qwen real kernel: load the architecture-specific *_Kitty class whose
+        # attention forward drives the real paged KittyCache. Prefill runs through a
+        # stock backend (sdpa needs no flash-attn); decode runs the Triton kernel.
         model_class = _real_kernel_model_class(model_family)
-        # Prefill runs through a stock attention backend (sdpa needs no
-        # flash-attn); decode always runs the Triton Kitty kernel regardless.
         model_obj = model_class.from_pretrained(
             resolved,
             torch_dtype=torch_dtype,
@@ -320,6 +321,10 @@ def load_model_and_tokenizer(
             local_files_only=local_files_only,
         )
     else:
+        # All sim/fake-quant paths AND GLM real-kernel load the stock (remote-code)
+        # model; for GLM real-kernel the Triton kernel is installed post-load by
+        # install_glm_real_kitty_kernel (GLM's legacy tuple cache can't thread an HF
+        # KittyCache via past_key_values, so a *_Kitty class would not help).
         model_obj = AutoModelForCausalLM.from_pretrained(
             resolved,
             torch_dtype=torch_dtype,
@@ -419,6 +424,12 @@ def generate_dataset(
             # its own (now-quantized) cache. All other models use the KittyKVCache.
             if legacy_cache_model:
                 kv_cache = None
+                if variant.real_kernel:
+                    # GLM real kernel keeps the paged KittyCache on its modules; size
+                    # it for this sample (context + generation) before generate().
+                    from kitty_sim.glm_kitty_patch import set_glm_real_kitty_sample_length
+
+                    set_glm_real_kitty_sample_length(model, context_length + max_gen)
             elif variant.real_kernel:
                 # Real Triton Kitty + QUEST kernel: per-sample paged cache sized
                 # to this prompt; decode runs the sparse Triton kernels.
@@ -457,7 +468,43 @@ def generate_dataset(
             # Guardrail: refuse to silently report dense fp16 as Kitty. Verify the
             # KV quantization path actually engaged on the first generated sample.
             if variant.use_kitty and not kitty_engagement_checked:
-                if legacy_cache_model:
+                if legacy_cache_model and variant.real_kernel:
+                    # GLM real kernel: the paged cache lives on the modules, so the
+                    # evidence is the accumulated last_quest_path in kitty_stats["paths"]
+                    # (same accept/reject logic as the Llama/Qwen real-kernel branch).
+                    paths = dict(kitty_stats.get("paths", {})) if kitty_stats else {}
+                    decode_calls = int(kitty_stats.get("decode_calls", 0)) if kitty_stats else 0
+                    has_triton = any(p.startswith("triton_sparse") for p in paths)
+                    dense_ok = {"dense_full_budget", "dense_no_shared_pages"}
+                    sparse_paths = {"triton_sparse_reduced_budget", "triton_sparse_forced_all_pages"}
+                    allowed = sparse_paths | dense_ok
+                    if variant.quest_skip_layers > 0:
+                        allowed = allowed | {"dense", "dense_skip_layer"}
+                    unexpected = set(paths) - allowed
+                    has_evidence = has_triton or set(paths) <= dense_ok or variant.quest_skip_layers > 0
+                    engaged = (
+                        kitty_stats is not None
+                        and int(kitty_stats.get("installed", 0)) > 0
+                        and decode_calls > 0
+                        and bool(paths)
+                        and not unexpected
+                        and has_evidence
+                    )
+                    detail = (
+                        f"installed={kitty_stats.get('installed') if kitty_stats else None} "
+                        f"decode_calls={decode_calls} paths={paths} triton_sparse={has_triton} "
+                        f"unexpected={sorted(unexpected)} quest_skip_layers={variant.quest_skip_layers}"
+                    )
+                    print(f"[glm-quest-kernel] {dataset} first-sample evidence: {detail}")
+                    raise_msg = (
+                        f"GLM real QUEST+Kitty kernel variant '{variant.name}' did not engage the "
+                        f"Triton sparse decode kernel ({detail}). Accepted last_quest_path: "
+                        f"'triton_sparse_*' (real selection), 'dense_full_budget'/'dense_no_shared_pages' "
+                        f"(context < budget), 'dense'/'dense_skip_layer' only when quest_skip_layers>0. "
+                        f"A bare 'dense' with skip=0, 'python_sparse_debug', or 'unknown' means QUEST "
+                        f"silently degraded. Refusing to proceed. See kitty_sim/glm_kitty_patch.py."
+                    )
+                elif legacy_cache_model:
                     engaged = bool(kitty_stats and kitty_stats.get("calls", 0) > 0)
                     detail = f"glm fake-quant patch calls={kitty_stats.get('calls') if kitty_stats else None}"
                     raise_msg = (
@@ -691,7 +738,25 @@ def run_longbench(args: Any) -> dict[str, Any]:
     # KittyKVCache logic used for HF-Cache models.
     legacy_cache_model = is_glm_family(model_family)
     kitty_stats: dict[str, Any] | None = None
-    if variant.sim_quest:
+    if variant.real_kernel and legacy_cache_model:
+        # GLM real Triton QUEST+Kitty kernel. GLM's legacy tuple cache can't thread an
+        # HF KittyCache via past_key_values, so the kernel is installed onto each
+        # SelfAttention; per-sample cache sizing is set in generate_dataset.
+        from kitty_sim.glm_kitty_patch import install_glm_real_kitty_kernel
+
+        kitty_stats = install_glm_real_kitty_kernel(
+            model_obj,
+            page_size=variant.page_size,
+            promote_ratio=variant.promote_ratio,
+            quest_enabled=variant.quest_enabled,
+            quest_token_budget=variant.quest_token_budget,
+            quest_skip_layers=variant.quest_skip_layers,
+        )
+        print(
+            f"[glm-quest-kernel] installed real Triton QUEST+Kitty on {kitty_stats['installed']} layers "
+            f"(variant={variant.tag}, budget={variant.quest_token_budget}, skip_layers={variant.quest_skip_layers})"
+        )
+    elif variant.sim_quest:
         # Pure-torch QUEST hook on the stock model; the sim KittyKVCache (passed
         # per sample via past_key_values) still supplies the Kitty fake-quant.
         from kitty_sim.quest_sparse import QuestConfig as _SimQuestConfig

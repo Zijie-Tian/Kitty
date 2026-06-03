@@ -20,3 +20,4 @@ build/
 logs/longbench_gpu0
 logs/longbench
 /logs/longbench_gpu1
+/quest_check_logs

@@ -216,6 +216,22 @@ class LongBenchTests(unittest.TestCase):
         self.assertEqual(cache.get_seq_length(), 4)
         self.assertEqual(stats["prefill_calls"], 1)
 
+    def test_glm_real_kitty_kernel_install_is_importable(self):
+        # No-GPU wiring check: the GLM real-kernel installer + shared plumbing are
+        # importable and the GLM family is recognized (GPU smoke covers behavior).
+        from kitty_sim.glm_kitty_patch import (
+            install_glm_real_kitty_kernel,
+            set_glm_real_kitty_sample_length,
+            install_glm_cache_plumbing,
+            is_glm_family,
+        )
+
+        self.assertTrue(is_glm_family("glm4"))
+        self.assertTrue(is_glm_family("chatglm"))
+        self.assertFalse(is_glm_family("llama3"))
+        for fn in (install_glm_real_kitty_kernel, set_glm_real_kitty_sample_length, install_glm_cache_plumbing):
+            self.assertTrue(callable(fn))
+
     def test_kitty_cache_accepts_short_prefill_without_assertion(self):
         cache = KittyKVCache(
             KittyKVCacheConfig(

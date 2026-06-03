@@ -451,15 +451,25 @@ overrides; never hardcode host paths in tracked files.
 ### Real QUEST + Kitty kernel on LongBench (variant `quest_kitty_page16_kernel`)
 
 `--variant quest_kitty_page16_kernel` is the REAL Triton Kitty + QUEST sparse
-decode path on LongBench, NOT the `kitty_page16` fake-quant proxy. The runner
-loads the architecture-specific `*_Kitty` model class (`kitty.models.llama`
-`LlamaForCausalLM_Kitty` or `kitty.models.qwen3` `Qwen3ForCausalLM_Kitty`) and
-builds the real paged `kitty.kvcache` cache per sample; decode runs the Triton
-sparse QK/SV kernels with query-aware page selection.
+decode path on LongBench, NOT the `kitty_page16` fake-quant proxy. Decode runs the
+Triton sparse QK/SV kernels with query-aware page selection over the real paged
+`kitty.kvcache` cache.
 
-Supported model families: `llama` and `qwen` only. Other families raise (no
-`kitty/models/<arch>` port exists). The Llama port reuses stock HF Llama and
-replaces only the attention forward (`src/kitty/models/llama/modeling_llama.py`).
+Supported model families: `llama`, `qwen`, and `glm`.
+- `llama` / `qwen`: the runner loads the architecture-specific `*_Kitty` model
+  class (`kitty.models.llama` `LlamaForCausalLM_Kitty` / `kitty.models.qwen3`
+  `Qwen3ForCausalLM_Kitty`, stock HF model with only the attention forward
+  replaced) and builds the real paged cache per sample via `past_key_values`.
+- `glm`: ChatGLM-4 loads its own remote code with a legacy tuple cache that can
+  NOT thread an HF cache via `past_key_values`, so the runner loads the stock
+  remote-code model (`AutoModelForCausalLM`, NOT a `*_Kitty` class) and installs
+  the kernel post-load with `kitty_sim.glm_kitty_patch.install_glm_real_kitty_kernel`
+  (per-layer 1-layer `KittyCache` on each `SelfAttention`; reuses the GLM
+  de-frag + generate shims). GLM must run in **fp16** (the GLM target already
+  passes `--torch-dtype float16`; the kitty cache/kernel buffers are fp16 while
+  GLM weights are bf16). The runner sizes each layer's cache per sample via
+  `set_glm_real_kitty_sample_length`, and the guardrail validates
+  `kitty_stats["paths"]` (printed as `[glm-quest-kernel] ... paths=...`).
 
 Always pass the QUEST budget explicitly: `QUEST_BUDGET=2048` (page16 -> 128
 logical pages). `QUEST_SKIP_LAYERS` defaults to 0 (every decode layer uses QUEST
@@ -498,6 +508,25 @@ The `.env` here has no `KITTY_LLAMA32_1B_PATH`, so the model path must be passed
 explicitly via `LLAMA32_MODEL_PATH=` (otherwise it falls back to a non-existent
 `$HOME/models/...`). For Qwen3-8B, use `qwen --variant quest_kitty_page16_kernel`
 (the `kitty` env already resolves `KITTY_QWEN3_8B_PATH`).
+
+Real QUEST+Kitty for GLM-4-9B-Chat-1M on GPU0 (remote code, fp16 forced by the GLM
+target; `.env` has no `KITTY_GLM4_9B_1M_PATH`, so pass `GLM_MODEL_PATH=`; GLM-9B is
+memory-heavy, so smoke at `MAX_MODEL_LEN=8192` first, then scale to 32768 watching
+`nvidia-smi`):
+
+```bash
+cd /mnt/data/tzj/Code/Kitty
+GLM_MODEL_PATH=/mnt/data/tzj/models/GLM-4-9B-Chat-1M \
+MAX_MODEL_LEN=8192 QUEST_BUDGET=2048 QUEST_SKIP_LAYERS=0 \
+DATASETS_CSV=multifieldqa_en,hotpotqa \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+bash scripts/run_exp.sh glm --variant quest_kitty_page16_kernel --gpu 0 --max-samples 2
+# -> longbench_out/smoke/glm4-9b-chat-1m_quest-kitty-kernel/{pred,logs}
+# full: drop --max-samples and raise MAX_MODEL_LEN to 32768 (watch GPU0 memory).
+```
+
+GLM evidence lines read `[glm-quest-kernel] ... paths={'triton_sparse_reduced_budget': N}`
+on long-context samples (short samples legitimately show `dense_full_budget`).
 
 ### Pure-torch QUEST + Kitty on LongBench (variant `quest_kitty_page16_sim`)
 

@@ -162,7 +162,11 @@ proxy (dense KV quant, NO query-aware selection) has been REMOVED. There are now
 two genuinely query-aware QUEST variants: `quest_kitty_page16_sim` (pure-PyTorch,
 no Triton; sim KittyKVCache fake-quant + gather-based QUEST oracle via
 `kitty_sim/sim_quest.py`; accuracy + relative-timing proxy, not a kernel-speed
-proof) and `quest_kitty_page16_kernel` (real Triton kernel, Llama/Qwen only).
+proof) and `quest_kitty_page16_kernel` (real Triton kernel; supports Llama, Qwen,
+and GLM). Llama/Qwen use the `kitty.models.{llama,qwen3}` `*_Kitty` classes; GLM
+(remote-code, legacy tuple cache) is installed post-load via
+`kitty_sim.glm_kitty_patch.install_glm_real_kitty_kernel` (per-layer KittyCache,
+fp16 required) — see CLAUDE.md for the GLM command.
 
 ## True QUEST + Kitty page16 kernel usage
 
