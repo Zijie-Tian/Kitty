@@ -13,9 +13,10 @@
 # method_layout_slug), separated by an underscore.
 #
 # Usage:
-#   bash scripts/run_exp.sh [all|llama|qwen|glm|deepseek|llama32] [--gpu GPU] [--max-samples N]
+#   bash scripts/run_exp.sh [all|llama|qwen|glm|deepseek|llama32] [--gpu GPU | --gpus G0,G1,...] [--max-samples N]
 #   SERIAL=1 bash scripts/run_exp.sh all
 #   bash scripts/run_exp.sh llama32 --gpu 1 --max-samples 2
+#   bash scripts/run_exp.sh llama32 --gpus 0,1,2 --max-samples 2   # fan datasets across GPUs (shell-level parallelism)
 #
 # Notes:
 # - .env is sourced automatically (KITTY_PYTHON_BIN, KITTY_*_PATH, LONGBENCH_DATA_ROOT).
@@ -41,6 +42,9 @@ source "${REPO_ROOT}/accuracy_simulation/env.sh"
 PYTHON_BIN="${PYTHON_BIN:-${KITTY_PYTHON_BIN:-${HOME}/anaconda3/envs/kitty/bin/python}}"
 DATA_ROOT="${DATA_ROOT:-${LONGBENCH_DATA_ROOT:-${HOME}/data/LongBench}}"
 GPU_OVERRIDE="${GPU_OVERRIDE:-}"
+# Multi-GPU dataset fan-out (CSV), e.g. "0,1,2".
+# Precedence: --gpus > --gpu > GPU_IDS_CSV env > per-target default.
+GPUS_OVERRIDE="${GPUS_OVERRIDE:-}"
 MAX_SAMPLES="${MAX_SAMPLES:--1}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-32768}"
 RUN_VARIANT="${RUN_VARIANT:-}"        # empty => per-target default; --variant/RUN_VARIANT overrides
@@ -60,41 +64,41 @@ LONGBENCH_DATASETS=(
 LLAMA_GPU="${LLAMA_GPU:-0}"
 LLAMA_MODEL_ID="${LLAMA_MODEL_ID:-meta-llama/Llama-3.1-8B-Instruct}"
 LLAMA_MODEL_PATH="${LLAMA_MODEL_PATH:-${KITTY_LLAMA31_8B_PATH:-${HOME}/models/Llama-3.1-8B-Instruct}}"
-LLAMA_MODEL_SLUG="llama31-8b-instruct"
+LLAMA_MODEL_SLUG="${LLAMA_MODEL_SLUG:-llama31-8b-instruct}"
 LLAMA_MAX_GEN="${LLAMA_MAX_GEN:-}"
 LLAMA_DEFAULT_VARIANT="${LLAMA_DEFAULT_VARIANT:-kitty}"
 
 LLAMA32_GPU="${LLAMA32_GPU:-1}"
 LLAMA32_MODEL_ID="${LLAMA32_MODEL_ID:-meta-llama/Llama-3.2-1B-Instruct}"
 LLAMA32_MODEL_PATH="${LLAMA32_MODEL_PATH:-${KITTY_LLAMA32_1B_PATH:-${HOME}/models/Llama-3.2-1B-Instruct}}"
-LLAMA32_MODEL_SLUG="llama32-1b-instruct"
+LLAMA32_MODEL_SLUG="${LLAMA32_MODEL_SLUG:-llama32-1b-instruct}"
 LLAMA32_MAX_GEN="${LLAMA32_MAX_GEN:-256}"
 LLAMA32_DEFAULT_VARIANT="${LLAMA32_DEFAULT_VARIANT:-quest_kitty_page16_sim}"
 
 QWEN_GPU="${QWEN_GPU:-1}"
 QWEN_MODEL_ID="${QWEN_MODEL_ID:-Qwen/Qwen3-8B}"
 QWEN_MODEL_PATH="${QWEN_MODEL_PATH:-${KITTY_QWEN3_8B_PATH:-${HOME}/models/Qwen3-8B}}"
-QWEN_MODEL_SLUG="qwen3-8b"
+QWEN_MODEL_SLUG="${QWEN_MODEL_SLUG:-qwen3-8b}"
 QWEN_MAX_GEN="${QWEN_MAX_GEN:-2048}"
 QWEN_DEFAULT_VARIANT="${QWEN_DEFAULT_VARIANT:-kitty}"
 
 GLM_GPU="${GLM_GPU:-2}"
 GLM_MODEL_ID="${GLM_MODEL_ID:-THUDM/GLM-4-9B-Chat-1M}"
 GLM_MODEL_PATH="${GLM_MODEL_PATH:-${KITTY_GLM4_9B_1M_PATH:-${HOME}/models/GLM-4-9B-Chat-1M}}"
-GLM_MODEL_SLUG="glm4-9b-chat-1m"
+GLM_MODEL_SLUG="${GLM_MODEL_SLUG:-glm4-9b-chat-1m}"
 GLM_MAX_GEN="${GLM_MAX_GEN:-}"
 GLM_DEFAULT_VARIANT="${GLM_DEFAULT_VARIANT:-kitty}"
 
 DEEPSEEK_GPU="${DEEPSEEK_GPU:-0}"
 DEEPSEEK_MODEL_ID="${DEEPSEEK_MODEL_ID:-deepseek-ai/DeepSeek-R1-Distill-Llama-8B}"
 DEEPSEEK_MODEL_PATH="${DEEPSEEK_MODEL_PATH:-${KITTY_DEEPSEEK_R1_DISTILL_LLAMA8B_PATH:-${HOME}/models/DeepSeek-R1-Distill-Llama-8B}}"
-DEEPSEEK_MODEL_SLUG="deepseek-r1-distill-llama-8b"
+DEEPSEEK_MODEL_SLUG="${DEEPSEEK_MODEL_SLUG:-deepseek-r1-distill-llama-8b}"
 DEEPSEEK_MAX_GEN="${DEEPSEEK_MAX_GEN:-1024}"
 DEEPSEEK_DEFAULT_VARIANT="${DEEPSEEK_DEFAULT_VARIANT:-kitty}"
 
 usage() {
   cat <<USAGE
-Usage: bash scripts/run_exp.sh [all|llama|qwen|glm|deepseek|llama32] [--gpu GPU] [--max-samples N]
+Usage: bash scripts/run_exp.sh [all|llama|qwen|glm|deepseek|llama32] [--gpu GPU | --gpus G0,G1,...] [--max-samples N]
 
 run_exp.sh is the ONLY supported entry point for LongBench in this repo.
 
@@ -111,6 +115,7 @@ and quest_kitty_page16_kernel (real Triton QUEST kernel, Llama/Qwen only).
 
 Examples:
   bash scripts/run_exp.sh llama32 --gpu 0 --max-samples 2     # smoke (2 samples, sim QUEST)
+  bash scripts/run_exp.sh llama32 --gpus 0,1,2 --max-samples 2  # fan datasets across GPUs 0,1,2
   bash scripts/run_exp.sh llama --gpu 1                       # full
   bash scripts/run_exp.sh qwen --variant quest_kitty_page16_sim   # full, pure-torch QUEST
   RUN_MODE=full bash scripts/run_exp.sh llama32 --gpu 1 --max-samples 2   # full layout, few samples
@@ -119,7 +124,7 @@ Examples:
 Environment overrides:
   PYTHON_BIN=${PYTHON_BIN}
   DATA_ROOT=${DATA_ROOT}
-  GPU_OVERRIDE=${GPU_OVERRIDE:-<unset>}
+  GPU_OVERRIDE=${GPU_OVERRIDE:-<unset>}    GPUS_OVERRIDE=${GPUS_OVERRIDE:-<unset>}    GPU_IDS_CSV=${GPU_IDS_CSV:-<unset>}
   MAX_SAMPLES=${MAX_SAMPLES}    MAX_MODEL_LEN=${MAX_MODEL_LEN}    RUN_MODE=${RUN_MODE}
   RUN_VARIANT=${RUN_VARIANT:-<per-target default>}
   DATASETS_CSV=${DATASETS_CSV:-<full 21>}    FORCE=${FORCE:-0}
@@ -146,6 +151,22 @@ parse_args() {
         GPU_OVERRIDE="${1#--gpu=}"
         if [[ -z "${GPU_OVERRIDE}" ]]; then
           echo "ERROR: --gpu requires a non-empty GPU id" >&2
+          return 2
+        fi
+        shift
+        ;;
+      --gpus)
+        if [[ "$#" -lt 2 || -z "${2:-}" || "${2:-}" == -* ]]; then
+          echo "ERROR: --gpus requires a comma-separated GPU list, for example: --gpus 0,1,2" >&2
+          return 2
+        fi
+        GPUS_OVERRIDE="$2"
+        shift 2
+        ;;
+      --gpus=*)
+        GPUS_OVERRIDE="${1#--gpus=}"
+        if [[ -z "${GPUS_OVERRIDE}" ]]; then
+          echo "ERROR: --gpus requires a non-empty GPU list" >&2
           return 2
         fi
         shift
@@ -221,9 +242,20 @@ parse_args() {
   TARGET="${TARGET:-all}"
 }
 
-select_gpu() {
+# Resolve the GPU list (CSV) for a target. A single id ("1") keeps the original
+# single-GPU behavior; a list ("0,1,2") fans datasets across GPUs.
+# Precedence: --gpus > --gpu > GPU_IDS_CSV env > per-target default.
+select_gpus() {
   local default_gpu="$1"
-  printf '%s\n' "${GPU_OVERRIDE:-${default_gpu}}"
+  if [[ -n "${GPUS_OVERRIDE:-}" ]]; then
+    printf '%s\n' "${GPUS_OVERRIDE}"
+  elif [[ -n "${GPU_OVERRIDE:-}" ]]; then
+    printf '%s\n' "${GPU_OVERRIDE}"
+  elif [[ -n "${GPU_IDS_CSV:-}" ]]; then
+    printf '%s\n' "${GPU_IDS_CSV}"
+  else
+    printf '%s\n' "${default_gpu}"
+  fi
 }
 
 # Map a variant name to its output method slug (mirrors runner.py method_layout_slug).
@@ -441,6 +473,85 @@ run_eval_dataset() {
   echo "[done]  GPU${gpu} ${model_tag} dataset=${dataset}"
 }
 
+# Backgroundable worker: run one dataset on one GPU, prefix its output with the
+# GPU id, and propagate the eval exit code past the sed pipe (PIPESTATUS[0]) so
+# the dispatcher can detect per-dataset failures.
+run_dataset_worker() {
+  local gpu="$1"; shift
+  local rc=0
+  { run_eval_dataset "${gpu}" "$@" 2>&1 | sed -u "s/^/[gpu${gpu}] /"; } || rc="${PIPESTATUS[0]}"
+  return "${rc}"
+}
+
+# Fan a list of datasets across a list of GPUs (shell-level task parallelism;
+# the Python eval code is unchanged). One dataset per GPU at a time; a GPU that
+# finishes immediately steals the next pending dataset (dynamic load balancing).
+# Args: gpus_csv model_id model_path model_tag model_family variant pred_dir \
+#       report_prefix max_gen verbosity -- dataset...
+run_datasets_parallel() {
+  local gpus_csv="$1"; shift
+  local model_id="$1" model_path="$2" model_tag="$3" model_family="$4" variant="$5"
+  local pred_dir="$6" report_prefix="$7" max_gen="$8" verbosity="$9"; shift 9
+  local -a datasets=("$@")
+
+  local -a gpus
+  IFS=',' read -r -a gpus <<< "${gpus_csv}"
+  local i
+  for i in "${!gpus[@]}"; do gpus[$i]="${gpus[$i]//[[:space:]]/}"; done
+
+  local -A slot_pid=() pid_gpu=() pid_ds=()
+  local g
+  for g in "${gpus[@]}"; do slot_pid["${g}"]=""; done
+
+  local overall_rc=0
+  local -a failures=()
+  local ds assigned p rc
+
+  for ds in "${datasets[@]}"; do
+    assigned=""
+    while [[ -z "${assigned}" ]]; do
+      for g in "${gpus[@]}"; do
+        p="${slot_pid[${g}]}"
+        if [[ -z "${p}" ]]; then
+          assigned="${g}"; break
+        elif ! kill -0 "${p}" 2>/dev/null; then
+          rc=0; wait "${p}" || rc=$?
+          if [[ "${rc}" -ne 0 ]]; then
+            overall_rc=1; failures+=("${pid_ds[${p}]}(gpu${g},rc=${rc})")
+            echo "[parallel] FAILED dataset=${pid_ds[${p}]} on GPU${g} (rc=${rc})" >&2
+          fi
+          slot_pid["${g}"]=""; unset "pid_gpu[${p}]" "pid_ds[${p}]"
+          assigned="${g}"; break
+        fi
+      done
+      [[ -z "${assigned}" ]] && sleep 0.5
+    done
+    run_dataset_worker "${assigned}" \
+      "${model_id}" "${model_path}" "${model_tag}" "${model_family}" \
+      "${variant}" "${pred_dir}" "${report_prefix}_${ds}.json" \
+      "${ds}" "${max_gen}" "${verbosity}" &
+    p=$!
+    slot_pid["${assigned}"]="${p}"; pid_gpu["${p}"]="${assigned}"; pid_ds["${p}"]="${ds}"
+    echo "[parallel] dispatch dataset=${ds} -> GPU${assigned} (pid ${p})"
+  done
+
+  for g in "${gpus[@]}"; do
+    p="${slot_pid[${g}]}"
+    [[ -z "${p}" ]] && continue
+    rc=0; wait "${p}" || rc=$?
+    if [[ "${rc}" -ne 0 ]]; then
+      overall_rc=1; failures+=("${pid_ds[${p}]}(gpu${g},rc=${rc})")
+      echo "[parallel] FAILED dataset=${pid_ds[${p}]} on GPU${g} (rc=${rc})" >&2
+    fi
+    slot_pid["${g}"]=""
+  done
+
+  if [[ "${overall_rc}" -ne 0 ]]; then
+    echo "[parallel] ${#failures[@]}/${#datasets[@]} dataset(s) failed: ${failures[*]}" >&2
+  fi
+  return "${overall_rc}"
+}
+
 score_pred_dir() {
   local pred_dir="$1"
   echo "[score] strict ${pred_dir} -> result.json"
@@ -448,10 +559,11 @@ score_pred_dir() {
     "${PYTHON_BIN}" -m kitty_sim.cli.score_longbench --model "${pred_dir}"
 }
 
-# run_model_loop label gpu model_id model_path model_family model_slug default_variant max_gen verbosity
+# run_model_loop label gpus_csv model_id model_path model_family model_slug default_variant max_gen verbosity
+# gpus_csv may be a single id ("1") or a list ("0,1,2"); datasets fan out across the list.
 run_model_loop() {
   local label="$1"
-  local gpu="$2"
+  local gpus_csv="$2"
   local model_id="$3"
   local model_path="$4"
   local model_family="$5"
@@ -477,24 +589,18 @@ run_model_loop() {
   local -a datasets
   mapfile -t datasets < <(resolve_datasets)
 
-  echo "========== ${label}: GPU${gpu} variant=${variant} mode=${mode} datasets=${#datasets[@]} out=${pred_dir} =========="
+  local -a gpu_arr
+  IFS=',' read -r -a gpu_arr <<< "${gpus_csv}"
+  echo "========== ${label}: GPU(s)=${gpus_csv} (${#gpu_arr[@]} parallel) variant=${variant} mode=${mode} datasets=${#datasets[@]} out=${pred_dir} =========="
   ensure_no_running_eval "${model_tag}"
 
+  # Prepare serially in the main process (skip complete, rm stale/partial) so
+  # workers never race on the same files; collect the datasets that must run.
   local dataset rc
+  local -a to_run=()
   for dataset in "${datasets[@]}"; do
     if prepare_dataset "${pred_dir}" "${dataset}" "${MAX_SAMPLES}"; then
-      run_eval_dataset \
-        "${gpu}" \
-        "${model_id}" \
-        "${model_path}" \
-        "${model_tag}" \
-        "${model_family}" \
-        "${variant}" \
-        "${pred_dir}" \
-        "${report_prefix}_${dataset}.json" \
-        "${dataset}" \
-        "${max_gen}" \
-        "${transformers_verbosity}"
+      to_run+=("${dataset}")
     else
       rc=$?
       if [[ "${rc}" -eq 10 ]]; then
@@ -504,41 +610,51 @@ run_model_loop() {
     fi
   done
 
+  # Fan the pending datasets across the GPU list (one dataset per GPU at a time).
+  if [[ "${#to_run[@]}" -gt 0 ]]; then
+    run_datasets_parallel "${gpus_csv}" \
+      "${model_id}" "${model_path}" "${model_tag}" "${model_family}" \
+      "${variant}" "${pred_dir}" "${report_prefix}" "${max_gen}" "${transformers_verbosity}" \
+      "${to_run[@]}"
+  else
+    echo "[parallel] nothing to run for ${label} (all datasets already complete)"
+  fi
+
   score_pred_dir "${pred_dir}"
   echo "========== ${label}: complete -> ${pred_dir} =========="
 }
 
 run_llama() {
   run_model_loop \
-    llama "$(select_gpu "${LLAMA_GPU}")" \
+    llama "$(select_gpus "${LLAMA_GPU}")" \
     "${LLAMA_MODEL_ID}" "${LLAMA_MODEL_PATH}" llama3 \
     "${LLAMA_MODEL_SLUG}" "${LLAMA_DEFAULT_VARIANT}" "${LLAMA_MAX_GEN}" ""
 }
 
 run_llama32() {
   run_model_loop \
-    llama32 "$(select_gpu "${LLAMA32_GPU}")" \
+    llama32 "$(select_gpus "${LLAMA32_GPU}")" \
     "${LLAMA32_MODEL_ID}" "${LLAMA32_MODEL_PATH}" llama3 \
     "${LLAMA32_MODEL_SLUG}" "${LLAMA32_DEFAULT_VARIANT}" "${LLAMA32_MAX_GEN}" ""
 }
 
 run_qwen() {
   run_model_loop \
-    qwen3 "$(select_gpu "${QWEN_GPU}")" \
+    qwen3 "$(select_gpus "${QWEN_GPU}")" \
     "${QWEN_MODEL_ID}" "${QWEN_MODEL_PATH}" qwen \
     "${QWEN_MODEL_SLUG}" "${QWEN_DEFAULT_VARIANT}" "${QWEN_MAX_GEN}" ""
 }
 
 run_glm() {
   run_model_loop \
-    glm4 "$(select_gpu "${GLM_GPU}")" \
+    glm4 "$(select_gpus "${GLM_GPU}")" \
     "${GLM_MODEL_ID}" "${GLM_MODEL_PATH}" glm4 \
     "${GLM_MODEL_SLUG}" "${GLM_DEFAULT_VARIANT}" "${GLM_MAX_GEN}" error
 }
 
 run_deepseek() {
   run_model_loop \
-    deepseek "$(select_gpu "${DEEPSEEK_GPU}")" \
+    deepseek "$(select_gpus "${DEEPSEEK_GPU}")" \
     "${DEEPSEEK_MODEL_ID}" "${DEEPSEEK_MODEL_PATH}" llama3 \
     "${DEEPSEEK_MODEL_SLUG}" "${DEEPSEEK_DEFAULT_VARIANT}" "${DEEPSEEK_MAX_GEN}" ""
 }
@@ -591,8 +707,9 @@ main() {
       ;;
   esac
 
-  if [[ "${target}" == "all" && -n "${GPU_OVERRIDE}" && "${SERIAL:-0}" != "1" ]]; then
-    echo "ERROR: --gpu with target 'all' requires SERIAL=1, otherwise all model loops would share GPU${GPU_OVERRIDE} concurrently." >&2
+  if [[ "${target}" == "all" && ( -n "${GPU_OVERRIDE}" || -n "${GPUS_OVERRIDE}" ) && "${SERIAL:-0}" != "1" ]]; then
+    echo "ERROR: --gpu/--gpus with target 'all' requires SERIAL=1; otherwise the model loops (llama/qwen/glm) already run concurrently on their own GPUs." >&2
+    echo "Hint: use a single target (e.g. 'llama32 --gpus 0,1,2') to fan one model's datasets across GPUs." >&2
     return 2
   fi
 
