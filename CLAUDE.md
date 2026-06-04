@@ -369,6 +369,126 @@ find eval_results_gsm8k_gpu1 -name '*summary.json' -print | sort
 not launch LongBench through any other script. It sources `.env` automatically
 and owns a deterministic, smoke/full-separated output layout.
 
+### Command reference: targets, flags, and environment
+
+`scripts/run_exp.sh [TARGET] [flags]` is the only supported way to launch
+LongBench. `TARGET` is positional and defaults to `all`. CLI flags always win
+over environment variables, and explicit env/CLI always wins over `.env`.
+
+**Targets.** Each target ships a default GPU, model id/path, model family,
+generation cap, and variant; every one of these is overridable (see the env
+table). `qwen` is an alias of `qwen3`, `glm` of `glm4`, `llama32` of `llama3.2`.
+
+| Target | Default GPU | Model id | Family | Default variant | Default max-gen |
+| --- | ---: | --- | --- | --- | --- |
+| `llama` | 0 | meta-llama/Llama-3.1-8B-Instruct | llama3 | `kitty` | per-dataset |
+| `llama32` | 1 | meta-llama/Llama-3.2-1B-Instruct | llama3 | `quest_kitty_page16_sim` | 256 |
+| `qwen` | 1 | Qwen/Qwen3-8B | qwen | `kitty` | 2048 |
+| `glm` | 2 | THUDM/GLM-4-9B-Chat-1M | glm4 | `kitty` | per-dataset |
+| `deepseek` | 0 | deepseek-ai/DeepSeek-R1-Distill-Llama-8B | llama3 | `kitty` | 1024 |
+| `all` | 0/1/2 | llama+qwen+glm concurrently | — | per-target | — |
+
+`all` runs llama (GPU0), qwen (GPU1), and glm (GPU2) concurrently, one process
+each; `SERIAL=1` runs them one after another. `deepseek` is opt-in and is never
+part of `all`.
+
+**Flags.**
+
+| Flag | Meaning |
+| --- | --- |
+| `--gpu N` | Run the target on a single physical GPU N. |
+| `--gpus G0,G1,...` | Fan the target's datasets across several GPUs (one dataset per GPU at a time; a GPU that finishes steals the next pending dataset). |
+| `--max-samples N` | `N>0` = smoke (N samples/dataset, output under `smoke/`); `N<=0` = full (all rows). A bare trailing integer is also taken as `--max-samples` (e.g. `run_exp.sh llama32 2`). |
+| `--max-model-len N` | Context cap (default `32768`). Full runs must keep `32768` unless a smoke/proxy is explicitly requested. |
+| `--variant NAME` | Override the target's default variant. |
+
+`--gpu` vs `--gpus` is purely shell-level task parallelism — the Python eval
+code is identical; `--gpus` just dispatches one dataset per free GPU. This is
+opt-in: per the GPU1-only rule above, stay on the per-target default GPU unless
+the user explicitly widens the hardware constraint.
+
+With `TARGET=all`, `--gpu/--gpus` is rejected unless `SERIAL=1` (the
+llama/qwen/glm loops already occupy GPU0/1/2 concurrently). To fan one model's
+datasets across GPUs, use a single target, e.g. `run_exp.sh llama32 --gpus 0,1,2`.
+
+**Variants** (`--variant` / `RUN_VARIANT`). The method slug is the output dir's
+`<method>` suffix:
+
+| Variant | Method slug | What it is |
+| --- | --- | --- |
+| `kitty` | `kitty` | Paper-style 2-bit Kitty, 128-token pages (sim fake-quant). |
+| `kitty_pro` | `kitty-pro` | Kitty with `promote_ratio=0.25`. |
+| `fp16` | `fp16` | Full-precision baseline — no Kitty cache, HF dense fp16 KV. |
+| `kivi_2` | `kivi-2` | KIVI-2 baseline (sim fake-quant; no promote, no channel-select, no sink). |
+| `kivi_star_2` | `kivi-star-2` | KIVI*-2 — same as `kivi_2` but `sink_length=32`. |
+| `quest_kitty_page16_sim` | `quest-kitty-sim` | Pure-torch QUEST+Kitty page16 accuracy proxy (real query-aware selection, no Triton, any arch). |
+| `quest_kitty_page16_kernel` | `quest-kitty-kernel` | Real Triton QUEST+Kitty page16 sparse decode (speed proof; Llama/Qwen/GLM). |
+| `custom` | `custom-kitty` | Custom Kitty config. |
+
+The `fp16`, `kivi_2`, and `kivi_star_2` baselines keep dense fp16 KV, so they do
+not save KV memory; only `kitty` / `*_kernel` actually compress the cache.
+
+**Environment overrides.**
+
+Run control:
+- `MAX_SAMPLES` (= `--max-samples`), `MAX_MODEL_LEN` (= `--max-model-len`, default `32768`), `RUN_VARIANT` (= `--variant`).
+- `RUN_MODE=auto|smoke|full` — force the smoke/full *layout* independently of the
+  sample count (e.g. `RUN_MODE=full ... --max-samples 2` = a few-sample run that
+  still writes to the full dir).
+- `DATASETS_CSV=ds1,ds2,...` — restrict to a subset of the default 21 datasets.
+- `SERIAL=1` — for `all`, run the three models serially instead of concurrently.
+- `FORCE=1` — allow overwriting an existing output that is *more* complete than
+  the requested run (otherwise refused, so results are never silently shrunk).
+
+GPU selection (precedence `--gpus` > `--gpu` > `GPU_IDS_CSV` > per-target default):
+- `GPU_OVERRIDE` (= `--gpu`), `GPUS_OVERRIDE` (= `--gpus`), `GPU_IDS_CSV`.
+
+QUEST controls (only used by `quest_kitty_page16_kernel`; ignored by other variants):
+- `QUEST_BUDGET` (= `--quest-token-budget`, always `2048` for QUEST+Kitty),
+  `QUEST_SKIP_LAYERS` (= `--quest-skip-layers`, default `0`).
+
+Per-target overrides — `<T>` is one of `LLAMA`, `LLAMA32`, `QWEN`, `GLM`, `DEEPSEEK`:
+- `<T>_GPU`, `<T>_MODEL_ID`, `<T>_MODEL_PATH`, `<T>_MODEL_SLUG`, `<T>_MAX_GEN`, `<T>_DEFAULT_VARIANT`.
+- `<T>_MODEL_PATH` falls back to the matching `.env` `KITTY_*_PATH`.
+- **`<T>_MODEL_SLUG` sets the output dir's `<model>` segment.** When running a
+  target with a *non-default* model (e.g. `qwen` with Qwen3-4B instead of the
+  default Qwen3-8B), set `<T>_MODEL_SLUG` too, so results are labeled correctly
+  and do not get mislabeled into / collide with the default model's dir.
+
+**Resume / clean-slate.**
+- smoke: the target's previous smoke dir is wiped on every launch (smoke is never resumed).
+- full: completed datasets are kept; partial/missing ones are rerun, so an
+  interrupted full run resumes and fills in the rest.
+- When the datasets finish, the pred dir is scored automatically
+  (`kitty_sim.cli.score_longbench`) into `pred/result.json`.
+
+**Multi-GPU example** — fan one model's 21 datasets across GPUs. Set the slug
+because this is a non-default model:
+
+```bash
+QWEN_MODEL_ID=Qwen/Qwen3-4B-Instruct-2507 \
+QWEN_MODEL_PATH=/path/to/Qwen3-4B-Instruct-2507 \
+QWEN_MODEL_SLUG=qwen3-4b-instruct-2507 \
+QWEN_MAX_GEN=512 MAX_MODEL_LEN=32768 \
+bash scripts/run_exp.sh qwen --gpus 0,1,2 --variant quest_kitty_page16_kernel
+# -> longbench_out/qwen3-4b-instruct-2507_quest-kitty-kernel/{pred,logs}
+```
+
+Two non-overlapping GPU groups run different variants at once (distinct output
+dirs, safe to launch in two terminals):
+
+```bash
+# terminal 1 — FP16 baseline on GPUs 0,1,2
+QWEN_MODEL_ID=Qwen/Qwen3-4B-Instruct-2507 QWEN_MODEL_PATH=/path/to/Qwen3-4B-Instruct-2507 \
+QWEN_MODEL_SLUG=qwen3-4b-instruct-2507 QWEN_MAX_GEN=512 MAX_MODEL_LEN=32768 \
+bash scripts/run_exp.sh qwen --gpus 0,1,2 --variant fp16
+
+# terminal 2 — KIVI-2 baseline on GPUs 3,4,5
+QWEN_MODEL_ID=Qwen/Qwen3-4B-Instruct-2507 QWEN_MODEL_PATH=/path/to/Qwen3-4B-Instruct-2507 \
+QWEN_MODEL_SLUG=qwen3-4b-instruct-2507 QWEN_MAX_GEN=512 MAX_MODEL_LEN=32768 \
+bash scripts/run_exp.sh qwen --gpus 3,4,5 --variant kivi_2
+```
+
 ### Output layout
 
 - full (no `--max-samples`, or `--max-samples -1`):
