@@ -56,12 +56,21 @@ class VariantConfig:
     quest_enabled: bool = False
     quest_token_budget: int | None = None
     quest_skip_layers: int = 0
+    # ShadowKV sim: pure-torch faithful port of ShadowKV's accuracy cache (SVD
+    # low-rank pre-RoPE keys + landmark chunk selection + outlier/local chunks).
+    # Accuracy + relative-timing proxy like sim_quest; NOT a memory/speed proof.
+    shadowkv: bool = False
+    sparse_budget: int = 2048
+    rank: int = 160
+    chunk_size: int = 8
 
     @property
     def tag(self) -> str:
         if not self.use_kitty:
             return "fp16"
         ratio = str(self.promote_ratio).replace(".", "p")
+        if self.shadowkv:
+            return f"{self.name}_sb{self.sparse_budget}_r{self.rank}_c{self.chunk_size}"
         if self.real_kernel or self.sim_quest:
             kind = "kernel" if self.real_kernel else "sim"
             return (
@@ -123,6 +132,22 @@ def build_variant(args: Any) -> VariantConfig:
             sink_length=32,
             buffer_length=16,
             group_size=16,
+        )
+    if variant == "shadowkv":
+        # Faithful pure-torch port of ShadowKV's accuracy cache (SVD low-rank
+        # pre-RoPE keys + landmark chunk selection). Accuracy proxy, not a
+        # speed/memory proof. Budget/rank/chunk default to the paper values.
+        budget = getattr(args, "shadowkv_budget", None)
+        budget = 2048 if budget in (None, 0) else int(budget)
+        rank = int(getattr(args, "shadowkv_rank", None) or 160)
+        chunk = int(getattr(args, "shadowkv_chunk_size", None) or 8)
+        return VariantConfig(
+            name="shadowkv",
+            use_kitty=True,
+            shadowkv=True,
+            sparse_budget=budget,
+            rank=rank,
+            chunk_size=chunk,
         )
     if variant == "kitty_pro":
         return VariantConfig(name="kitty_pro", use_kitty=True, promote_ratio=0.25)
@@ -187,6 +212,32 @@ def _real_kernel_cache(variant: VariantConfig, model: Any, context_length: int, 
     )
 
 
+def _shadowkv_cache(variant: VariantConfig, model: Any, context_length: int, max_gen: int):
+    """Build the per-sample ShadowKV sim cache (pure-torch accuracy port).
+
+    Sized to context_length + max_gen (batch size 1, one prompt at a time). Uses
+    the model's own rotary embedding so reconstructed keys are RoPE'd with the
+    exact (rope-scaled) frequencies, matching the query path.
+    """
+    from kitty_sim.shadowkv_sim import ShadowKVSimCache
+
+    config = model.config
+    if getattr(config, "head_dim", None) is None:
+        config.head_dim = config.hidden_size // config.num_attention_heads
+    max_length = int(context_length) + int(max_gen)
+    return ShadowKVSimCache(
+        config,
+        sparse_budget=variant.sparse_budget,
+        rank=variant.rank,
+        chunk_size=variant.chunk_size,
+        max_length=max_length,
+        max_gen=int(max_gen),
+        device=getattr(model, "device", "cuda:0"),
+        dtype=model.dtype,
+        rotary_emb=getattr(model.model, "rotary_emb", None),
+    )
+
+
 def _safe_tag(value: str) -> str:
     return value.strip().replace("/", "_").replace(" ", "_")
 
@@ -225,6 +276,7 @@ def method_layout_slug(variant: VariantConfig | str) -> str:
         "kivi_2": "kivi-2",
         "kivi_star_2": "kivi-star-2",
         "custom": "custom-kitty",
+        "shadowkv": "shadowkv",
     }.get(name.lower(), _layout_slug(name))
 
 
@@ -434,6 +486,9 @@ def generate_dataset(
                 # Real Triton Kitty + QUEST kernel: per-sample paged cache sized
                 # to this prompt; decode runs the sparse Triton kernels.
                 kv_cache = _real_kernel_cache(variant, model, context_length, max_gen)
+            elif variant.shadowkv:
+                # ShadowKV sim: per-sample pure-torch cache sized to this prompt.
+                kv_cache = _shadowkv_cache(variant, model, context_length, max_gen)
             else:
                 kv_cache = _cache_factory(variant)
             eos_token_id: int | list[int] | None = tokenizer.eos_token_id
@@ -455,7 +510,7 @@ def generate_dataset(
                 }
                 if dataset == "samsum":
                     gen_kwargs["min_length"] = context_length + 1
-                if variant.real_kernel or variant.sim_quest:
+                if variant.real_kernel or variant.sim_quest or variant.shadowkv:
                     # real_kernel: matches the validated benchmark_kitty.py path.
                     # sim_quest: the QUEST gather hook has data-dependent shapes,
                     # so torch.compile must stay off.
@@ -539,6 +594,32 @@ def generate_dataset(
                         f"attention forward was not patched or the sim KittyKVCache was bypassed, "
                         f"so results would be plain dense fp16/Kitty mislabelled as QUEST. "
                         f"Refusing to proceed. See kitty_sim/sim_quest.py."
+                    )
+                elif variant.shadowkv:
+                    # Pure-torch ShadowKV: prove the decode hook ran (vs the
+                    # attention never being patched / the cache bypassed -> silent
+                    # dense fp16). last_selected_chunks is informational: short
+                    # contexts legitimately select few/zero chunks.
+                    decode_calls = int(kitty_stats.get("decode_calls", 0)) if kitty_stats else 0
+                    seqlen = kv_cache.get_seq_length() if kv_cache is not None else 0
+                    engaged = (
+                        kv_cache is not None and seqlen > 0
+                        and kitty_stats is not None
+                        and int(kitty_stats.get("installed", 0)) > 0
+                        and decode_calls > 0
+                    )
+                    detail = (
+                        f"installed={kitty_stats.get('installed') if kitty_stats else None} "
+                        f"decode_calls={decode_calls} seq_length={seqlen} "
+                        f"last_selected_chunks={kitty_stats.get('last_selected_chunks') if kitty_stats else None}"
+                    )
+                    print(f"[shadowkv] {dataset} first-sample evidence: {detail}")
+                    raise_msg = (
+                        f"ShadowKV variant '{variant.name}' did not run the pure-torch ShadowKV "
+                        f"decode hook for model_family='{model_family}' ({detail}). Either the "
+                        f"attention forward was not patched or the ShadowKVSimCache was bypassed, "
+                        f"so results would be plain dense fp16 mislabelled as ShadowKV. "
+                        f"Refusing to proceed. See kitty_sim/shadowkv_sim.py."
                     )
                 elif variant.real_kernel:
                     # Real QUEST+Kitty: prove the Triton decode kernel engaged and
@@ -773,6 +854,25 @@ def run_longbench(args: Any) -> dict[str, Any]:
         print(
             f"[sim-quest] installed pure-torch QUEST hook on {kitty_stats['installed']} layers "
             f"(variant={variant.tag}, budget={variant.quest_token_budget}, skip_layers={variant.quest_skip_layers})"
+        )
+    elif variant.shadowkv:
+        # Pure-torch ShadowKV hook on the stock model; the ShadowKVSimCache
+        # (passed per sample via past_key_values) holds the SVD/landmark/buffer
+        # state, since the HF Cache.update interface never sees the query.
+        from kitty_sim.shadowkv_sim import ShadowKVSimConfig, install_shadowkv_sim
+
+        kitty_stats = install_shadowkv_sim(
+            model_obj,
+            ShadowKVSimConfig(
+                sparse_budget=variant.sparse_budget,
+                rank=variant.rank,
+                chunk_size=variant.chunk_size,
+            ),
+        )
+        print(
+            f"[shadowkv] installed pure-torch ShadowKV sim hook on {kitty_stats['installed']} layers "
+            f"(variant={variant.tag}, budget={variant.sparse_budget}, rank={variant.rank}, "
+            f"chunk={variant.chunk_size})"
         )
     elif variant.use_kitty and legacy_cache_model:
         kitty_stats = install_glm_kitty_fakequant(
