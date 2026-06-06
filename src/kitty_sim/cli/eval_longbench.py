@@ -23,6 +23,7 @@ def build_parser() -> argparse.ArgumentParser:
             "kitty",
             "quest_kitty_page16_kernel",
             "quest_kitty_page16_sim",
+            "shadowkv",
             "kitty_pro",
             "kivi_2",
             "kivi_star_2",
@@ -41,6 +42,25 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=0,
         help="Number of leading decode layers to run dense instead of QUEST sparse (default 0).",
+    )
+    # ShadowKV sim controls (variant=shadowkv only).
+    parser.add_argument(
+        "--shadowkv-budget",
+        type=int,
+        default=None,
+        help="ShadowKV sparse token budget (chunks selected per decode step). Defaults to 2048.",
+    )
+    parser.add_argument(
+        "--shadowkv-rank",
+        type=int,
+        default=None,
+        help="ShadowKV SVD rank for low-rank key compression. Defaults to 160.",
+    )
+    parser.add_argument(
+        "--shadowkv-chunk-size",
+        type=int,
+        default=None,
+        help="ShadowKV landmark chunk size (tokens per chunk). Defaults to 8.",
     )
     parser.add_argument("--dataset", default=None, help="Run one LongBench dataset only")
     parser.add_argument("--e", action="store_true", help="Evaluate LongBench-E")

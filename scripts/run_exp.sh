@@ -269,6 +269,7 @@ method_slug() {
     kivi_2) printf 'kivi-2\n' ;;
     kivi_star_2) printf 'kivi-star-2\n' ;;
     custom) printf 'custom-kitty\n' ;;
+    shadowkv) printf 'shadowkv\n' ;;
     *) printf '%s\n' "${1//_/-}" ;;
   esac
 }
@@ -466,6 +467,16 @@ run_eval_dataset() {
   fi
   if [[ -n "${QUEST_SKIP_LAYERS:-}" ]]; then
     cmd+=(--quest-skip-layers "${QUEST_SKIP_LAYERS}")
+  fi
+  # ShadowKV sim controls (only meaningful for the shadowkv variant; ignored otherwise).
+  if [[ -n "${SHADOWKV_BUDGET:-}" ]]; then
+    cmd+=(--shadowkv-budget "${SHADOWKV_BUDGET}")
+  fi
+  if [[ -n "${SHADOWKV_RANK:-}" ]]; then
+    cmd+=(--shadowkv-rank "${SHADOWKV_RANK}")
+  fi
+  if [[ -n "${SHADOWKV_CHUNK:-}" ]]; then
+    cmd+=(--shadowkv-chunk-size "${SHADOWKV_CHUNK}")
   fi
 
   echo "[start] GPU${gpu} ${model_tag} dataset=${dataset} variant=${variant} max_samples=${MAX_SAMPLES} max_model_len=${MAX_MODEL_LEN}"
