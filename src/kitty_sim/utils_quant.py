@@ -128,4 +128,11 @@ def fake_quant_groupwise_lastdim(
     # fake quantization
     q = ((x - mn) / scale).clamp(torch.zeros_like(max_val), max_val).round()
     dq = q * scale + mn
+    if promote_mask is not None and promote_bit >= 16:
+        # "F16 channels": the magnitude-selected promoted channels are kept in
+        # full precision (no quantization); the rest stay at `bit`. Realizes the
+        # 1-bit-base + fp16-boost K regime (promote_bit=16) for the low-bit K
+        # study. promote_mask is already (B, nh, D, 1, 1) and x is the grouped
+        # (B, nh, D, G, group_size) view, so this broadcasts per channel.
+        dq = torch.where(promote_mask, x, dq)
     return dq.view(B, nh, D, T).to(data.dtype)

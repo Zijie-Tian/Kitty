@@ -124,11 +124,11 @@ class KittyKVCacheConfig(CacheConfig):
                     found_value=self.promote_bit,
                 ),
             )
-        if self.promote_bit <= 0 or self.promote_bit >= 16:
+        if self.promote_bit <= 0 or self.promote_bit > 16:
             raise ValueError(
                 incorrect_arg_msg.format(
                     key="promote_bit",
-                    correct_value=f"between 1 and 15",
+                    correct_value=f"between 1 and 16 (16 = keep promoted channels in fp16)",
                     found_value=self.promote_bit,
                 ),
             )

@@ -1,0 +1,30 @@
+# Low-bit-K trec sweep. Llama-3.2-1B, V fixed 4-bit, magnitude channel select.
+# head_dim=64 -> promote_ratio granularity 1/64 (0.0625=4ch, 0.125=8ch, 0.25=16ch...).
+# Columns: TAG KBITS VBITS PBIT PRATIO CHANSEL
+#
+# ---- reference points ----
+fp16          fp16 fp16 0  0        1
+base2_v4      2    4    4  0.0      1
+base1_v4      1    4    2  0.0      1
+kitty_2b4b    2    4    4  0.25     1
+# ---- f16-channel canary (validate promote_bit=16 path early) ----
+pb16_pr0625   1    4    16 0.0625   1
+# ---- boost = 2-bit channels (eff = 1 + pratio) ----
+pb2_pr0625    1    4    2  0.0625   1
+pb2_pr125     1    4    2  0.125    1
+pb2_pr25      1    4    2  0.25     1
+pb2_pr375     1    4    2  0.375    1
+pb2_pr50      1    4    2  0.5      1
+pb2_pr625     1    4    2  0.625    1
+pb2_pr75      1    4    2  0.75     1
+# ---- boost = 4-bit channels (eff = 1 + 3*pratio) ----
+pb4_pr0625    1    4    4  0.0625   1
+pb4_pr125     1    4    4  0.125    1
+pb4_pr25      1    4    4  0.25     1
+pb4_pr375     1    4    4  0.375    1
+pb4_pr50      1    4    4  0.5      1
+# ---- boost = f16 channels (eff = 1 + 15*pratio) ----
+pb16_pr0156   1    4    16 0.015625 1
+pb16_pr03     1    4    16 0.03125  1
+pb16_pr125    1    4    16 0.125    1
+pb16_pr25     1    4    16 0.25     1

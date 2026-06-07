@@ -1,0 +1,5 @@
+# transient run artifacts (predictions, logs, per-config results, markers)
+out/
+logs/
+res/
+DONE
