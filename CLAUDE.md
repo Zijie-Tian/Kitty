@@ -712,12 +712,13 @@ base + 4-bit boost — this is a deliberately more aggressive regime, not a
 recommended setting.
 
 **Finding (LLaMA-3.2-1B, full LongBench, 21 datasets, 32k context, sim).** 1-bit K
-base falls off a quantization cliff: total average **10.46** (`promote_ratio=0.25`)
-and **15.96** (`promote_ratio=0.5`). Raising the 2-bit boost fraction recovers
-accuracy roughly linearly (long-range retrieval such as hotpotqa/musique comes
-back first) but stays far below every true 2-bit method (kivi 24.24 / kitty 26.25
-/ fp16 27.59). 2-bit remains Kitty's precision floor on 1B. (`promote_ratio=0.75`
-sweep point under evaluation.)
+base falls off a quantization cliff at a low boost fraction but recovers steadily
+as more channels are promoted to 2-bit: total average **10.46**
+(`promote_ratio=0.25`, ~1.25-bit K), **15.96** (`0.5`, ~1.5-bit K), **23.36**
+(`0.75`, ~1.75-bit K). By 0.75 it nearly reaches the true 2-bit floor (kivi 24.24 /
+kitty 26.25 / fp16 27.59): accuracy tracks the effective K bitwidth, and only a
+small fraction of 1-bit channels is tolerable. 2-bit remains the practical floor
+on 1B.
 
 Reproduction (canonical GPU1 single-card form; swap `--variant` for the other two;
 model path resolves via `.env`/`LLAMA32_MODEL_PATH`):
