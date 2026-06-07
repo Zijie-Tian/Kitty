@@ -600,9 +600,9 @@ is not built for a 1-bit K base).
 
 | `promote_ratio` | eff. K bitwidth | K1V2 (V 2-bit) | K1V4 (V 4-bit) |
 | ---: | ---: | ---: | ---: |
-| 0.25 | ~1.25-bit | **10.46** | full run in progress |
-| 0.5 | ~1.5-bit | **15.96** | full run in progress |
-| 0.75 | ~1.75-bit | **23.36** | full run in progress |
+| 0.25 | ~1.25-bit | **10.46** | **10.76** |
+| 0.5 | ~1.5-bit | **15.96** | **17.49** |
+| 0.75 | ~1.75-bit | **23.36** | **24.31** |
 
 Baselines: fp16 27.59 / kitty (2-bit) 26.25 / kivi (2-bit) 24.24.
 
@@ -610,9 +610,10 @@ Baselines: fp16 27.59 / kitty (2-bit) 26.25 / kivi (2-bit) 24.24.
 monotonically: a 1-bit K base collapses when too many channels stay at 1-bit
 (0.25→10.46) but recovers steadily, nearly reaching the true 2-bit floor by 0.75
 (23.36 ≈ kivi 24.24). Only a small fraction of 1-bit channels is tolerable; 2-bit
-is the practical K floor on 1B. **K1V4 (WIP)** re-runs the same K sweep with V at
-4-bit to see whether a higher-precision V lifts accuracy at each K point; numbers
-pending — this WIP commit registers the variants and launches the runs.
+is the practical K floor on 1B. **K1V4 (final):** relaxing V to 4-bit gives only a
+small lift at each K point — +0.30 / +1.53 / +0.95 (10.76 / 17.49 / 24.31), never
+>~1.5 — so the collapse is **K-driven, not V-limited**; once K is sub-2-bit a
+higher-precision V barely helps. Prioritize K precision over V in this regime.
 
 Reproduction (canonical GPU1 single-card; swap `--variant` for any of the six;
 model path via `.env`/`LLAMA32_MODEL_PATH`):

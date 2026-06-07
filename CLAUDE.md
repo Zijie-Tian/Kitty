@@ -737,9 +737,9 @@ research, not a kernel-speed or memory-savings claim.
 
 | `promote_ratio` | eff. K bitwidth | K1V2 (V 2-bit) | K1V4 (V 4-bit) |
 | ---: | ---: | ---: | ---: |
-| 0.25 | ~1.25-bit | **10.46** | full run in progress |
-| 0.5 | ~1.5-bit | **15.96** | full run in progress |
-| 0.75 | ~1.75-bit | **23.36** | full run in progress |
+| 0.25 | ~1.25-bit | **10.46** | **10.76** |
+| 0.5 | ~1.5-bit | **15.96** | **17.49** |
+| 0.75 | ~1.75-bit | **23.36** | **24.31** |
 
 Baselines (same harness): fp16 27.59 / kitty (2-bit base, 4-bit boost) 26.25 /
 kivi (2-bit) 24.24.
@@ -753,10 +753,14 @@ steadily as the boost fraction rises, nearly reaching the true 2-bit floor by 0.
 fractions (long-range retrieval such as hotpotqa/musique is the first to fail and
 the first to recover).
 
-**K1V4 (WIP).** The K1V4 family re-runs the same K sweep with V at 4-bit to test
-whether a higher-precision V lifts accuracy at each K operating point (i.e. is the
-collapse K-driven, or is there V headroom to exploit?). Full numbers are pending;
-this WIP commit registers the variants and launches the runs.
+**Finding (K1V4, final).** Relaxing V to 4-bit gives only a small, consistent lift
+at each K operating point — +0.30 (`0.25`: 10.46 → 10.76), +1.53 (`0.5`: 15.96 →
+17.49), +0.95 (`0.75`: 23.36 → 24.31) — never more than ~1.5 points. The dominant
+factor by far is the effective K bitwidth (10 → 17 → 24 as the boost fraction
+rises), confirming the collapse is **K-driven, not V-limited**: once K is
+sub-2-bit, spending the budget on a higher-precision V barely helps. At 0.75 K1V4
+just edges past kivi (24.31 vs 24.24) but stays below kitty 26.25 / fp16 27.59.
+Takeaway: in this regime, prioritize K precision over V precision.
 
 ### Reproduction
 
