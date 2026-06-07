@@ -268,6 +268,9 @@ method_slug() {
     kitty_k1v2) printf 'kitty-k1v2\n' ;;
     kitty_k1v2_pr50) printf 'kitty-k1v2-pr50\n' ;;
     kitty_k1v2_pr75) printf 'kitty-k1v2-pr75\n' ;;
+    kitty_k1v4) printf 'kitty-k1v4\n' ;;
+    kitty_k1v4_pr50) printf 'kitty-k1v4-pr50\n' ;;
+    kitty_k1v4_pr75) printf 'kitty-k1v4-pr75\n' ;;
     fp16) printf 'fp16\n' ;;
     kivi_2) printf 'kivi-2\n' ;;
     kivi_star_2) printf 'kivi-star-2\n' ;;

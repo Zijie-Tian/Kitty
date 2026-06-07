@@ -417,6 +417,9 @@ datasets across GPUs, use a single target, e.g. `run_exp.sh llama32 --gpus 0,1,2
 | `kitty_k1v2` | `kitty-k1v2` | Experimental sub-2-bit K: 1-bit base + 2-bit channel boost (`kbits=1, promote_bit=2, promote_ratio=0.25`); V stays per-token 2-bit. |
 | `kitty_k1v2_pr50` | `kitty-k1v2-pr50` | Same K1V2 regime, `promote_ratio=0.5` (half the K channels at 2-bit, effective ~1.5-bit K). |
 | `kitty_k1v2_pr75` | `kitty-k1v2-pr75` | Same K1V2 regime, `promote_ratio=0.75` (effective ~1.75-bit K). |
+| `kitty_k1v4` | `kitty-k1v4` | K1V4: same low-bit K as `kitty_k1v2` (1-bit base + 25% 2-bit boost) but V relaxed to per-token **4-bit**. |
+| `kitty_k1v4_pr50` | `kitty-k1v4-pr50` | K1V4 with `promote_ratio=0.5` (V 4-bit). |
+| `kitty_k1v4_pr75` | `kitty-k1v4-pr75` | K1V4 with `promote_ratio=0.75` (V 4-bit). |
 | `fp16` | `fp16` | Full-precision baseline — no Kitty cache, HF dense fp16 KV. |
 | `kivi_2` | `kivi-2` | KIVI-2 baseline (sim fake-quant; no promote, no channel-select, no sink). |
 | `kivi_star_2` | `kivi-star-2` | KIVI*-2 — same as `kivi_2` but `sink_length=32`. |
@@ -567,40 +570,60 @@ that still writes to the full layout:
 Local model paths come from `.env` (`KITTY_*_PATH`) or per-target `*_MODEL_PATH`
 overrides; never hardcode host paths in tracked files.
 
-## Experimental sub-2-bit K1V2 sweep (`kitty_k1v2` / `kitty_k1v2_pr50` / `kitty_k1v2_pr75`)
+## Experimental low-bit K-cache exploration (K1V2 / K1V4 families)
 
-`kitty_k1v2*` are experimental **sub-2-bit K** variants that probe how far the K
-cache can be pushed below Kitty's 2-bit floor. They keep V at per-token 2-bit
-(paper design) and quantize the K base to **1-bit** with a magnitude-selected
-channel boost to **2-bit** (`kbits=1, promote_bit=2, vbits=2, sink_length=32,
-buffer_length=128, group_size=128, channel_selection=1`). Only `promote_ratio`
-differs across the three (fraction of K channels promoted to 2-bit): `kitty_k1v2`
-0.25 (~1.25-bit K), `kitty_k1v2_pr50` 0.5 (~1.5-bit K), `kitty_k1v2_pr75` 0.75
-(~1.75-bit K).
+Ongoing exploration of how far the **K cache can be pushed below Kitty's 2-bit
+floor**, and whether spending precision on the **V cache** instead compensates.
+All variants keep the Kitty machinery (sink, magnitude channel selection,
+128-token groups) and change only the K base bitwidth, the 2-bit boost fraction,
+and V bitwidth. Paper-style Kitty is a 2-bit K base + 4-bit boost; everything here
+is a deliberately more aggressive sub-2-bit-K regime — research probes, not a
+production setting.
 
-They run on the pure-torch sim fake-quant path (`kitty_sim`), so they are an
-**accuracy proxy only and save no KV memory**; the real Triton kernel hardcodes
-the 2-bit/4-bit packing and is not built for 1-bit. Paper-style Kitty is 2-bit
-base + 4-bit boost — this is a deliberately more aggressive regime, not a
-recommended setting.
+**Two axes.** (1) **K boost fraction**: K base fixed at **1-bit**, promote a
+fraction (`promote_ratio` ∈ {0.25, 0.5, 0.75}) of channels to **2-bit**, setting
+the effective avg K bitwidth (0.25→~1.25-bit, 0.5→~1.5-bit, 0.75→~1.75-bit).
+(2) **V precision**: run the K sweep twice, V at **2-bit** (K1V2) vs **4-bit**
+(K1V4); V has no channel boost. Shared K config: `kbits=1, promote_bit=2,
+sink_length=32, buffer_length=128, group_size=128, channel_selection=1`.
 
-**Finding (LLaMA-3.2-1B, full LongBench, 21 datasets, 32k, sim).** 1-bit K base
-falls off a quantization cliff at low boost but recovers steadily as more channels
-go to 2-bit: total average **10.46** (`promote_ratio=0.25`, ~1.25-bit K), **15.96**
-(`0.5`, ~1.5-bit K), **23.36** (`0.75`, ~1.75-bit K). By 0.75 it nearly reaches the
-true 2-bit floor (kivi 24.24 / kitty 26.25 / fp16 27.59): accuracy tracks the
-effective K bitwidth. 2-bit remains the practical floor on 1B.
+| Family | V cache | `promote_ratio` 0.25 / 0.5 / 0.75 |
+| --- | --- | --- |
+| **K1V2** | per-token **2-bit** | `kitty_k1v2` / `kitty_k1v2_pr50` / `kitty_k1v2_pr75` |
+| **K1V4** | per-token **4-bit** | `kitty_k1v4` / `kitty_k1v4_pr50` / `kitty_k1v4_pr75` |
 
-Reproduction (canonical GPU1 single-card form; swap `--variant` for the other two;
-model path resolves via `.env`/`LLAMA32_MODEL_PATH`):
+All six run on the pure-torch sim fake-quant path (`kitty_sim`): **accuracy proxy
+only, no KV memory savings** (the Triton kernel hardcodes 2-bit/4-bit packing and
+is not built for a 1-bit K base).
+
+**Results so far (LLaMA-3.2-1B, full LongBench, 21 datasets, 32k, sim).**
+
+| `promote_ratio` | eff. K bitwidth | K1V2 (V 2-bit) | K1V4 (V 4-bit) |
+| ---: | ---: | ---: | ---: |
+| 0.25 | ~1.25-bit | **10.46** | full run in progress |
+| 0.5 | ~1.5-bit | **15.96** | full run in progress |
+| 0.75 | ~1.75-bit | **23.36** | full run in progress |
+
+Baselines: fp16 27.59 / kitty (2-bit) 26.25 / kivi (2-bit) 24.24.
+
+**Finding (K1V2, final).** Accuracy tracks the **effective K bitwidth** almost
+monotonically: a 1-bit K base collapses when too many channels stay at 1-bit
+(0.25→10.46) but recovers steadily, nearly reaching the true 2-bit floor by 0.75
+(23.36 ≈ kivi 24.24). Only a small fraction of 1-bit channels is tolerable; 2-bit
+is the practical K floor on 1B. **K1V4 (WIP)** re-runs the same K sweep with V at
+4-bit to see whether a higher-precision V lifts accuracy at each K point; numbers
+pending — this WIP commit registers the variants and launches the runs.
+
+Reproduction (canonical GPU1 single-card; swap `--variant` for any of the six;
+model path via `.env`/`LLAMA32_MODEL_PATH`):
 
 ```bash
 # smoke (2 samples/dataset)
 cd /home/zijie/Code/Kitty
 LLAMA32_MODEL_PATH=/path/to/Llama-3.2-1B-Instruct \
 MAX_MODEL_LEN=32768 LLAMA32_MAX_GEN=256 \
-bash scripts/run_exp.sh llama32 --gpu 1 --variant kitty_k1v2_pr50 --max-samples 2
-# -> longbench_out/smoke/llama32-1b-instruct_kitty-k1v2-pr50/{pred,logs}
+bash scripts/run_exp.sh llama32 --gpu 1 --variant kitty_k1v4_pr50 --max-samples 2
+# -> longbench_out/smoke/llama32-1b-instruct_kitty-k1v4-pr50/{pred,logs}
 ```
 
 ```bash
@@ -608,8 +631,8 @@ bash scripts/run_exp.sh llama32 --gpu 1 --variant kitty_k1v2_pr50 --max-samples 
 cd /home/zijie/Code/Kitty
 LLAMA32_MODEL_PATH=/path/to/Llama-3.2-1B-Instruct \
 MAX_MODEL_LEN=32768 LLAMA32_MAX_GEN=256 \
-bash scripts/run_exp.sh llama32 --gpu 1 --variant kitty_k1v2_pr50
-# -> longbench_out/llama32-1b-instruct_kitty-k1v2-pr50/{pred,logs}
+bash scripts/run_exp.sh llama32 --gpu 1 --variant kitty_k1v4_pr50
+# -> longbench_out/llama32-1b-instruct_kitty-k1v4-pr50/{pred,logs}
 ```
 
 To fan one variant's 21 datasets across several GPUs for speed (an explicit

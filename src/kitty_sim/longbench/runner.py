@@ -177,6 +177,31 @@ def build_variant(args: Any) -> VariantConfig:
             kbits=1, vbits=2, promote_bit=2, promote_ratio=0.75,
             sink_length=32, buffer_length=128, group_size=128, channel_selection=1,
         )
+    if variant == "kitty_k1v4":
+        # Low-bit K kept aggressive (1-bit base + 25% 2-bit channel boost, same K
+        # as kitty_k1v2) but V relaxed to 4-bit -- tests whether a higher-precision
+        # V cache rescues accuracy while K stays sub-2-bit.
+        return VariantConfig(
+            name="kitty_k1v4", use_kitty=True,
+            kbits=1, vbits=4, promote_bit=2, promote_ratio=0.25,
+            sink_length=32, buffer_length=128, group_size=128, channel_selection=1,
+        )
+    if variant == "kitty_k1v4_pr50":
+        # Same K1V4 regime (1-bit K base + 2-bit channel boost, V at 4-bit) but
+        # promote_ratio=0.5 -- half the K channels promoted to 2-bit.
+        return VariantConfig(
+            name="kitty_k1v4_pr50", use_kitty=True,
+            kbits=1, vbits=4, promote_bit=2, promote_ratio=0.5,
+            sink_length=32, buffer_length=128, group_size=128, channel_selection=1,
+        )
+    if variant == "kitty_k1v4_pr75":
+        # Same K1V4 regime but promote_ratio=0.75 -- three quarters of the K
+        # channels promoted to 2-bit (effective ~1.75-bit K), V at 4-bit.
+        return VariantConfig(
+            name="kitty_k1v4_pr75", use_kitty=True,
+            kbits=1, vbits=4, promote_bit=2, promote_ratio=0.75,
+            sink_length=32, buffer_length=128, group_size=128, channel_selection=1,
+        )
     if variant == "kivi_2":
         return VariantConfig(name="kivi_2", use_kitty=True, sink_length=0, promote_ratio=0.0, channel_selection=0)
     if variant == "kivi_star_2":
@@ -301,6 +326,9 @@ def method_layout_slug(variant: VariantConfig | str) -> str:
         "kitty_k1v2": "kitty-k1v2",
         "kitty_k1v2_pr50": "kitty-k1v2-pr50",
         "kitty_k1v2_pr75": "kitty-k1v2-pr75",
+        "kitty_k1v4": "kitty-k1v4",
+        "kitty_k1v4_pr50": "kitty-k1v4-pr50",
+        "kitty_k1v4_pr75": "kitty-k1v4-pr75",
         "fp16": "fp16",
         "kivi_2": "kivi-2",
         "kivi_star_2": "kivi-star-2",
