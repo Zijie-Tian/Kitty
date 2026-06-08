@@ -35,6 +35,8 @@ def infer_model_family(model_name: str | None, model_path: str | None = None) ->
         return "xgen"
     if "internlm" in source:
         return "internlm"
+    if "phi" in source:
+        return "phi"
     return "default"
 
 
@@ -60,7 +62,7 @@ def build_chat(tokenizer: Any, prompt: str, model_family: str) -> str:
         return conv.get_prompt()
     if family == "llama2-7b-80k":
         return f"<|im_start|> {prompt}"
-    if family in {"llama3.2", "qwen"}:
+    if family in {"llama3.2", "qwen", "phi"}:
         messages = [{"role": "user", "content": prompt}]
         return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     if family == "llama2" or family == "mistral-instruct":

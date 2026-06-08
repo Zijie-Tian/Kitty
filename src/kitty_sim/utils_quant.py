@@ -113,13 +113,18 @@ def fake_quant_groupwise_lastdim(
     
     if promote_mask is not None:
         assert promote_mask.shape == (B, nh, D), f"Expected mask shape (B, nh, D), got {promote_mask.shape}"
-        scale_base = (mx - mn).clamp(min=eps) / (2 ** bit - 1)
-        scale_promote = (mx - mn).clamp(min=eps) / (2 ** promote_bit - 1)
         promote_mask = promote_mask.view(B, nh, D, 1, 1)
+        # promote_bit>=16 means "keep promoted channels in fp16" (realized by the
+        # passthrough below). Use the base bit as a placeholder for their scale so
+        # the 2**16-1 = 65535 constant is never cast to fp16, whose max is 65504
+        # ("value cannot be converted to type at::Half without overflow").
+        eff_promote_bit = bit if promote_bit >= 16 else promote_bit
+        scale_base = (mx - mn).clamp(min=eps) / (2 ** bit - 1)
+        scale_promote = (mx - mn).clamp(min=eps) / (2 ** eff_promote_bit - 1)
         scale = torch.where(promote_mask, scale_promote, scale_base)
         max_val = torch.where(
             promote_mask,
-            torch.full_like(scale, 2 ** promote_bit - 1),       # promote_bit should be smaller than 16, otherwise overflow for f16
+            torch.full_like(scale, 2 ** eff_promote_bit - 1),
             torch.full_like(scale, 2 ** bit - 1)
         )
     else:
@@ -128,4 +133,11 @@ def fake_quant_groupwise_lastdim(
     # fake quantization
     q = ((x - mn) / scale).clamp(torch.zeros_like(max_val), max_val).round()
     dq = q * scale + mn
+    if promote_mask is not None and promote_bit >= 16:
+        # "F16 channels": the magnitude-selected promoted channels are kept in
+        # full precision (no quantization); the rest stay at `bit`. Realizes the
+        # 1-bit-base + fp16-boost K regime (promote_bit=16) for the low-bit K
+        # study. promote_mask is already (B, nh, D, 1, 1) and x is the grouped
+        # (B, nh, D, G, group_size) view, so this broadcasts per channel.
+        dq = torch.where(promote_mask, x, dq)
     return dq.view(B, nh, D, T).to(data.dtype)
