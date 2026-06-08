@@ -27,9 +27,12 @@ Like ``sim_quest``, this is an ACCURACY + relative-timing proxy: it does NOT
 save KV memory (the full value cache and the low-rank key factors stay resident
 on the GPU) and it is NOT a kernel-speed proof.
 
-Architecture coverage: Llama and Qwen3 (the only arch-specific part is Q/K/V
-projection + optional q_norm/k_norm + RoPE, handled here via attribute checks).
-GLM (partial RoPE + legacy tuple cache) is intentionally out of scope.
+Architecture coverage: Llama, Qwen3, and Phi-3 / Phi-4-mini. The only
+arch-specific parts are handled via attribute checks: Q/K/V projection (separate
+q/k/v_proj vs Phi's fused ``qkv_proj``), optional Qwen3 q_norm/k_norm, and RoPE
+(full vs Phi's ``partial_rotary_factor`` 0.75 + longrope, via
+``_apply_rotary_partial`` and a rotary_emb-built cos/sin table). GLM (legacy
+tuple cache) is intentionally out of scope.
 """
 
 from __future__ import annotations
@@ -45,7 +48,6 @@ from torch import nn
 from transformers.cache_utils import DynamicCache
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.models.llama.modeling_llama import (
-    apply_rotary_pos_emb,
     eager_attention_forward,
     repeat_kv,
 )
@@ -73,6 +75,32 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
+
+
+def _apply_rotary_partial(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    unsqueeze_dim: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Partial-RoPE-aware apply (rotary_dim = ``cos.shape[-1]`` <= head_dim).
+
+    Mirrors HF's modern ``apply_rotary_pos_emb``: rotate the first ``rotary_dim``
+    dims of q/k and pass the remainder through unchanged. Correct for full RoPE
+    (Llama / Qwen3, rotary_dim == head_dim so the pass slice is empty) and for
+    partial RoPE (Phi-3 / Phi-4-mini, partial_rotary_factor 0.75 -> rotary_dim
+    96 of 128). Replaces the stock llama ``apply_rotary_pos_emb`` (full-rotate
+    only), whose broadcast would fail on Phi's 96-dim cos against the 128-dim head.
+    """
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    rotary_dim = cos.shape[-1]
+    q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
+    k_rot, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
+    q_embed = torch.cat([(q_rot * cos) + (_rotate_half(q_rot) * sin), q_pass], dim=-1)
+    k_embed = torch.cat([(k_rot * cos) + (_rotate_half(k_rot) * sin), k_pass], dim=-1)
+    return q_embed, k_embed
 
 
 class ShadowKVSimCache(DynamicCache):
@@ -180,25 +208,40 @@ class ShadowKVSimCache(DynamicCache):
 
     # ------------------------------------------------------------------ RoPE
     def _build_rope_table(self, rotary_emb: Any) -> None:
-        if rotary_emb is not None and getattr(rotary_emb, "inv_freq", None) is not None:
-            inv_freq = rotary_emb.inv_freq.detach().to(torch.float32).to(self.device)
-            attention_scaling = float(getattr(rotary_emb, "attention_scaling", 1.0))
-        else:  # fallback: standard rope from config theta
+        # Prefer the model's own rotary embedding to build the [0, max_length)
+        # cos/sin table: this reproduces partial RoPE (Phi: rotary_dim 96 < 128)
+        # and rope-scaling (Llama-3.1 / Phi longrope, whose length-dependent
+        # short/long factor is selected here by this sample's max_length, and
+        # whose attention_scaling is already folded into the returned cos/sin)
+        # exactly, so reconstructed keys match the query path. The table's last
+        # dim becomes rotary_dim, which _rope_at_positions rotates (passing the tail).
+        if rotary_emb is not None:
+            pos = torch.arange(self.max_length, device=self.device, dtype=torch.long).unsqueeze(0)
+            dummy = torch.zeros(1, 1, 1, device=self.device, dtype=self.dtype)
+            with torch.no_grad():
+                cos, sin = rotary_emb(dummy, pos)
+            self.cos_table = cos[0].to(self.dtype)
+            self.sin_table = sin[0].to(self.dtype)
+        else:  # fallback: standard full RoPE from config theta
             theta = float(getattr(self.config, "rope_theta", 10000.0))
             half = self.head_dim // 2
             inv_freq = 1.0 / (theta ** (torch.arange(0, half, dtype=torch.float32, device=self.device) / half))
-            attention_scaling = 1.0
-        t = torch.arange(self.max_length, dtype=torch.float32, device=self.device)
-        freqs = torch.outer(t, inv_freq)
-        emb = torch.cat((freqs, freqs), dim=-1)
-        self.cos_table = (emb.cos() * attention_scaling).to(self.dtype)
-        self.sin_table = (emb.sin() * attention_scaling).to(self.dtype)
+            t = torch.arange(self.max_length, dtype=torch.float32, device=self.device)
+            freqs = torch.outer(t, inv_freq)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            self.cos_table = emb.cos().to(self.dtype)
+            self.sin_table = emb.sin().to(self.dtype)
+        self.rotary_dim = int(self.cos_table.shape[-1])
 
     def _rope_at_positions(self, x: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
-        # x: [bsz, kv_heads, n, head_dim]; position_ids: [bsz, kv_heads, n]
+        # x: [bsz, kv_heads, n, head_dim]; position_ids: [bsz, kv_heads, n].
+        # Rotate only the first rotary_dim dims (partial RoPE for Phi; full for
+        # Llama/Qwen where rotary_dim == head_dim and the pass slice is empty).
         cos = self.cos_table[position_ids]
         sin = self.sin_table[position_ids]
-        return (x * cos) + (_rotate_half(x) * sin)
+        rotary_dim = cos.shape[-1]
+        x_rot, x_pass = x[..., :rotary_dim], x[..., rotary_dim:]
+        return torch.cat([(x_rot * cos) + (_rotate_half(x_rot) * sin), x_pass], dim=-1)
 
     @staticmethod
     def _layer(value: Any, layer_idx: int) -> torch.Tensor:
@@ -434,16 +477,27 @@ def _shadowkv_sim_attention_forward(
     input_shape = hidden_states.shape[:-1]
     hidden_shape = (*input_shape, -1, self.head_dim)
 
-    # Q/K/V projection (+ Qwen3 q_norm/k_norm) — the only arch-specific part.
-    query_states = self.q_proj(hidden_states).view(hidden_shape)
-    key_states = self.k_proj(hidden_states).view(hidden_shape)
+    # Q/K/V projection — the only arch-specific part. Fused qkv_proj (Phi-3 /
+    # Phi-4-mini: a single [Q|K|V] Linear, split by head counts) vs separate
+    # q/k/v_proj (Llama / Qwen3), plus optional Qwen3 q_norm/k_norm.
+    if getattr(self, "qkv_proj", None) is not None:
+        qkv = self.qkv_proj(hidden_states)
+        q_pos = self.config.num_attention_heads * self.head_dim
+        kv_pos = self.config.num_key_value_heads * self.head_dim
+        query_states = qkv[..., :q_pos].view(hidden_shape)
+        key_states = qkv[..., q_pos : q_pos + kv_pos].view(hidden_shape)
+        value_states = qkv[..., q_pos + kv_pos :].view(hidden_shape)
+    else:
+        query_states = self.q_proj(hidden_states).view(hidden_shape)
+        key_states = self.k_proj(hidden_states).view(hidden_shape)
+        value_states = self.v_proj(hidden_states).view(hidden_shape)
     if getattr(self, "q_norm", None) is not None:
         query_states = self.q_norm(query_states)
     if getattr(self, "k_norm", None) is not None:
         key_states = self.k_norm(key_states)
     query_states = query_states.transpose(1, 2)
     key_states = key_states.transpose(1, 2)
-    value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+    value_states = value_states.transpose(1, 2)
 
     cos, sin = position_embeddings
     cache: ShadowKVSimCache = past_key_value if past_key_value is not None else past_key_values
@@ -456,7 +510,7 @@ def _shadowkv_sim_attention_forward(
     if is_prefill:
         # SVD on PRE-RoPE keys, then RoPE, then build the ShadowKV structures.
         cache.get_svd(key_states, self.layer_idx)
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        query_states, key_states = _apply_rotary_partial(query_states, key_states, cos, sin)
         cache.prefill_kv_cache(value_states, self.layer_idx, key_states, query_states[:, :, -1:])
         # Dense attention over the full post-RoPE K/V (QUEST/ShadowKV are decode-only).
         attention_interface: Callable = eager_attention_forward
@@ -474,7 +528,7 @@ def _shadowkv_sim_attention_forward(
         )
         stats["prefill_calls"] += 1
     else:
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        query_states, key_states = _apply_rotary_partial(query_states, key_states, cos, sin)
         cache.update_kv_cache(key_states, value_states, self.layer_idx)
         position_ids = cache.get_retrieval_position_ids(self.layer_idx, query_states)
         value_sel = cache.get_value_cache(self.layer_idx, position_ids)
