@@ -1,0 +1,15 @@
+# Deep study (local 3090s, 3/card). Run for BOTH trec and qasper.
+# (A) 2-bit crossover refinement around pb2_pr6875 (cheapest dual-pass config).
+# (B) 1-bit + F16 mix at HIGH promote_ratio: find how much f16 fraction is needed
+#     to clear the bars, and at what effective bitwidth (eff = 1 + 15*pr).
+# Columns: TAG KBITS VBITS PBIT PRATIO CHANSEL  (distinct tags, no collisions)
+pb2_pr065625   1 4 2  0.65625  1
+pb2_pr071875   1 4 2  0.71875  1
+pb16h_pr50     1 4 16 0.5      1
+pb16h_pr5625   1 4 16 0.5625   1
+pb16h_pr625    1 4 16 0.625    1
+pb16h_pr6875   1 4 16 0.6875   1
+pb16h_pr75     1 4 16 0.75     1
+pb16h_pr8125   1 4 16 0.8125   1
+pb16h_pr875    1 4 16 0.875    1
+pb16h_pr9375   1 4 16 0.9375   1

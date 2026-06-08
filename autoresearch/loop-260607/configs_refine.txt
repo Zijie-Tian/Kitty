@@ -1,0 +1,4 @@
+# Crossover refinement around pb2_pr6875 (the cheapest config clearing both bars).
+# Bracket the qasper>19 crossover finely (42ch and 46ch of 64). kbits=1 vbits=4 pb=2.
+pb2_pr065625  1 4 2 0.65625  1
+pb2_pr071875  1 4 2 0.71875  1

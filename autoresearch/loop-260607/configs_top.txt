@@ -1,0 +1,6 @@
+# Top dual-pass configs to validate on the FULL 21-subtask LongBench (vs fp16 avg 27.59).
+# pb2_pr6875 = the cheapest config clearing trec>=62 & qasper>19 (eff 1.69).
+# pb2_pr875  = safer-margin pick (eff 1.875). base2_v4 = pure-2-bit reference (eff 2.0).
+pb2_pr6875  1 4 2 0.6875 1
+pb2_pr875   1 4 2 0.875  1
+base2_v4    2 4 4 0.0    1

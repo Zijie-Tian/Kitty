@@ -1,5 +1,11 @@
-# transient run artifacts (predictions, logs, per-config results, markers)
+# transient run artifacts (predictions, logs, per-config results, markers, aggregates)
 out/
+out_*/
 logs/
 res/
+res_*/
+f16study/
+*.out
 DONE
+DONE_*
+results_*.tsv

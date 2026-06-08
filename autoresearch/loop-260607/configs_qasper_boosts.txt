@@ -1,0 +1,16 @@
+# qasper for the non-2bit boost families (4/3/8-bit) across promote_ratio, to map
+# qasper-vs-eff per boost type. Complements GPU0 (2-bit family + survivors) and
+# GPU2 (f16). Distinct tags from those so res_qasper/ never collides.
+pb4_pr0625   1 4 4 0.0625  1
+pb4_pr125    1 4 4 0.125   1
+pb4_pr1875   1 4 4 0.1875  1
+pb4_pr25     1 4 4 0.25    1
+pb4_pr3125   1 4 4 0.3125  1
+pb4_pr375    1 4 4 0.375   1
+pb4_pr50     1 4 4 0.5     1
+pb3_pr125    1 4 3 0.125   1
+pb3_pr25     1 4 3 0.25    1
+pb3_pr50     1 4 3 0.5     1
+pb8_pr0625   1 4 8 0.0625  1
+pb8_pr125    1 4 8 0.125   1
+pb8_pr25     1 4 8 0.25    1

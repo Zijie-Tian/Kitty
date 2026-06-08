@@ -1,0 +1,18 @@
+# Phase 2 qasper: trec>=62 survivors + full 2-bit-boost family (maps qasper-vs-eff)
+# + non-2bit trec-survivors (test if higher-precision boosts help the sensitive qasper).
+# Columns: TAG KBITS VBITS PBIT PRATIO CHANSEL
+base1_v4     1 4 2  0.0     1
+pb2_pr25     1 4 2  0.25    1
+pb2_pr375    1 4 2  0.375   1
+pb2_pr4375   1 4 2  0.4375  1
+pb2_pr50     1 4 2  0.5     1
+pb2_pr5625   1 4 2  0.5625  1
+pb2_pr625    1 4 2  0.625   1
+pb2_pr6875   1 4 2  0.6875  1
+pb2_pr75     1 4 2  0.75    1
+pb2_pr875    1 4 2  0.875   1
+base2_v4     2 4 4  0.0     1
+pb3_pr75     1 4 3  0.75    1
+pb4_pr625    1 4 4  0.625   1
+pb4_pr75     1 4 4  0.75    1
+kitty_2b4b   2 4 4  0.25    1

@@ -795,3 +795,105 @@ Observed peak:
 - PyTorch peak reserved: about `24.83 GiB`.
 
 Treat these as environment-specific smoke numbers, not a formal benchmark.
+
+## Low-bit-K full-LongBench harness + recommended `pb2` configs
+
+Model-agnostic harness and the recommended low-bit-K "type" from the low-bit-K
+study. It extends the K1V4 family: a **1-bit K base + magnitude-selected channels
+promoted to 2-bit** (V fixed 4-bit), swept over the boost fraction `promote_ratio`.
+All on the pure-torch `kitty_sim` fake-quant path: **accuracy proxy only, no memory
+/ speed savings**; the real Triton kernel does NOT support a 1-bit base (hardcoded
+2/4-bit packing).
+
+### The recommended configs ("pb2" type)
+
+`--variant custom` with `kbits=1 vbits=4 promote_bit=2 channel_selection=1
+sink_length=32 buffer_length=128 group_size=128`, varying `promote_ratio`:
+
+| config | promote_ratio | effective K bits | what |
+| --- | ---: | ---: | --- |
+| `pb2_pr6875` | 0.6875 | **1.6875** | cheapest config clearing the bars (trec>=62 AND qasper>19) on 1B |
+| `pb2_pr875` | 0.875 | 1.875 | safer-margin pick |
+| `fp16` | — | 16 | dense baseline (ceiling) |
+
+`promote_ratio` sets how many of the `head_dim` K channels keep 2-bit; the rest
+stay 1-bit. head_dim is 64 on Llama-3.2-1B and 128 on Llama-3.2-3B / phi-4-mini /
+Llama-3.1-8B, so pr0.6875 = 44/64 or 88/128 channels @2-bit.
+
+### Harness (`autoresearch/loop-260607/`)
+
+- `driver_ds.sh TAG KBITS VBITS PBIT PRATIO CHANSEL [MAXSAMPLES]` — one config on one
+  LongBench dataset. Env: `DATASET`, `GPU`, `MODEL_FAMILY`, `MODEL_TAG`,
+  `LLAMA32_MODEL_PATH` (= model path, any model), `MAXS`. Writes `res_<dataset>/<TAG>.tsv`.
+- `full_lb_sweep.sh [CFG]` — every config in CFG x all 21 LongBench subtasks, parallel
+  across a GPU pool (list a GPU N times in `GPUS` for N workers on it). `MAXS=-1` = full.
+- `sweep_ds_mgpu.sh [CFG]` — every config x ONE `DATASET`, multi-GPU round-robin.
+- `aggregate.py TAG ...` — per-config full-LongBench average over `res_*/<TAG>.tsv`.
+- Run artifacts (`out_*/ res_*/ logs/ *.out DONE*`) are gitignored (regenerable).
+
+### Canonical: run the three cases (fp16 + pb2_pr6875 + pb2_pr875), full LongBench
+
+Use distinct tags per model so `res_*/` never collide (`<m>` = model slug):
+
+```bash
+cd <repo>/autoresearch/loop-260607 && conda activate kitty
+cat > configs_3cases.txt <<'EOF'
+fp16_<m>        fp16 fp16 0  0      1
+pb2_pr6875_<m>  1    4    2  0.6875 1
+pb2_pr875_<m>   1    4    2  0.875  1
+EOF
+LLAMA32_MODEL_PATH=/path/to/Model MODEL_FAMILY=<family> MODEL_TAG=<m> \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+GPUS=<layout> MAXS=-1 \
+setsid bash full_lb_sweep.sh configs_3cases.txt > fulllb_<m>.out 2>&1 &
+# then, per config: python3 aggregate.py fp16_<m> ; python3 aggregate.py pb2_pr6875_<m> ; ...
+```
+
+`MODEL_FAMILY` ∈ `llama3` (Llama-3.x), `qwen`, `glm4`, `phi` (Phi-3/4; added here for
+the chat template). For a new arch, extend `infer_model_family` / `build_chat` in
+`src/kitty_sim/longbench/templates.py`.
+
+### GPU parallelism vs context (24GB 3090; per-process peak @32k input)
+
+Each worker loads its own weights (no cross-process sharing), so workers/card =
+`floor(24GB / per-process-peak)`:
+
+| model | weights | ~peak @32k | workers / 24GB card | `GPUS` layout |
+| --- | ---: | ---: | ---: | --- |
+| Llama-3.2-1B | 2.5GB | ~5GB | 3 | `0,0,0,1,1,1,...` |
+| Llama-3.2-3B | 6.5GB | ~12GB | 2 | `0,0,1,1,...` |
+| phi-4-mini (3.8B) | 7.7GB | 15.4GB | **1** (2 OOMs at 32k) | `0,1,2,3,4,5` |
+| Llama-3.1-8B | ~16GB | ~22GB | **1** (tight on 24GB) | `0,1,2,3,4,5` |
+
+### Findings so far (full LongBench, sim)
+
+| model | fp16 avg | pb2_pr6875 (eff 1.69) | gap |
+| --- | ---: | ---: | ---: |
+| Llama-3.2-1B | 27.59 | 23.95 | ~ -13% |
+| Llama-3.2-3B | ~38 | ~37 (matched subset) | **~ -3%** |
+
+Bigger model = far more robust to the aggressive 1-bit-base K. Mechanism: accuracy
+is set by the FRACTION of K channels kept >=2-bit (~2/3 needed), not their per-channel
+precision; 2-bit boost is bit-optimal (1-bit+f16 needs ~6x the bits, 3-bit already
+matches the f16 upper bound). qasper>19 is the binding bar (needs more 2-bit channels
+than trec); long-summarization tasks (qmsum/vcsum/multi_news) are the first to collapse.
+
+### Llama-3.1-8B recipe (other machine)
+
+```bash
+cd <repo>/autoresearch/loop-260607 && conda activate kitty
+cat > configs_8b.txt <<'EOF'
+fp16_8b        fp16 fp16 0  0      1
+pb2_pr6875_8b  1    4    2  0.6875 1
+pb2_pr875_8b   1    4    2  0.875  1
+EOF
+LLAMA32_MODEL_PATH=/path/to/Llama-3.1-8B-Instruct MODEL_FAMILY=llama3 MODEL_TAG=llama31-8b \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+GPUS=0,1,2,3,4,5 MAXS=-1 \
+setsid bash full_lb_sweep.sh configs_8b.txt > fulllb_8b.out 2>&1 &
+python3 aggregate.py pb2_pr6875_8b   # full-LB avg per config
+```
+
+8B @32k needs ~22GB/process -> **1 worker/card** on a 24GB GPU (list each GPU once in
+`GPUS`); prefer >=40GB cards for headroom / 2-per-card. `head_dim=128` so pr0.6875 =
+88/128 channels @2-bit.

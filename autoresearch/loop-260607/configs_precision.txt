@@ -1,0 +1,10 @@
+# Precision-at-fixed-channel-count: at the dual-pass channel counts (40ch=pr0.625,
+# 44ch=pr0.6875), sweep the protection precision 3/4/8-bit. Compare against existing
+# 2-bit (pb2_*) and f16 (f16u_*) at the same ratios to see the climb to the f16 upper
+# bound and the cheapest precision with comfortable qasper margin. kbits=1 vbits=4.
+pre3_pr6875  1 4 3 0.6875 1
+pre4_pr6875  1 4 4 0.6875 1
+pre8_pr6875  1 4 8 0.6875 1
+pre3_pr625   1 4 3 0.625  1
+pre4_pr625   1 4 4 0.625  1
+pre8_pr625   1 4 8 0.625  1

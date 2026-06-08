@@ -1,0 +1,25 @@
+# Llama-3.2-1B fp16 full LongBench baseline (user-provided ceiling). Compare quant configs against this.
+# Acceptance bars: trec >= 62 (ceiling 65), qasper > 19 (ceiling 23.33).
+subtask	f16_full
+2wikimqa	28.9
+dureader	15
+gov_report	17.09
+hotpotqa	36.97
+lcc	35.51
+lsht	42.75
+multi_news	16
+multifieldqa_en	43.57
+multifieldqa_zh	22.84
+musique	21.59
+narrativeqa	21.31
+passage_count	3.5
+passage_retrieval_en	4.12
+passage_retrieval_zh	3.34
+qasper	23.33
+qmsum	15.03
+repobench-p	40.32
+samsum	28.36
+trec	65
+triviaqa	80.85
+vcsum	14.1
+AVERAGE	27.5943

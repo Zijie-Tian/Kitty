@@ -411,7 +411,7 @@ def load_model_and_tokenizer(
     tokenizer = AutoTokenizer.from_pretrained(
         resolved,
         trust_remote_code=True,
-        use_fast=("llama3" in model_family or "qwen" in model_family),
+        use_fast=("llama3" in model_family or "qwen" in model_family or "phi" in model_family),
         local_files_only=local_files_only,
     )
     if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:

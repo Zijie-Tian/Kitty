@@ -1,0 +1,17 @@
+# f16 UPPER-BOUND study: 1-bit base + N channels kept FULL fp16, swept over the SAME
+# promote_ratios as the 2-bit-boost family, for trec AND qasper. f16 at ratio r is the
+# best-case (upper bound) of 2-bit at ratio r (same channels protected, but losslessly).
+# Distinct tags (f16u_*) so res_trec/ res_qasper/ never collide. kbits=1 vbits=4 pb=16.
+f16u_pr0625   1 4 16 0.0625   1
+f16u_pr125    1 4 16 0.125    1
+f16u_pr1875   1 4 16 0.1875   1
+f16u_pr25     1 4 16 0.25     1
+f16u_pr3125   1 4 16 0.3125   1
+f16u_pr375    1 4 16 0.375    1
+f16u_pr4375   1 4 16 0.4375   1
+f16u_pr50     1 4 16 0.5      1
+f16u_pr5625   1 4 16 0.5625   1
+f16u_pr625    1 4 16 0.625    1
+f16u_pr6875   1 4 16 0.6875   1
+f16u_pr75     1 4 16 0.75     1
+f16u_pr875    1 4 16 0.875    1

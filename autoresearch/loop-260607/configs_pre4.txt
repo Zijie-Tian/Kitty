@@ -1,0 +1,4 @@
+# Full 21-subtask LongBench validation of the kernel-practical pick:
+# 4-bit boost on 40/64 channels (pr0.625), 1-bit base, V 4-bit. eff_K = 2.875.
+# proxy: trec 65.0 / qasper 22.49.
+pre4_pr625  1 4 4 0.625 1

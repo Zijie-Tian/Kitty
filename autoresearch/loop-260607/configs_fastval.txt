@@ -1,0 +1,6 @@
+# Fast full-LongBench validation (--max-samples 64) for the 3 top configs, on LOCAL 3090s.
+# Apples-to-apples 3-way comparison at 64 samples/subtask; pb2_pr6875 also has the slow
+# 200-sample GPU0 number for high-confidence absolute value.
+pb2_pr6875  1 4 2 0.6875 1
+pb2_pr875   1 4 2 0.875  1
+base2_v4    2 4 4 0.0    1
