@@ -63,6 +63,12 @@ class VariantConfig:
     sparse_budget: int = 2048
     rank: int = 160
     chunk_size: int = 8
+    # Per-layer promote_ratio override (kitty_k1v4 only): a tuple of
+    # (layer_idx, ratio) pairs -- hashable (frozen dataclass safe) and
+    # asdict-friendly. None => scalar promote_ratio for every layer.
+    # promote_ratio_config_path keeps the source JSON path for provenance.
+    promote_ratio_per_layer: tuple[tuple[int, float], ...] | None = None
+    promote_ratio_config_path: str | None = None
 
     @property
     def tag(self) -> str:
@@ -77,15 +83,66 @@ class VariantConfig:
                 f"{self.name}_p{self.page_size}_pr{ratio}"
                 f"_qb{self.quest_token_budget}_qsl{self.quest_skip_layers}_{kind}"
             )
+        suffix = ""
+        if self.promote_ratio_per_layer:
+            h = hashlib.sha256(repr(self.promote_ratio_per_layer).encode()).hexdigest()[:6]
+            suffix = f"-prcfg{h}"
         return (
             f"{self.name}_g{self.group_size}_b{self.buffer_length}_s{self.sink_length}"
             f"_sel{self.channel_selection}_k{self.kbits}_v{self.vbits}"
-            f"_pb{self.promote_bit}_pr{ratio}"
+            f"_pb{self.promote_bit}_pr{ratio}{suffix}"
         )
+
+
+def _load_promote_ratio_config(
+    path: str, default_ratio: float
+) -> tuple[float, tuple[tuple[int, float], ...] | None]:
+    """Load a per-layer promote_ratio schedule from a JSON file.
+
+    Accepted forms:
+      * {"default": 0.25, "layers": {"0": 0.75, "1": 0.5}}
+            -- any layer absent from "layers" falls back to "default".
+      * [0.75, 0.5, ...]  (a bare list: one ratio per layer index, in order).
+    Returns (default_ratio, per_layer), where per_layer is a tuple of
+    (layer_idx, ratio) pairs (None when there are no explicit per-layer
+    overrides). Ratios are validated to lie in [0, 1]; layer-index range vs the
+    model's actual layer count is checked later in run_longbench (after load).
+    """
+    with open(path, "r", encoding="utf-8") as handle:
+        cfg = json.load(handle)
+
+    def _check(value: Any, where: str) -> float:
+        r = float(value)
+        if not (0.0 <= r <= 1.0):
+            raise ValueError(f"promote-ratio-config {where} must be in [0, 1]; got {r}")
+        return r
+
+    if isinstance(cfg, list):
+        pairs = tuple((i, _check(v, f"layers[{i}]")) for i, v in enumerate(cfg))
+        return default_ratio, (pairs or None)
+    if isinstance(cfg, dict):
+        resolved_default = _check(cfg.get("default", default_ratio), "default")
+        layers = cfg.get("layers", {}) or {}
+        if not isinstance(layers, dict):
+            raise ValueError("promote-ratio-config 'layers' must be an object {layer_idx: ratio}")
+        pairs = tuple(
+            (int(k), _check(v, f"layers[{k}]"))
+            for k, v in sorted(layers.items(), key=lambda kv: int(kv[0]))
+        )
+        return resolved_default, (pairs or None)
+    raise ValueError(
+        'promote-ratio-config must be a JSON object {"default": r, "layers": {...}} '
+        "or a list [r0, r1, ...]"
+    )
 
 
 def build_variant(args: Any) -> VariantConfig:
     variant = args.variant.lower()
+    config_path = getattr(args, "promote_ratio_config", None)
+    if config_path and variant != "kitty_k1v4":
+        raise ValueError(
+            f"--promote-ratio-config is only supported for --variant kitty_k1v4; got '{variant}'."
+        )
     if variant == "fp16":
         return VariantConfig(name="fp16", use_kitty=False, promote_ratio=0.0)
     if variant == "kitty":
@@ -151,56 +208,23 @@ def build_variant(args: Any) -> VariantConfig:
         )
     if variant == "kitty_pro":
         return VariantConfig(name="kitty_pro", use_kitty=True, promote_ratio=0.25)
-    if variant == "kitty_k1v2":
-        # Aggressive 1-bit base + 2-bit channel boost on K; V stays per-token 2-bit.
-        # (Paper Kitty is 2-bit base + 4-bit boost; this explores the 1/2-bit regime.)
-        return VariantConfig(
-            name="kitty_k1v2", use_kitty=True,
-            kbits=1, vbits=2, promote_bit=2, promote_ratio=0.25,
-            sink_length=32, buffer_length=128, group_size=128, channel_selection=1,
-        )
-    if variant == "kitty_k1v2_pr50":
-        # Same K1V2 regime (1-bit base + 2-bit boost on K, V per-token 2-bit) but
-        # with promote_ratio=0.5 -- half the K channels promoted to 2-bit, probing
-        # whether a larger 2-bit fraction rescues the 1-bit-base collapse.
-        return VariantConfig(
-            name="kitty_k1v2_pr50", use_kitty=True,
-            kbits=1, vbits=2, promote_bit=2, promote_ratio=0.5,
-            sink_length=32, buffer_length=128, group_size=128, channel_selection=1,
-        )
-    if variant == "kitty_k1v2_pr75":
-        # Same K1V2 regime but with promote_ratio=0.75 -- three quarters of the K
-        # channels promoted to 2-bit (effective ~1.75-bit K), continuing the
-        # promote_ratio sweep toward the 2-bit ceiling.
-        return VariantConfig(
-            name="kitty_k1v2_pr75", use_kitty=True,
-            kbits=1, vbits=2, promote_bit=2, promote_ratio=0.75,
-            sink_length=32, buffer_length=128, group_size=128, channel_selection=1,
-        )
     if variant == "kitty_k1v4":
-        # Low-bit K kept aggressive (1-bit base + 25% 2-bit channel boost, same K
-        # as kitty_k1v2) but V relaxed to 4-bit -- tests whether a higher-precision
-        # V cache rescues accuracy while K stays sub-2-bit.
+        # Low-bit K (1-bit base + 2-bit magnitude channel boost), V relaxed to
+        # 4-bit. The K boost fraction (promote_ratio) is PER-LAYER when
+        # --promote-ratio-config is supplied: a JSON object
+        # {"default": r, "layers": {idx: r}} or a bare list [r0, r1, ...].
+        # Without a config, the scalar default below applies to every layer
+        # (byte-for-byte the historical kitty_k1v4 behaviour).
+        default_ratio = 0.25
+        per_layer = None
+        if config_path:
+            default_ratio, per_layer = _load_promote_ratio_config(config_path, default_ratio)
         return VariantConfig(
             name="kitty_k1v4", use_kitty=True,
-            kbits=1, vbits=4, promote_bit=2, promote_ratio=0.25,
+            kbits=1, vbits=4, promote_bit=2, promote_ratio=default_ratio,
             sink_length=32, buffer_length=128, group_size=128, channel_selection=1,
-        )
-    if variant == "kitty_k1v4_pr50":
-        # Same K1V4 regime (1-bit K base + 2-bit channel boost, V at 4-bit) but
-        # promote_ratio=0.5 -- half the K channels promoted to 2-bit.
-        return VariantConfig(
-            name="kitty_k1v4_pr50", use_kitty=True,
-            kbits=1, vbits=4, promote_bit=2, promote_ratio=0.5,
-            sink_length=32, buffer_length=128, group_size=128, channel_selection=1,
-        )
-    if variant == "kitty_k1v4_pr75":
-        # Same K1V4 regime but promote_ratio=0.75 -- three quarters of the K
-        # channels promoted to 2-bit (effective ~1.75-bit K), V at 4-bit.
-        return VariantConfig(
-            name="kitty_k1v4_pr75", use_kitty=True,
-            kbits=1, vbits=4, promote_bit=2, promote_ratio=0.75,
-            sink_length=32, buffer_length=128, group_size=128, channel_selection=1,
+            promote_ratio_per_layer=per_layer,
+            promote_ratio_config_path=config_path,
         )
     if variant == "kivi_2":
         return VariantConfig(name="kivi_2", use_kitty=True, sink_length=0, promote_ratio=0.0, channel_selection=0)
@@ -233,6 +257,9 @@ def _cache_factory(config: VariantConfig):
         vbits=config.vbits,
         promote_ratio=config.promote_ratio,
         promote_bit=config.promote_bit,
+        promote_ratio_per_layer=(
+            dict(config.promote_ratio_per_layer) if config.promote_ratio_per_layer else None
+        ),
         channel_selection=config.channel_selection,
     )
     return get_kvcache_kitty(ns)
@@ -323,12 +350,7 @@ def method_layout_slug(variant: VariantConfig | str) -> str:
         "quest_kitty_page16_sim": "quest-kitty-sim",
         "kitty": "kitty",
         "kitty_pro": "kitty-pro",
-        "kitty_k1v2": "kitty-k1v2",
-        "kitty_k1v2_pr50": "kitty-k1v2-pr50",
-        "kitty_k1v2_pr75": "kitty-k1v2-pr75",
         "kitty_k1v4": "kitty-k1v4",
-        "kitty_k1v4_pr50": "kitty-k1v4-pr50",
-        "kitty_k1v4_pr75": "kitty-k1v4-pr75",
         "fp16": "fp16",
         "kivi_2": "kivi-2",
         "kivi_star_2": "kivi-star-2",
@@ -868,6 +890,22 @@ def run_longbench(args: Any) -> dict[str, Any]:
         local_files_only=args.local_files_only,
         real_kernel=variant.real_kernel,
     )
+
+    # Validate a per-layer promote_ratio schedule against the model's real layer
+    # count now that the model is loaded (build_variant only checked ratios).
+    if variant.promote_ratio_per_layer:
+        n_layers = int(getattr(model_obj.config, "num_hidden_layers", 0))
+        bad = [idx for idx, _ in variant.promote_ratio_per_layer if not (0 <= idx < n_layers)]
+        if bad:
+            raise ValueError(
+                f"--promote-ratio-config references layer indices {bad} outside the model's "
+                f"[0, {n_layers}) range (num_hidden_layers={n_layers})."
+            )
+        print(
+            f"[per-layer-pr] {variant.name}: default={variant.promote_ratio} "
+            f"overrides={dict(variant.promote_ratio_per_layer)} "
+            f"(config={variant.promote_ratio_config_path})"
+        )
 
     # GLM-family remote modeling uses a legacy tuple KV cache and never calls
     # Cache.update(), so a KittyKVCache passed via past_key_values is a no-op
