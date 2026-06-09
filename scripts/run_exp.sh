@@ -266,6 +266,7 @@ method_slug() {
     kitty) printf 'kitty\n' ;;
     kitty_pro) printf 'kitty-pro\n' ;;
     kitty_k1v4) printf 'kitty-k1v4\n' ;;
+    kitty_k1v4_xhead) printf 'kitty-k1v4-xhead\n' ;;
     fp16) printf 'fp16\n' ;;
     kivi_2) printf 'kivi-2\n' ;;
     kivi_star_2) printf 'kivi-star-2\n' ;;
@@ -461,8 +462,11 @@ run_eval_dataset() {
   if [[ -n "${max_gen}" ]]; then
     cmd+=(--max-gen "${max_gen}")
   fi
-  # Per-layer promote_ratio schedule (only meaningful for the kitty_k1v4
-  # variant; build_variant rejects it for any other variant).
+  # Per-layer promote_ratio schedule (only meaningful for the kitty_k1v4 /
+  # kitty_k1v4_xhead variants; build_variant rejects it for any other variant).
+  # NOTE: when comparing kitty_k1v4 vs kitty_k1v4_xhead arms, set this for BOTH
+  # launches -- an arm launched without it silently runs the built-in
+  # promote_ratio=0.25 default and still writes to the same output dir name.
   if [[ -n "${PROMOTE_RATIO_CONFIG:-}" ]]; then
     cmd+=(--promote-ratio-config "${PROMOTE_RATIO_CONFIG}")
   fi

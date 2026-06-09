@@ -24,6 +24,9 @@ def build_promote_mask(
                                         (0)  for Random Selection;
                                         (1)  Magnitude-based Channel Selection;
                                         (2)  Variance-based Channel Selection;
+                                        (3)  Cross-head Magnitude-based Selection: the layer's total
+                                             budget (nh * k_chan, identical to strategy 1) is allocated
+                                             jointly across all heads, so per-head counts may differ;
     returns:
         promote_mask  : (B, nh, D) bool,      promote_mask[i][j] == True -> j-th channel of i-th head is selected for promotion
     """
@@ -54,6 +57,17 @@ def build_promote_mask(
         score = diff.pow(2).mean(dim=-1)  # (B, nh, D, T) → (B, nh, D)
         _, top_idx = score.topk(k_chan, dim=-1)
         promote_mask.scatter_(-1, top_idx, True)   # True → promote channel
+    elif channel_selection == 3:                                                            # (3)  Cross-head Magnitude-based Selection
+        # The layer budget is exactly nh * k_chan -- the same total as strategy (1)
+        # at any ratio -- but the topk runs over the flattened (nh*D) channels of
+        # the whole layer, so heads with larger-magnitude channels take more of
+        # the budget and others take less (possibly zero).
+        score = key_states.abs().mean(dim=-1)                       # (B, nh, D)
+        flat_score = score.reshape(B, nh * D)                       # (B, nh*D)
+        _, top_idx = flat_score.topk(nh * k_chan, dim=-1)           # (B, nh*k_chan)
+        flat_mask = torch.zeros((B, nh * D), dtype=torch.bool, device=key_states.device)
+        flat_mask.scatter_(-1, top_idx, True)
+        promote_mask = flat_mask.view(B, nh, D)
     ########################################################################################################################
     else:
         raise ValueError(f"Invalid channel_selection strategy: {channel_selection}")

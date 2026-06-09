@@ -37,7 +37,7 @@ class KittyKVCacheConfig(CacheConfig):
         promote_ratio: float = 0.1,
         promote_bit: int = 4,
         promote_ratio_per_layer: Optional[dict] = None,  # {layer_idx: ratio} overriding promote_ratio per layer; None = scalar for every layer
-        channel_selection: int = 1,               # -1: Unspecified, 0: Random, 1: Magnitude-based
+        channel_selection: int = 1,               # -1: Unspecified, 0: Random, 1: Magnitude-based, 3: Cross-head Magnitude (layer-global budget)
         VCache_BitDecoding: bool = False,         # The behavior of Value Cache, set to True means BitDecoding, otherwise KIVI Style Value Cache
         PostQuant: bool = True,                   # Post Quantization is always enabled
     ):
@@ -68,11 +68,11 @@ class KittyKVCacheConfig(CacheConfig):
             "Some of the keys in `cache_config` are defined incorrectly. `{key}` should be {correct_value}` "
             "but found {found_value}"
         )
-        if self.channel_selection not in [0,1]:
+        if self.channel_selection not in [0, 1, 3]:
             raise ValueError(
                 incorrect_arg_msg.format(
                     key="channel_selection",
-                    correct_value="0 or 1",
+                    correct_value="0, 1 or 3",
                     found_value=self.channel_selection,
                 ),
             )
