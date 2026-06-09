@@ -36,6 +36,7 @@ class KittyKVCacheConfig(CacheConfig):
         vbits: int = 2,
         promote_ratio: float = 0.1,
         promote_bit: int = 4,
+        promote_ratio_per_layer: Optional[dict] = None,  # {layer_idx: ratio} overriding promote_ratio per layer; None = scalar for every layer
         channel_selection: int = 1,               # -1: Unspecified, 0: Random, 1: Magnitude-based
         VCache_BitDecoding: bool = False,         # The behavior of Value Cache, set to True means BitDecoding, otherwise KIVI Style Value Cache
         PostQuant: bool = True,                   # Post Quantization is always enabled
@@ -48,6 +49,13 @@ class KittyKVCacheConfig(CacheConfig):
         self.vbits = vbits
         self.promote_ratio = promote_ratio
         self.promote_bit = promote_bit
+        # Per-layer override map {layer_idx: ratio}; layers absent from the map
+        # fall back to the scalar promote_ratio above. None => scalar everywhere.
+        self.promote_ratio_per_layer = (
+            {int(k): float(v) for k, v in promote_ratio_per_layer.items()}
+            if promote_ratio_per_layer is not None
+            else None
+        )
         self.channel_selection = channel_selection
         self.VCache_BitDecoding = VCache_BitDecoding
         self.PostQuant = PostQuant
@@ -132,6 +140,24 @@ class KittyKVCacheConfig(CacheConfig):
                     found_value=self.promote_bit,
                 ),
             )
+        if self.promote_ratio_per_layer is not None:
+            for idx, r in self.promote_ratio_per_layer.items():
+                if not (0.0 <= r <= 1.0):
+                    raise ValueError(
+                        incorrect_arg_msg.format(
+                            key=f"promote_ratio_per_layer[{idx}]",
+                            correct_value="between 0.0 and 1.0",
+                            found_value=r,
+                        ),
+                    )
+            if any(r > 0 for r in self.promote_ratio_per_layer.values()) and self.promote_bit < self.kbits:
+                raise ValueError(
+                    incorrect_arg_msg.format(
+                        key="promote_bit",
+                        correct_value=f"promote_bit should be >= kbits ({self.kbits}) when any per-layer promote_ratio > 0",
+                        found_value=self.promote_bit,
+                    ),
+                )
         if self.VCache_BitDecoding not in [False]:
             raise ValueError(
                 incorrect_arg_msg.format(
@@ -170,6 +196,8 @@ class KittyKVCache(DynamicCache):
         self.kbits = cache_config.kbits
         self.vbits = cache_config.vbits
         self.promote_ratio = cache_config.promote_ratio
+        # Per-layer promote_ratio override {layer_idx: ratio}; None => scalar.
+        self.promote_ratio_per_layer = cache_config.promote_ratio_per_layer
         self.promote_bit = cache_config.promote_bit
         self.channel_selection = cache_config.channel_selection
         self.VCache_BitDecoding = cache_config.VCache_BitDecoding
@@ -178,6 +206,12 @@ class KittyKVCache(DynamicCache):
         #
         #self.query_cache: list[torch.Tensor] = []
         #self.query_score: list[torch.Tensor] = []
+
+    def _layer_pr(self, layer_idx: int) -> float:
+        """Promote ratio for this layer: per-layer override if present, else scalar."""
+        if self.promote_ratio_per_layer is not None:
+            return self.promote_ratio_per_layer.get(layer_idx, self.promote_ratio)
+        return self.promote_ratio
 
     def get_seq_length(self, layer_idx: int = 0) -> int:
         """Return cached sequence length for transformers cache/mask helpers."""
@@ -266,7 +300,7 @@ class KittyKVCache(DynamicCache):
                 # Quantize Key Cache
                 for idx in range(start_idx, end_idx, self.buffer_length):
                     key_slice = current_key_cache[:, :, idx:idx+self.buffer_length, :].transpose(2, 3).contiguous()
-                    promote_mask = build_promote_mask(key_slice, self.promote_ratio, self.channel_selection)
+                    promote_mask = build_promote_mask(key_slice, self._layer_pr(layer_idx), self.channel_selection)
                     key_slice = fake_quant_groupwise_lastdim(key_slice, self.group_size, self.kbits, promote_mask, self.promote_bit).transpose(2, 3).contiguous()
                     current_key_cache[:, :, idx:idx+self.buffer_length, :] = key_slice
                 # Quantize Value Cache
@@ -294,7 +328,7 @@ class KittyKVCache(DynamicCache):
             if num_tokens_kv_to_quantize > 0 and (num_tokens_kv_to_quantize % self.buffer_length == 1):  # need to quantize
                 # Quantize Key Cache
                 key_slice = current_key_cache[:, :, -self.buffer_length-1:-1, :]
-                promote_mask = build_promote_mask(key_slice.transpose(2, 3).contiguous(), self.promote_ratio, self.channel_selection)
+                promote_mask = build_promote_mask(key_slice.transpose(2, 3).contiguous(), self._layer_pr(layer_idx), self.channel_selection)
                 key_slice = fake_quant_groupwise_lastdim(key_slice.transpose(2, 3).contiguous(), self.group_size, self.kbits, promote_mask, self.promote_bit).transpose(2, 3).contiguous()
                 current_key_cache[:, :, -self.buffer_length-1:-1, :] = key_slice
                 # Quantize Value Cache (BitDecoding)
@@ -329,6 +363,7 @@ def get_kvcache_kitty(args: argparse.Namespace) -> KittyKVCache:
         vbits               = args.vbits,
         promote_ratio       = args.promote_ratio,
         promote_bit         = args.promote_bit,
+        promote_ratio_per_layer = getattr(args, "promote_ratio_per_layer", None),
         channel_selection   = args.channel_selection,
         VCache_BitDecoding  = False,  # Using KIVI Style V Cache
         PostQuant           = True,  # Post Quantization is always enabled for Kitty KV Cache

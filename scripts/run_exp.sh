@@ -265,12 +265,7 @@ method_slug() {
     quest_kitty_page16_sim|quest_kitty_sim) printf 'quest-kitty-sim\n' ;;
     kitty) printf 'kitty\n' ;;
     kitty_pro) printf 'kitty-pro\n' ;;
-    kitty_k1v2) printf 'kitty-k1v2\n' ;;
-    kitty_k1v2_pr50) printf 'kitty-k1v2-pr50\n' ;;
-    kitty_k1v2_pr75) printf 'kitty-k1v2-pr75\n' ;;
     kitty_k1v4) printf 'kitty-k1v4\n' ;;
-    kitty_k1v4_pr50) printf 'kitty-k1v4-pr50\n' ;;
-    kitty_k1v4_pr75) printf 'kitty-k1v4-pr75\n' ;;
     fp16) printf 'fp16\n' ;;
     kivi_2) printf 'kivi-2\n' ;;
     kivi_star_2) printf 'kivi-star-2\n' ;;
@@ -465,6 +460,11 @@ run_eval_dataset() {
   fi
   if [[ -n "${max_gen}" ]]; then
     cmd+=(--max-gen "${max_gen}")
+  fi
+  # Per-layer promote_ratio schedule (only meaningful for the kitty_k1v4
+  # variant; build_variant rejects it for any other variant).
+  if [[ -n "${PROMOTE_RATIO_CONFIG:-}" ]]; then
+    cmd+=(--promote-ratio-config "${PROMOTE_RATIO_CONFIG}")
   fi
   # Real QUEST+Kitty kernel controls (only meaningful for the
   # quest_kitty_page16_kernel variant; ignored by other variants).

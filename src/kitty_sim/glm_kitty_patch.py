@@ -50,6 +50,11 @@ def cache_config_from_variant(variant) -> KittyKVCacheConfig:
         vbits=variant.vbits,
         promote_ratio=variant.promote_ratio,
         promote_bit=variant.promote_bit,
+        promote_ratio_per_layer=(
+            dict(variant.promote_ratio_per_layer)
+            if getattr(variant, "promote_ratio_per_layer", None)
+            else None
+        ),
         channel_selection=variant.channel_selection,
     )
 
