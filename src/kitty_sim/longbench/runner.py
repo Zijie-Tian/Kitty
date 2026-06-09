@@ -371,13 +371,39 @@ def config_hash(payload: dict[str, Any]) -> str:
     return hashlib.sha256(blob).hexdigest()[:16]
 
 
-def _real_kernel_model_class(model_family: str):
+def _real_kernel_model_class(model_family: str, model_path: str | None = None):
     """Resolve the architecture-specific *_Kitty model class for the real kernel.
 
     The real Triton Kitty + QUEST kernel is wired per architecture (custom
-    attention forward). Only Qwen3 and Llama are supported today.
+    attention forward). Supported: Llama, Qwen3, and Phi-3 / Phi-4-mini.
+
+    Phi-4-mini runs through the ``llama`` run_exp.sh target, so its family label
+    is ``llama3`` and does NOT say "phi". We therefore detect the real
+    architecture from the model config (``model_type == "phi3"``) first and only
+    fall back to the family label, so Phi is never mis-loaded into the Llama port
+    (which crashes on Phi's fused qkv_proj + partial RoPE).
     """
+    # Architecture from the config wins over the family label (Phi runs under the
+    # llama target with family=llama3 but needs the Phi-3 attention port).
+    if model_path is not None:
+        try:
+            from transformers import AutoConfig
+
+            model_type = str(
+                getattr(AutoConfig.from_pretrained(model_path, trust_remote_code=True), "model_type", "")
+            ).lower()
+        except Exception:
+            model_type = ""
+        if "phi3" in model_type:
+            from kitty.models.phi3 import Phi3ForCausalLM_Kitty
+
+            return Phi3ForCausalLM_Kitty
+
     fam = model_family.lower()
+    if "phi" in fam:
+        from kitty.models.phi3 import Phi3ForCausalLM_Kitty
+
+        return Phi3ForCausalLM_Kitty
     if "llama" in fam:
         from kitty.models.llama import LlamaForCausalLM_Kitty
         return LlamaForCausalLM_Kitty
@@ -386,7 +412,7 @@ def _real_kernel_model_class(model_family: str):
         return Qwen3ForCausalLM_Kitty
     raise ValueError(
         f"Real QUEST+Kitty kernel has no implementation for model_family={model_family!r}; "
-        f"supported families: 'llama', 'qwen'. Add a kitty/models/<arch> port first."
+        f"supported families: 'llama', 'qwen', 'phi'. Add a kitty/models/<arch> port first."
     )
 
 
@@ -417,10 +443,12 @@ def load_model_and_tokenizer(
     if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
         tokenizer.pad_token = tokenizer.eos_token
     if real_kernel and not is_glm_family(model_family):
-        # Llama/Qwen real kernel: load the architecture-specific *_Kitty class whose
-        # attention forward drives the real paged KittyCache. Prefill runs through a
-        # stock backend (sdpa needs no flash-attn); decode runs the Triton kernel.
-        model_class = _real_kernel_model_class(model_family)
+        # Llama/Qwen/Phi real kernel: load the architecture-specific *_Kitty class
+        # whose attention forward drives the real paged KittyCache. Prefill runs
+        # through a stock backend (sdpa needs no flash-attn); decode runs the Triton
+        # kernel. Pass the model path so Phi (run under the llama target, family
+        # llama3) is routed to the Phi-3 port by its config model_type.
+        model_class = _real_kernel_model_class(model_family, resolved)
         model_obj = model_class.from_pretrained(
             resolved,
             torch_dtype=torch_dtype,
