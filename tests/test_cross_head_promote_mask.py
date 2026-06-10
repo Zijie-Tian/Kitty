@@ -155,6 +155,47 @@ class CacheUpdateWithCrossHeadTests(unittest.TestCase):
         self.assertEqual(out_v.shape, v.shape)
 
 
+class CrossHeadPerLayerPrTests(unittest.TestCase):
+    """channel_selection=3 composes with promote_ratio_per_layer: each layer's
+    cross-head budget is nh * int(D * that layer's own ratio)."""
+
+    def test_update_uses_per_layer_budget_under_cs3(self):
+        from kitty_sim import kitty_simulate
+
+        cfg = KittyKVCacheConfig(
+            sink_length=2, buffer_length=2, group_size=2,
+            kbits=1, vbits=4, promote_bit=2, promote_ratio=0.5,
+            promote_ratio_per_layer={0: 0.75, 1: 0.25},
+            channel_selection=3,
+        )
+        cache = KittyKVCache(cfg)
+
+        recorded = []  # (ratio, mask_total, nh, D)
+        real = kitty_simulate.build_promote_mask
+
+        def spy(key_states, promote_ratio, channel_selection):
+            self.assertEqual(channel_selection, 3)
+            mask = real(key_states, promote_ratio, channel_selection)
+            _, nh, D, _ = key_states.shape
+            recorded.append((round(float(promote_ratio), 6), int(mask.sum()), nh, D))
+            return mask
+
+        kitty_simulate.build_promote_mask = spy
+        try:
+            torch.manual_seed(0)
+            # B=1, nh=2, T=6 (> sink2+buffer2 so quantization triggers), D=8.
+            for layer, want_ratio in ((0, 0.75), (1, 0.25), (2, 0.5)):
+                recorded.clear()
+                k, v = torch.randn(1, 2, 6, 8), torch.randn(1, 2, 6, 8)
+                cache.update(k, v, layer)
+                self.assertTrue(recorded, f"no mask call on layer {layer}")
+                for ratio, total, nh, D in recorded:
+                    self.assertEqual(ratio, want_ratio, f"layer {layer}")
+                    self.assertEqual(total, nh * int(D * want_ratio + 1e-6), f"layer {layer}")
+        finally:
+            kitty_simulate.build_promote_mask = real
+
+
 class BuildVariantXheadTests(unittest.TestCase):
     def _write(self, payload):
         fd, path = tempfile.mkstemp(suffix=".json")
