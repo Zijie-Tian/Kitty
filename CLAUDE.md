@@ -418,12 +418,8 @@ datasets across GPUs, use a single target, e.g. `run_exp.sh llama32 --gpus 0,1,2
 | --- | --- | --- |
 | `kitty` | `kitty` | Paper-style 2-bit Kitty, 128-token pages (sim fake-quant). |
 | `kitty_pro` | `kitty-pro` | Kitty with `promote_ratio=0.25`. |
-| `kitty_k1v2` | `kitty-k1v2` | Experimental sub-2-bit K: 1-bit base + 2-bit channel boost (`kbits=1, promote_bit=2, promote_ratio=0.25`); V stays per-token 2-bit. |
-| `kitty_k1v2_pr50` | `kitty-k1v2-pr50` | Same K1V2 regime, `promote_ratio=0.5` (half the K channels at 2-bit, effective ~1.5-bit K). |
-| `kitty_k1v2_pr75` | `kitty-k1v2-pr75` | Same K1V2 regime, `promote_ratio=0.75` (effective ~1.75-bit K). |
-| `kitty_k1v4` | `kitty-k1v4` | K1V4: same low-bit K as `kitty_k1v2` (1-bit base + 25% 2-bit boost) but V relaxed to per-token **4-bit**. |
-| `kitty_k1v4_pr50` | `kitty-k1v4-pr50` | K1V4 with `promote_ratio=0.5` (V 4-bit). |
-| `kitty_k1v4_pr75` | `kitty-k1v4-pr75` | K1V4 with `promote_ratio=0.75` (V 4-bit). |
+| `kitty_k1v4` | `kitty-k1v4` | K1V4 low-bit-K research config: 1-bit K base + 2-bit magnitude channel boost, V per-token **4-bit**. Boost fraction defaults to `promote_ratio=0.25`; override it (globally or per layer) via `--promote-ratio-config` / `PROMOTE_RATIO_CONFIG`. |
+| `kitty_k1v4_xhead` | `kitty-k1v4-xhead` | `kitty_k1v4` with `channel_selection=3` (cross-head): the layer's promote budget (`nh * int(head_dim*pr)`, bit-identical to the uniform variant) is allocated jointly across all KV heads by magnitude topk, so per-head counts may differ. Measured: no better than uniform at any ratio, clearly worse at pr=0.5 (see low-bit-K section). |
 | `fp16` | `fp16` | Full-precision baseline — no Kitty cache, HF dense fp16 KV. |
 | `kivi_2` | `kivi-2` | KIVI-2 baseline (sim fake-quant; no promote, no channel-select, no sink). |
 | `kivi_star_2` | `kivi-star-2` | KIVI*-2 — same as `kivi_2` but `sink_length=32`. |
@@ -433,6 +429,15 @@ datasets across GPUs, use a single target, e.g. `run_exp.sh llama32 --gpus 0,1,2
 
 The `fp16`, `kivi_2`, and `kivi_star_2` baselines keep dense fp16 KV, so they do
 not save KV memory; only `kitty` / `*_kernel` actually compress the cache.
+
+The old fixed-ratio low-bit-K variants (`kitty_k1v2`, `kitty_k1v2_pr50/75`,
+`kitty_k1v4_pr50/75`) were REMOVED: the boost fraction is now supplied
+externally via `--promote-ratio-config` (a `{"default": r}` JSON reproduces any
+old fixed-pr run), and the K1V2 (V 2-bit) family was superseded by K1V4. When
+sweeping several ratios of the SAME variant, set `LLAMA32_MODEL_SLUG` (or the
+target's `<T>_MODEL_SLUG`) to encode the ratio in the output dir — the method
+slug alone does not, and resume/skip only counts rows, so two ratios sharing a
+dir would silently mix.
 
 **Environment overrides.**
 
@@ -723,23 +728,27 @@ buffer_length=128, group_size=128, channel_selection=1`.
 
 ### Variant matrix
 
-| Family | V cache | `promote_ratio` 0.25 / 0.5 / 0.75 |
+| Family | V cache | How to run |
 | --- | --- | --- |
-| **K1V2** | per-token **2-bit** | `kitty_k1v2` / `kitty_k1v2_pr50` / `kitty_k1v2_pr75` |
-| **K1V4** | per-token **4-bit** | `kitty_k1v4` / `kitty_k1v4_pr50` / `kitty_k1v4_pr75` |
+| **K1V2** | per-token **2-bit** | REMOVED from code (results below retained for reference). |
+| **K1V4** | per-token **4-bit** | `--variant kitty_k1v4` + `PROMOTE_RATIO_CONFIG` JSON (`{"default": r}` for a flat ratio, per-layer form for schedules). |
+| **K1V4 cross-head** | per-token **4-bit** | `--variant kitty_k1v4_xhead` — same budget, allocated across heads jointly (`channel_selection=3`). |
 
-All six run on the pure-torch sim fake-quant path (`kitty_sim`), so they are an
-**accuracy proxy only and save no KV memory** — the real Triton kernel hardcodes
-2-bit/4-bit packing and is not built for a 1-bit K base. Treat these as accuracy
-research, not a kernel-speed or memory-savings claim.
+All of these run on the pure-torch sim fake-quant path (`kitty_sim`), so they are
+an **accuracy proxy only and save no KV memory** — the real Triton kernel
+hardcodes 2-bit/4-bit packing and is not built for a 1-bit K base (nor for
+per-head-variable boosted-channel counts). Treat these as accuracy research, not
+a kernel-speed or memory-savings claim.
 
 ### Results so far (LLaMA-3.2-1B, full LongBench, 21 datasets, 32k context, sim)
 
-| `promote_ratio` | eff. K bitwidth | K1V2 (V 2-bit) | K1V4 (V 4-bit) |
-| ---: | ---: | ---: | ---: |
-| 0.25 | ~1.25-bit | **10.46** | full run in progress |
-| 0.5 | ~1.5-bit | **15.96** | full run in progress |
-| 0.75 | ~1.75-bit | **23.36** | full run in progress |
+| `promote_ratio` | eff. K bitwidth | K1V2 (V 2-bit) | K1V4 uniform | K1V4 cross-head |
+| ---: | ---: | ---: | ---: | ---: |
+| 0.25 | 1.250 | **10.46** | **10.76** | 10.84 |
+| 0.5 | 1.500 | **15.96** | **17.49** | 17.04 |
+| 0.625 | 1.625 | — | **21.89** | 22.07 |
+| 0.75 | 1.750 | **23.36** | **24.31** | — |
+| 0.875 | 1.875 | — | **25.20** | 25.07 |
 
 Baselines (same harness): fp16 27.59 / kitty (2-bit base, 4-bit boost) 26.25 /
 kivi (2-bit) 24.24.
@@ -753,36 +762,63 @@ steadily as the boost fraction rises, nearly reaching the true 2-bit floor by 0.
 fractions (long-range retrieval such as hotpotqa/musique is the first to fail and
 the first to recover).
 
-**K1V4 (WIP).** The K1V4 family re-runs the same K sweep with V at 4-bit to test
-whether a higher-precision V lifts accuracy at each K operating point (i.e. is the
-collapse K-driven, or is there V headroom to exploit?). Full numbers are pending;
-this WIP commit registers the variants and launches the runs.
+**Finding (K1V4, final).** Relaxing V to 4-bit lifts every K operating point only
+modestly (+0.3 to +1.5 over K1V2) — the collapse is K-driven, not V-limited. The
+uniform K1V4 dose-response is cleanly monotone in effective K bits
+(10.76 → 17.49 → 21.89 → 24.31 → 25.20).
+
+**Finding (cross-head, final).** `kitty_k1v4_xhead` reallocates the SAME promote
+budget across the 8 KV heads by raw magnitude (per-head counts observed 10–58
+vs the uniform 32 at pr=0.5; the per-head "loudness" profile is stable across
+datasets, i.e. a model property). At equal bits it is **never meaningfully
+better** than the uniform per-head quota (best +0.18 avg at 0.625) and is
+**clearly worse at pr=0.5** (−0.45 avg; trec −2.5, qasper −3.2): raw |K|
+magnitude is not comparable across heads, so "loud" heads steal top channels
+from quiet heads whose own per-head softmax needs them — the uniform quota acts
+as a correct implicit regularizer. Task signature is stable across ratios (lsht
+consistently likes cross-head, narrativeqa/repobench-p/lcc consistently
+dislike it): the freedom redistributes damage across task types rather than
+reducing it. Head-level allocation, if pursued (P3), needs a head-normalized or
+quantization-error-driven signal, not raw magnitude.
 
 ### Reproduction
 
-Canonical GPU1 single-card form; swap `--variant` for any of the six; model path
-resolves via `.env`/`LLAMA32_MODEL_PATH`:
+Canonical GPU1 single-card form; model path resolves via
+`.env`/`LLAMA32_MODEL_PATH`. The boost fraction comes from a JSON config
+(`{"default": 0.5}` here); use `--variant kitty_k1v4_xhead` for the cross-head
+arm. When running several ratios, encode the ratio in the output dir via
+`LLAMA32_MODEL_SLUG` (e.g. `llama32-1b-instruct-pr625`):
 
 ```bash
 # smoke (2 samples/dataset)
 cd /home/zijie/Code/Kitty
+printf '{"default": 0.5}' > configs/pr50.json
 LLAMA32_MODEL_PATH=/path/to/Llama-3.2-1B-Instruct \
+PROMOTE_RATIO_CONFIG=$PWD/configs/pr50.json \
 MAX_MODEL_LEN=32768 LLAMA32_MAX_GEN=256 \
-bash scripts/run_exp.sh llama32 --gpu 1 --variant kitty_k1v4_pr50 --max-samples 2
-# -> longbench_out/smoke/llama32-1b-instruct_kitty-k1v4-pr50/{pred,logs}
+bash scripts/run_exp.sh llama32 --gpu 1 --variant kitty_k1v4 --max-samples 2
+# -> longbench_out/smoke/llama32-1b-instruct_kitty-k1v4/{pred,logs}
 ```
 
 ```bash
 # full (all 21 datasets, 32k context)
 cd /home/zijie/Code/Kitty
+printf '{"default": 0.5}' > configs/pr50.json
 LLAMA32_MODEL_PATH=/path/to/Llama-3.2-1B-Instruct \
+PROMOTE_RATIO_CONFIG=$PWD/configs/pr50.json \
 MAX_MODEL_LEN=32768 LLAMA32_MAX_GEN=256 \
-bash scripts/run_exp.sh llama32 --gpu 1 --variant kitty_k1v4_pr50
-# -> longbench_out/llama32-1b-instruct_kitty-k1v4-pr50/{pred,logs}
+bash scripts/run_exp.sh llama32 --gpu 1 --variant kitty_k1v4
+# -> longbench_out/llama32-1b-instruct_kitty-k1v4/{pred,logs}
 ```
+
+Set `PROMOTE_RATIO_CONFIG` for BOTH arms when comparing uniform vs cross-head —
+an arm launched without it silently runs the built-in `promote_ratio=0.25`
+default and still writes to the same output dir name.
 
 To fan one variant's 21 datasets across several GPUs for speed (an explicit
 override of the GPU1-only rule), use e.g. `--gpus 0,1,2,3,4,5` instead of `--gpu 1`.
+A 1B model at 32k needs ~5 GB/worker, so two concurrent launches can share the
+same 24 GB card (list the card in both launches' `--gpus`) for 2 workers/card.
 
 ## 32k memory probe evidence
 
