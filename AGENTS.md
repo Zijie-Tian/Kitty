@@ -419,7 +419,7 @@ datasets across GPUs, use a single target, e.g. `run_exp.sh llama32 --gpus 0,1,2
 | `kitty` | `kitty` | Paper-style 2-bit Kitty, 128-token pages (sim fake-quant). |
 | `kitty_pro` | `kitty-pro` | Kitty with `promote_ratio=0.25`. |
 | `kitty_k1v4` | `kitty-k1v4` | K1V4 low-bit-K research config: 1-bit K base + 2-bit magnitude channel boost, V per-token **4-bit**. Boost fraction defaults to `promote_ratio=0.25`; override it (globally or per layer) via `--promote-ratio-config` / `PROMOTE_RATIO_CONFIG`. |
-| `kitty_k1v4_xhead` | `kitty-k1v4-xhead` | `kitty_k1v4` with `channel_selection=3` (cross-head): the layer's promote budget (`nh * int(head_dim*pr)`, bit-identical to the uniform variant) is allocated jointly across all KV heads by magnitude topk, so per-head counts may differ. Measured: no better than uniform at any ratio, clearly worse at pr=0.5 (see low-bit-K section). |
+| `kitty_k1v4_xhead` | `kitty-k1v4-xhead` | `kitty_k1v4` with `channel_selection=3` (cross-head): the layer's promote budget (`nh * int(head_dim*pr)`, bit-identical to the uniform variant) is allocated jointly across all KV heads by magnitude topk, so per-head counts may differ. Measured: at FLAT ratios never better than uniform (worst at pr=0.5, −0.45), but paired with a sensitivity-aligned per-layer pr schedule it is the best 1.5-bit config (S1-X 18.39 vs flat-U 17.49; see low-bit-K section). |
 | `fp16` | `fp16` | Full-precision baseline — no Kitty cache, HF dense fp16 KV. |
 | `kivi_2` | `kivi-2` | KIVI-2 baseline (sim fake-quant; no promote, no channel-select, no sink). |
 | `kivi_star_2` | `kivi-star-2` | KIVI*-2 — same as `kivi_2` but `sink_length=32`. |
@@ -781,6 +781,37 @@ dislike it): the freedom redistributes damage across task types rather than
 reducing it. Head-level allocation, if pursued (P3), needs a head-normalized or
 quantization-error-driven signal, not raw magnitude.
 
+**Finding (per-layer schedule × cross-head, final).** At the 0.5 anchor, three
+strictly equal-bits per-layer pr schedules (16-layer Σ `int(64*pr_l)` = 512,
+i.e. 1.500 effective K bits each) were run with U/X paired arms on the full
+21-dataset LongBench:
+
+| schedule (all 1.5-bit equal bits) | U (sel=1) | X (sel=3) | Δ(X−U) |
+| --- | ---: | ---: | ---: |
+| flat 0.5 (control) | 17.49 | 17.04 | −0.45 |
+| S1 sensitivity-aligned (L10/L14→0.875, L0/L1→0.25, L2–L5→0.4375, rest 0.5) | 17.21 | **18.39** | **+1.18** |
+| S2 skew-protect (most head-skewed layers boosted) | 13.83 | 13.47 | −0.36 |
+| S3 inverted S1 (k′=64−k) | 13.41 | 13.16 | −0.25 |
+
+The interaction is SPECIFIC: S1-X is the best 1.5-bit operating point measured
+(+0.90 over flat-U), while the same schedule does nothing on the uniform arm
+(17.21 < 17.49, replicating the layer-diff "calibration doesn't beat uniform"
+negative result), and S2/S3 show it is not "any schedule rescues cross-head"
+(both Δ still negative). S1's X−U gain is broad (15/21 datasets positive,
+median +0.49) and concentrated in retrieval (triviaqa +6.2, multifieldqa_en
++3.7, 2wikimqa +3.6, hotpotqa +3.2). S3's two-arm collapse (hotpotqa 5.7,
+triviaqa 28.7) independently confirms L10/L14 are genuinely sensitive layers.
+The sensitivity ranking (L10 > L14 > L9; front layers least sensitive) comes
+from the layer-diff leave-one-out probes: drop ONE layer's K to 1-bit at
+uniform references 0.6875/0.875, score on qasper/hotpotqa/multifieldqa_en.
+Caveats: qasper stays below flat-U under every schedule tried (11.71 → ~9);
+single model (1B) and single anchor (0.5) so far. The validated S1 schedule:
+
+```json
+{"default": 0.5, "layers": {"10": 0.875, "14": 0.875, "0": 0.25, "1": 0.25,
+ "2": 0.4375, "3": 0.4375, "4": 0.4375, "5": 0.4375}}
+```
+
 ### Reproduction
 
 Canonical GPU1 single-card form; model path resolves via
@@ -814,6 +845,11 @@ bash scripts/run_exp.sh llama32 --gpu 1 --variant kitty_k1v4
 Set `PROMOTE_RATIO_CONFIG` for BOTH arms when comparing uniform vs cross-head —
 an arm launched without it silently runs the built-in `promote_ratio=0.25`
 default and still writes to the same output dir name.
+
+For the validated best 1.5-bit config, write the S1 schedule JSON above to a
+file and run `--variant kitty_k1v4_xhead` with `PROMOTE_RATIO_CONFIG` pointing
+at it; encode the schedule in the output dir via `LLAMA32_MODEL_SLUG`
+(e.g. `llama32-1b-instruct-s1sens`) so arms never share a dir.
 
 To fan one variant's 21 datasets across several GPUs for speed (an explicit
 override of the GPU1-only rule), use e.g. `--gpus 0,1,2,3,4,5` instead of `--gpu 1`.
