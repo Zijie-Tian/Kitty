@@ -139,9 +139,10 @@ def _load_promote_ratio_config(
 def build_variant(args: Any) -> VariantConfig:
     variant = args.variant.lower()
     config_path = getattr(args, "promote_ratio_config", None)
-    if config_path and variant != "kitty_k1v4":
+    if config_path and variant not in ("kitty_k1v4", "kitty_k1v4_xhead"):
         raise ValueError(
-            f"--promote-ratio-config is only supported for --variant kitty_k1v4; got '{variant}'."
+            "--promote-ratio-config is only supported for --variant kitty_k1v4 / "
+            f"kitty_k1v4_xhead; got '{variant}'."
         )
     if variant == "fp16":
         return VariantConfig(name="fp16", use_kitty=False, promote_ratio=0.0)
@@ -208,21 +209,27 @@ def build_variant(args: Any) -> VariantConfig:
         )
     if variant == "kitty_pro":
         return VariantConfig(name="kitty_pro", use_kitty=True, promote_ratio=0.25)
-    if variant == "kitty_k1v4":
+    if variant in ("kitty_k1v4", "kitty_k1v4_xhead"):
         # Low-bit K (1-bit base + 2-bit magnitude channel boost), V relaxed to
         # 4-bit. The K boost fraction (promote_ratio) is PER-LAYER when
         # --promote-ratio-config is supplied: a JSON object
         # {"default": r, "layers": {idx: r}} or a bare list [r0, r1, ...].
         # Without a config, the scalar default below applies to every layer
         # (byte-for-byte the historical kitty_k1v4 behaviour).
+        #
+        # kitty_k1v4_xhead differs ONLY in channel_selection=3: the layer's
+        # promote budget (nh * int(head_dim*ratio), bit-identical to the uniform
+        # variant) is allocated jointly across all KV heads by magnitude, so
+        # per-head promoted-channel counts may differ.
         default_ratio = 0.25
         per_layer = None
         if config_path:
             default_ratio, per_layer = _load_promote_ratio_config(config_path, default_ratio)
         return VariantConfig(
-            name="kitty_k1v4", use_kitty=True,
+            name=variant, use_kitty=True,
             kbits=1, vbits=4, promote_bit=2, promote_ratio=default_ratio,
-            sink_length=32, buffer_length=128, group_size=128, channel_selection=1,
+            sink_length=32, buffer_length=128, group_size=128,
+            channel_selection=3 if variant == "kitty_k1v4_xhead" else 1,
             promote_ratio_per_layer=per_layer,
             promote_ratio_config_path=config_path,
         )
@@ -351,6 +358,7 @@ def method_layout_slug(variant: VariantConfig | str) -> str:
         "kitty": "kitty",
         "kitty_pro": "kitty-pro",
         "kitty_k1v4": "kitty-k1v4",
+        "kitty_k1v4_xhead": "kitty-k1v4-xhead",
         "fp16": "fp16",
         "kivi_2": "kivi-2",
         "kivi_star_2": "kivi-star-2",
