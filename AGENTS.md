@@ -2,6 +2,22 @@
 
 This file captures durable, repo-local guidance for agents working in this Kitty checkout. It should contain stable operational constraints and reproducible commands, not transient run logs.
 
+## Notion 笔记路由
+
+When recording notes to Notion for this project, route by note type:
+
+- **研究笔记 / Research notes** (方法调研 / 文献综述 / 结论与观察 / 技术报告) → database
+  `📚 研究笔记 | Research Notes`, id `819846320d954eeea661638174068076`
+  (data source `35fd3ce0-5640-4963-979f-4c1bad6d2639`).
+- **实验测试笔记 / Experiment & test notes** (跑了哪些实验、数据表、复现命令、精度评测)
+  → database `测试笔记 | Test Notes`, id `fa575373aeaa494d957a90fe07d5c8e0`
+  (data source `ee4db7c4-cbd7-4b35-bd6e-fbc04a9c8310`).
+
+Use the `ntn` CLI with `NOTION_KEYRING=0` (headless / file-based auth). Create a
+page under a database via `parent.type=data_source_id`. Note: ntn currently can
+NOT attach a `file_upload` to an image block — save figures locally and drag them
+into Notion manually if embedding is needed.
+
 ## GPU1-only evaluation rule
 
 When a task mentions the current GPU1-only reproduction/evaluation setup, restrict execution to physical GPU1.
