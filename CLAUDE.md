@@ -458,10 +458,11 @@ or improved. Full design + usage: `docs/typed_kv_quant.md`. The matched baseline
 4-bit for both quantized variants. Override the policy without code edits via
 `TYPED_BIN_CODEBOOKS=sign,sign,sign,tern,nf2,nf2`.
 
-Validated on Llama-3.2-1B (9 hardest QA/retrieval datasets): typed 22.82 vs
-tern_uniform 20.16 vs fp16 25.67 — typed beats uniform tern by +2.66 at fewer bits
-(retains 88.9% of fp16 vs tern's 78.5%). Llama-3.2-1B only so far; `nf2` (per-group
-Lloyd) is the runtime bottleneck.
+Validated on Llama-3.2-1B (full 21 LongBench, 32k): typed 25.26 vs tern_uniform 23.44
+vs fp16 27.63 — typed beats uniform tern by +1.82 at fewer bits (retains 91.4% of fp16
+vs tern's 84.8%), gains concentrated on retrieval (trec 65.00=fp16 vs tern 56.00,
+multifieldqa_en +6.1, qasper +4.4). Llama-3.2-1B only so far; `nf2` (per-group Lloyd)
+is the runtime bottleneck.
 
 ```bash
 # smoke (2 samples/dataset, long-context datasets so the K path is exercised)

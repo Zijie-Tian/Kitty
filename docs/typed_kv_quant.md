@@ -207,17 +207,22 @@ quantile bin (bin 0 = lowest σ²). Codebook names: see §2.
 `typed` Pareto-dominates uniform tern (lower bits **and** higher overlap). Below
 1.68 bit overlap drops below the 0.774 iso-tern wall.
 
-**LongBench** (9 hardest QA/retrieval datasets, the discriminating subset):
+**LongBench** (full 21 datasets, Llama-3.2-1B, 32k context):
 
 | | fp16 | tern_uniform (1.83b) | typed (1.68b) |
 | --- | ---: | ---: | ---: |
-| avg (9 common) | 25.67 | 20.16 | **22.82** |
-| retain vs fp16 | 100% | 78.5% | **88.9%** |
+| avg (21) | 27.63 | 23.44 | **25.26** |
+| retain vs fp16 | 100% | 84.8% | **91.4%** |
 
-typed (fewer bits) beats uniform tern by **+2.66**, with the gains concentrated on the
-K-fidelity-sensitive retrieval tasks (multifieldqa_en +6.1, qasper +4.4, hotpotqa
-+3.9). The real-score win is larger than the proxy suggested because typed spends bits
-exactly on the retrieval-critical high-σ² channels.
+typed (fewer bits) beats uniform tern by **+1.82** on the full 21, closing the gap to
+fp16 from tern's 84.8% to 91.4%. Gains are concentrated on the K-fidelity-sensitive
+retrieval tasks (trec 65.00 = fp16 vs tern 56.00; multifieldqa_en +6.1, qasper +4.4,
+hotpotqa +3.9, lsht +2.8); the only dataset where typed slightly trails tern is
+repobench-p (−0.26). The full-21 margin (+1.82) is smaller than the 9-hardest-dataset
+margin (+2.66 → 22.82 vs 20.16) because saturated easy datasets (passage_count,
+passage_retrieval) dilute the average — the direction is unchanged. The real-score win
+exceeds the overlap proxy because typed spends bits exactly on the retrieval-critical
+high-σ² channels.
 
 ## 7. Caveats
 
