@@ -40,6 +40,9 @@ class KittyKVCacheConfig(CacheConfig):
         channel_selection: int = 1,               # -1: Unspecified, 0: Random, 1: Magnitude-based, 3: Cross-head Magnitude (layer-global budget)
         VCache_BitDecoding: bool = False,         # The behavior of Value Cache, set to True means BitDecoding, otherwise KIVI Style Value Cache
         PostQuant: bool = True,                   # Post Quantization is always enabled
+        k_codebook: str = "kivi",                 # "kivi" = existing min-max groupwise K quant; "typed" = per-channel sigma^2-binned codebooks
+        bin_codebooks: Optional[list] = None,     # typed only: list[str] mapping sigma^2-bin -> codebook (meanonly/sign/tern/uni2/nf2/uni3)
+        n_bins: int = 6,                          # typed only: number of per-layer sigma^2 quantile bins
     ):
         super().__init__("kitty_kv")
         self.sink_length = sink_length
@@ -59,6 +62,9 @@ class KittyKVCacheConfig(CacheConfig):
         self.channel_selection = channel_selection
         self.VCache_BitDecoding = VCache_BitDecoding
         self.PostQuant = PostQuant
+        self.k_codebook = k_codebook
+        self.bin_codebooks = list(bin_codebooks) if bin_codebooks is not None else None
+        self.n_bins = n_bins
         #
         self.validate()
 
@@ -68,6 +74,12 @@ class KittyKVCacheConfig(CacheConfig):
             "Some of the keys in `cache_config` are defined incorrectly. `{key}` should be {correct_value}` "
             "but found {found_value}"
         )
+        if self.k_codebook not in ("kivi", "typed"):
+            raise ValueError(
+                incorrect_arg_msg.format(key="k_codebook", correct_value="'kivi' or 'typed'",
+                                         found_value=self.k_codebook))
+        if self.k_codebook == "typed" and not self.bin_codebooks:
+            raise ValueError("k_codebook='typed' requires a non-empty bin_codebooks list")
         if self.channel_selection not in [0, 1, 3]:
             raise ValueError(
                 incorrect_arg_msg.format(
@@ -203,6 +215,13 @@ class KittyKVCache(DynamicCache):
         self.VCache_BitDecoding = cache_config.VCache_BitDecoding
         self.PostQuant = cache_config.PostQuant
         self.cache_implementation = cache_config.cache_implementation
+        # Typed (sigma^2-binned) K codebook support. k_bin_ids[layer_idx] = [nh,D]
+        # per-channel bin id, computed once (from the prompt quant region at prefill)
+        # then reused for every buffer flush + decode. None for the default 'kivi' path.
+        self.k_codebook = cache_config.k_codebook
+        self.bin_codebooks = cache_config.bin_codebooks
+        self.n_bins = cache_config.n_bins
+        self.k_bin_ids: dict[int, torch.Tensor] = {}
         #
         #self.query_cache: list[torch.Tensor] = []
         #self.query_score: list[torch.Tensor] = []
@@ -212,6 +231,27 @@ class KittyKVCache(DynamicCache):
         if self.promote_ratio_per_layer is not None:
             return self.promote_ratio_per_layer.get(layer_idx, self.promote_ratio)
         return self.promote_ratio
+
+    def _ensure_k_bins(self, layer_idx, key_region_t):
+        """Cache per-channel sigma^2-bins for a layer from a [B,nh,D,Tq] region.
+        Called once with the full prompt quant region at prefill; no-op if set."""
+        if self.k_codebook != "typed" or layer_idx in self.k_bin_ids:
+            return
+        from .typed_quant import compute_sigma_bins
+        self.k_bin_ids[layer_idx] = compute_sigma_bins(key_region_t, self.group_size, self.n_bins)
+
+    def _quant_k_buffer(self, key_slice_t, layer_idx):
+        """Quantize a [B,nh,D,buffer] post-RoPE K buffer. 'typed' uses the layer's
+        sigma^2-bins (lazily binned from this buffer if prefill never set them);
+        default 'kivi' uses the existing min-max groupwise + promote path."""
+        if self.k_codebook == "typed":
+            from .typed_quant import fake_quant_typed_buffer
+            self._ensure_k_bins(layer_idx, key_slice_t)
+            return fake_quant_typed_buffer(
+                key_slice_t, self.k_bin_ids[layer_idx], self.bin_codebooks, self.group_size)
+        promote_mask = build_promote_mask(key_slice_t, self._layer_pr(layer_idx), self.channel_selection)
+        return fake_quant_groupwise_lastdim(
+            key_slice_t, self.group_size, self.kbits, promote_mask, self.promote_bit)
 
     def get_seq_length(self, layer_idx: int = 0) -> int:
         """Return cached sequence length for transformers cache/mask helpers."""
@@ -297,11 +337,14 @@ class KittyKVCache(DynamicCache):
                 num_token_to_buffer = num_tokens % self.buffer_length
                 num_token_to_quantize = num_tokens - num_token_to_buffer
                 end_idx = start_idx + num_token_to_quantize
-                # Quantize Key Cache
+                # Quantize Key Cache. Typed path bins channels by sigma^2 once over
+                # the full prompt quant region [sink, end_idx) before flushing buffers.
+                self._ensure_k_bins(
+                    layer_idx,
+                    current_key_cache[:, :, start_idx:end_idx, :].transpose(2, 3).contiguous())
                 for idx in range(start_idx, end_idx, self.buffer_length):
                     key_slice = current_key_cache[:, :, idx:idx+self.buffer_length, :].transpose(2, 3).contiguous()
-                    promote_mask = build_promote_mask(key_slice, self._layer_pr(layer_idx), self.channel_selection)
-                    key_slice = fake_quant_groupwise_lastdim(key_slice, self.group_size, self.kbits, promote_mask, self.promote_bit).transpose(2, 3).contiguous()
+                    key_slice = self._quant_k_buffer(key_slice, layer_idx).transpose(2, 3).contiguous()
                     current_key_cache[:, :, idx:idx+self.buffer_length, :] = key_slice
                 # Quantize Value Cache
                 if not self.VCache_BitDecoding:
@@ -327,9 +370,8 @@ class KittyKVCache(DynamicCache):
             num_tokens_kv_to_quantize = current_cache_length - self.sink_length - self.buffer_length
             if num_tokens_kv_to_quantize > 0 and (num_tokens_kv_to_quantize % self.buffer_length == 1):  # need to quantize
                 # Quantize Key Cache
-                key_slice = current_key_cache[:, :, -self.buffer_length-1:-1, :]
-                promote_mask = build_promote_mask(key_slice.transpose(2, 3).contiguous(), self._layer_pr(layer_idx), self.channel_selection)
-                key_slice = fake_quant_groupwise_lastdim(key_slice.transpose(2, 3).contiguous(), self.group_size, self.kbits, promote_mask, self.promote_bit).transpose(2, 3).contiguous()
+                key_slice = current_key_cache[:, :, -self.buffer_length-1:-1, :].transpose(2, 3).contiguous()
+                key_slice = self._quant_k_buffer(key_slice, layer_idx).transpose(2, 3).contiguous()
                 current_key_cache[:, :, -self.buffer_length-1:-1, :] = key_slice
                 # Quantize Value Cache (BitDecoding)
                 if self.VCache_BitDecoding:
@@ -367,6 +409,9 @@ def get_kvcache_kitty(args: argparse.Namespace) -> KittyKVCache:
         channel_selection   = args.channel_selection,
         VCache_BitDecoding  = False,  # Using KIVI Style V Cache
         PostQuant           = True,  # Post Quantization is always enabled for Kitty KV Cache
+        k_codebook          = getattr(args, "k_codebook", "kivi"),
+        bin_codebooks       = getattr(args, "bin_codebooks", None),
+        n_bins              = getattr(args, "n_bins", 6),
     )
     #
     return KittyKVCache(cache_config=cache_config)

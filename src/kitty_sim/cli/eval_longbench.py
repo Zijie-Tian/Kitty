@@ -30,6 +30,10 @@ def build_parser() -> argparse.ArgumentParser:
             "kivi_2",
             "kivi_star_2",
             "custom",
+            "typed",
+            "typed_winner",
+            "tern_uniform",
+            "tern_k",
         ],
     )
     # Real QUEST+Kitty kernel controls (variant=quest_kitty_page16_kernel only).

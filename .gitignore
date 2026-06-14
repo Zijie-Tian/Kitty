@@ -17,6 +17,8 @@ build/
 /.omx
 /.claude
 /longbench_out
+# KV-cache 能量探针产物（图/JSON/PT），可再生，不跟踪
+/probe_out
 logs/longbench_gpu0
 logs/longbench
 /logs/longbench_gpu1

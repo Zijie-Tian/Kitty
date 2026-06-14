@@ -442,9 +442,54 @@ datasets across GPUs, use a single target, e.g. `run_exp.sh llama32 --gpus 0,1,2
 | `quest_kitty_page16_sim` | `quest-kitty-sim` | Pure-torch QUEST+Kitty page16 accuracy proxy (real query-aware selection, no Triton, any arch). |
 | `quest_kitty_page16_kernel` | `quest-kitty-kernel` | Real Triton QUEST+Kitty page16 sparse decode (speed proof; Llama/Qwen/GLM). |
 | `custom` | `custom-kitty` | Custom Kitty config. |
+| `typed` | `typed` | σ²-binned mixed-codebook K quant (sim fake-quant). Per-layer channels are binned by residual σ²; low-σ² bins use cheap codebooks (sign), high-σ² bins use richer ones (nf2). Winner `["sign","sign","sign","tern","nf2","nf2"]` ≈ K **1.68 bit**, V per-token 4-bit. See `docs/typed_kv_quant.md`. |
+| `tern_uniform` | `tern-uniform` | Uniform-tern K (all channels tern) + V 4-bit, K ≈ 1.83 bit — the iso-tern baseline `typed` is compared against. |
 
 The `fp16`, `kivi_2`, and `kivi_star_2` baselines keep dense fp16 KV, so they do
 not save KV memory; only `kitty` / `*_kernel` actually compress the cache.
+
+### Typed σ²-binned K-quant test (variants `typed` / `tern_uniform`)
+
+`typed` is a per-channel mixed-codebook K quant: channels are binned by residual σ²
+and given different codebooks (low σ² → cheap `sign`, high σ² → richer `nf2`), so the
+average K bit-width (≈1.68) drops below uniform tern (≈1.83) while accuracy is kept
+or improved. Full design + usage: `docs/typed_kv_quant.md`. The matched baseline is
+`tern_uniform` (uniform tern K, ≈1.83 bit); `fp16` is the ceiling. V is per-token
+4-bit for both quantized variants. Override the policy without code edits via
+`TYPED_BIN_CODEBOOKS=sign,sign,sign,tern,nf2,nf2`.
+
+Validated on Llama-3.2-1B (9 hardest QA/retrieval datasets): typed 22.82 vs
+tern_uniform 20.16 vs fp16 25.67 — typed beats uniform tern by +2.66 at fewer bits
+(retains 88.9% of fp16 vs tern's 78.5%). Llama-3.2-1B only so far; `nf2` (per-group
+Lloyd) is the runtime bottleneck.
+
+```bash
+# smoke (2 samples/dataset, long-context datasets so the K path is exercised)
+cd /mnt/data/tzj/Code/Kitty
+LLAMA32_MODEL_PATH=/mnt/data/tzj/models/Llama-3.2-1B-Instruct \
+MAX_MODEL_LEN=32768 LLAMA32_MAX_GEN=256 DATASETS_CSV=multifieldqa_en,hotpotqa \
+bash scripts/run_exp.sh llama32 --gpu 0 --variant typed --max-samples 2
+# -> longbench_out/smoke/llama32-1b-instruct_typed/{pred,logs}
+```
+
+```bash
+# full comparison (all 21 datasets, 32k context): typed vs its baselines
+cd /mnt/data/tzj/Code/Kitty
+LLAMA32_MODEL_PATH=/mnt/data/tzj/models/Llama-3.2-1B-Instruct \
+MAX_MODEL_LEN=32768 LLAMA32_MAX_GEN=256 \
+bash scripts/run_exp.sh llama32 --gpu 0 --variant typed         # -> longbench_out/llama32-1b-instruct_typed
+LLAMA32_MODEL_PATH=/mnt/data/tzj/models/Llama-3.2-1B-Instruct \
+MAX_MODEL_LEN=32768 LLAMA32_MAX_GEN=256 \
+bash scripts/run_exp.sh llama32 --gpu 0 --variant tern_uniform  # -> longbench_out/llama32-1b-instruct_tern-uniform
+LLAMA32_MODEL_PATH=/mnt/data/tzj/models/Llama-3.2-1B-Instruct \
+MAX_MODEL_LEN=32768 LLAMA32_MAX_GEN=256 \
+bash scripts/run_exp.sh llama32 --gpu 0 --variant fp16          # -> longbench_out/llama32-1b-instruct_fp16
+```
+
+Fan one variant's 21 datasets across several GPUs (faster, explicit override of the
+GPU1-only rule): replace `--gpu 0` with `--gpus 0,1,3`. A fast offline overlap proxy
+for policy search (no LongBench) lives in `scripts/build_kq_cache.py` +
+`scripts/eval_typed_policy.py` (see `docs/typed_kv_quant.md` §5b).
 
 The old fixed-ratio low-bit-K variants (`kitty_k1v2`, `kitty_k1v2_pr50/75`,
 `kitty_k1v4_pr50/75`) were REMOVED: the boost fraction is now supplied

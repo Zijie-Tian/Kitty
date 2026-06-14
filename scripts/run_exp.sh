@@ -272,6 +272,8 @@ method_slug() {
     kivi_star_2) printf 'kivi-star-2\n' ;;
     custom) printf 'custom-kitty\n' ;;
     shadowkv) printf 'shadowkv\n' ;;
+    typed|typed_winner) printf 'typed\n' ;;
+    tern_uniform|tern_k) printf 'tern-uniform\n' ;;
     *) printf '%s\n' "${1//_/-}" ;;
   esac
 }
