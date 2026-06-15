@@ -1,4 +1,4 @@
-# Typed σ²-binned K-cache Quantization
+# QLUT-Attn k1v4 — σ²-binned K-cache Quantization
 
 A per-channel **mixed-codebook** K-cache quantization strategy: within a layer,
 different K channels are quantized with **different codebooks**, chosen by the
@@ -28,7 +28,7 @@ residual and is proportional to **σ² = E[(k−μ)²]**. Two consequences:
   depends on most. They need a richer codebook.
 
 Giving every channel the *same* codebook (e.g. uniform tern) is therefore doubly
-wasteful: over-spending on red channels and under-spending on blue ones. `typed`
+wasteful: over-spending on red channels and under-spending on blue ones. `qlutattn-k1v4`
 fixes the allocation.
 
 > Note on selector choice: Kitty's default `channel_selection=1` promotes channels by
@@ -88,7 +88,7 @@ offline-calibrated NF4-style fixed-shape codebook at the same 2.25 bit.
 
 ### Bit accounting (winner, Llama-3.2-1B, 6 equal bins ≈ 16.7% each)
 
-| channels | uniform tern | typed | Δ |
+| channels | uniform tern | qlutattn-k1v4 | Δ |
 | --- | ---: | ---: | --- |
 | red (bins 0–2, 50%) | 1.83 | sign 1.25 | −0.58 |
 | mid (bin 3, ~17%) | 1.83 | tern 1.83 | 0 |
@@ -103,7 +103,7 @@ channels where the marginal accuracy gain is large — a rate-distortion bit-all
 
 - Marginal gain of adding bits to a red channel ≈ 0 (residual already tiny); marginal
   gain on a blue channel is large. The optimal allocation moves bits red→blue, which is
-  exactly what `typed` does.
+  exactly what `qlutattn-k1v4` does.
 - Fast-RoPE blue channels have a bimodal arcsine post-RoPE distribution (the rotation
   sweeps cos/sin within a group). sign/tern/uniform all mismatch it; `nf2`'s free
   4 levels fit the two modes — so blue channels specifically get `nf2`.
@@ -114,17 +114,17 @@ channels where the marginal accuracy gain is large — a rate-distortion bit-all
 
 ## 4. Implementation
 
-- `src/kitty_sim/typed_quant.py` — codebooks (`apply_codebook`), Lloyd (`_lloyd`),
+- `src/kitty_sim/qlut_quant.py` — codebooks (`apply_codebook`), Lloyd (`_lloyd`),
   σ² binning (`channel_sigma2`, `sigma2_bins`, `compute_sigma_bins`), buffer quant
-  (`fake_quant_typed_buffer`), and offline-proxy helpers (`apply_typed`,
+  (`fake_quant_qlut_buffer`), and offline-proxy helpers (`apply_qlut`,
   `effective_bits`).
 - `src/kitty_sim/kitty_simulate.py` — `KittyKVCacheConfig`/`KittyKVCache` gain
-  `k_codebook` (`"kivi"` default = existing min-max path; `"typed"`), `bin_codebooks`,
-  `n_bins`. The typed branch (`_ensure_k_bins` + `_quant_k_buffer`) computes per-layer
+  `k_codebook` (`"kivi"` default = existing min-max path; `"qlut"`), `bin_codebooks`,
+  `n_bins`. The qlutattn-k1v4 branch (`_ensure_k_bins` + `_quant_k_buffer`) computes per-layer
   σ²-bins once at prefill and applies per-bin codebooks at every K flush. V is
   unchanged (per-token, `vbits`).
-- `src/kitty_sim/longbench/runner.py` — variants `typed` (winner policy, override via
-  `TYPED_BIN_CODEBOOKS`) and `tern_uniform` (all-tern K baseline), both V 4-bit.
+- `src/kitty_sim/longbench/runner.py` — variants `qlutattn-k1v4` (winner policy, override via
+  `QLUT_BIN_CODEBOOKS`) and `tern_uniform` (all-tern K baseline), both V 4-bit.
 
 The `k_codebook="kivi"` default means every existing variant is byte-for-byte
 unchanged.
@@ -133,14 +133,14 @@ unchanged.
 
 ### 5a. LongBench accuracy test (the deliverable)
 
-`typed` (winner, K≈1.68 bit) vs `tern_uniform` (uniform tern K≈1.83 bit, the iso-tern
+`qlutattn-k1v4` (winner, K≈1.68 bit) vs `tern_uniform` (uniform tern K≈1.83 bit, the iso-tern
 baseline) vs `fp16` (ceiling). V is per-token 4-bit for both quantized variants.
 
 ```bash
 cd <repo>
 LLAMA32_MODEL_PATH=/path/to/Llama-3.2-1B-Instruct \
 MAX_MODEL_LEN=32768 LLAMA32_MAX_GEN=256 \
-bash scripts/run_exp.sh llama32 --gpu 0 --variant typed          # -> longbench_out/llama32-1b-instruct_typed
+bash scripts/run_exp.sh llama32 --gpu 0 --variant qlutattn_k1v4          # -> longbench_out/llama32-1b-instruct_qlutattn-k1v4
 bash scripts/run_exp.sh llama32 --gpu 0 --variant tern_uniform   # -> longbench_out/llama32-1b-instruct_tern-uniform
 bash scripts/run_exp.sh llama32 --gpu 0 --variant fp16           # ceiling
 ```
@@ -150,19 +150,19 @@ Smoke (2 samples/dataset; scope to long-context datasets so the K path is exerci
 ```bash
 LLAMA32_MODEL_PATH=/path/to/Llama-3.2-1B-Instruct \
 MAX_MODEL_LEN=32768 LLAMA32_MAX_GEN=256 DATASETS_CSV=multifieldqa_en,hotpotqa \
-bash scripts/run_exp.sh llama32 --gpu 0 --variant typed --max-samples 2
+bash scripts/run_exp.sh llama32 --gpu 0 --variant qlutattn_k1v4 --max-samples 2
 ```
 
 Fan one variant's 21 datasets across several GPUs (faster, opt-in override of the
 GPU1-only rule): replace `--gpu 0` with `--gpus 0,1,3`. Override the policy without
-code edits via `TYPED_BIN_CODEBOOKS=sign,sign,sign,tern,nf2,nf2`.
+code edits via `QLUT_BIN_CODEBOOKS=sign,sign,sign,tern,nf2,nf2`.
 
 Scoring is automatic when the run finishes; for a partial/preliminary score over the
 datasets already finished, use `--no-strict-complete`:
 
 ```bash
 python -m kitty_sim.cli.score_longbench \
-  --model longbench_out/llama32-1b-instruct_typed/pred --no-strict-complete
+  --model longbench_out/llama32-1b-instruct_qlutattn-k1v4/pred --no-strict-complete
 ```
 
 ### 5b. Offline overlap proxy + policy search (no LongBench)
@@ -177,9 +177,9 @@ CUDA_VISIBLE_DEVICES=0 PYTHONPATH=src python scripts/build_kq_cache.py \
   --longbench-dir /path/to/LongBench/data --tag llama32-1b
 # -> probe_out/kq_cache_llama32-1b.pt
 
-# 2) evaluate a policy: prints eff_bits + overlap, writes probe_out/typed_policy_eval.json
+# 2) evaluate a policy: prints eff_bits + overlap, writes probe_out/qlut_policy_eval.json
 printf '{"group_size":128,"bin_codebooks":["sign","sign","sign","tern","nf2","nf2"]}' > /tmp/pol.json
-CUDA_VISIBLE_DEVICES=0 PYTHONPATH=src python scripts/eval_typed_policy.py \
+CUDA_VISIBLE_DEVICES=0 PYTHONPATH=src python scripts/eval_qlut_policy.py \
   --cache probe_out/kq_cache_llama32-1b.pt --policy /tmp/pol.json
 ```
 
@@ -202,21 +202,21 @@ quantile bin (bin 0 = lowest σ²). Codebook names: see §2.
 | policy | eff. K bits | overlap |
 | --- | ---: | ---: |
 | all-tern (uniform baseline) | 1.835 | 0.774 |
-| **typed `[s,s,s,t,nf2,nf2]`** | **1.680** | **0.777** |
+| **qlutattn-k1v4 `[s,s,s,t,nf2,nf2]`** | **1.680** | **0.777** |
 
-`typed` Pareto-dominates uniform tern (lower bits **and** higher overlap). Below
+`qlutattn-k1v4` Pareto-dominates uniform tern (lower bits **and** higher overlap). Below
 1.68 bit overlap drops below the 0.774 iso-tern wall.
 
 **LongBench** (9 hardest QA/retrieval datasets, the discriminating subset):
 
-| | fp16 | tern_uniform (1.83b) | typed (1.68b) |
+| | fp16 | tern_uniform (1.83b) | qlutattn-k1v4 (1.68b) |
 | --- | ---: | ---: | ---: |
 | avg (9 common) | 25.67 | 20.16 | **22.82** |
 | retain vs fp16 | 100% | 78.5% | **88.9%** |
 
-typed (fewer bits) beats uniform tern by **+2.66**, with the gains concentrated on the
+qlutattn-k1v4 (fewer bits) beats uniform tern by **+2.66**, with the gains concentrated on the
 K-fidelity-sensitive retrieval tasks (multifieldqa_en +6.1, qasper +4.4, hotpotqa
-+3.9). The real-score win is larger than the proxy suggested because typed spends bits
++3.9). The real-score win is larger than the proxy suggested because qlutattn-k1v4 spends bits
 exactly on the retrieval-critical high-σ² channels.
 
 ## 7. Caveats

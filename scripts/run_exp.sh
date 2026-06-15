@@ -272,7 +272,7 @@ method_slug() {
     kivi_star_2) printf 'kivi-star-2\n' ;;
     custom) printf 'custom-kitty\n' ;;
     shadowkv) printf 'shadowkv\n' ;;
-    typed|typed_winner) printf 'typed\n' ;;
+    qlutattn_k1v4|qlutattn-k1v4) printf 'qlutattn-k1v4\n' ;;
     tern_uniform|tern_k) printf 'tern-uniform\n' ;;
     *) printf '%s\n' "${1//_/-}" ;;
   esac
@@ -522,51 +522,58 @@ run_datasets_parallel() {
   local i
   for i in "${!gpus[@]}"; do gpus[$i]="${gpus[$i]//[[:space:]]/}"; done
 
-  local -A slot_pid=() pid_gpu=() pid_ds=()
-  local g
-  for g in "${gpus[@]}"; do slot_pid["${g}"]=""; done
+  # One scheduling slot per entry in the GPU list, keyed by slot INDEX (not GPU
+  # id) so a GPU may appear multiple times to get multiple concurrent workers,
+  # e.g. "0,0,0,1,1,1" runs 3 workers each on GPU0 and GPU1. slot_gpu[s] is the
+  # physical GPU bound to slot s.
+  local n_slots=${#gpus[@]}
+  local -a slot_pid=() slot_gpu=()
+  local -A pid_ds=()
+  local s
+  for ((s = 0; s < n_slots; s++)); do slot_pid[$s]=""; slot_gpu[$s]="${gpus[$s]}"; done
 
   local overall_rc=0
   local -a failures=()
-  local ds assigned p rc
+  local ds assigned_slot assigned p rc
 
   for ds in "${datasets[@]}"; do
-    assigned=""
-    while [[ -z "${assigned}" ]]; do
-      for g in "${gpus[@]}"; do
-        p="${slot_pid[${g}]}"
+    assigned_slot=-1
+    while [[ "${assigned_slot}" -lt 0 ]]; do
+      for ((s = 0; s < n_slots; s++)); do
+        p="${slot_pid[$s]}"
         if [[ -z "${p}" ]]; then
-          assigned="${g}"; break
+          assigned_slot=$s; break
         elif ! kill -0 "${p}" 2>/dev/null; then
           rc=0; wait "${p}" || rc=$?
           if [[ "${rc}" -ne 0 ]]; then
-            overall_rc=1; failures+=("${pid_ds[${p}]}(gpu${g},rc=${rc})")
-            echo "[parallel] FAILED dataset=${pid_ds[${p}]} on GPU${g} (rc=${rc})" >&2
+            overall_rc=1; failures+=("${pid_ds[${p}]}(gpu${slot_gpu[$s]},rc=${rc})")
+            echo "[parallel] FAILED dataset=${pid_ds[${p}]} on GPU${slot_gpu[$s]} (rc=${rc})" >&2
           fi
-          slot_pid["${g}"]=""; unset "pid_gpu[${p}]" "pid_ds[${p}]"
-          assigned="${g}"; break
+          slot_pid[$s]=""; unset "pid_ds[${p}]"
+          assigned_slot=$s; break
         fi
       done
-      [[ -z "${assigned}" ]] && sleep 0.5
+      [[ "${assigned_slot}" -lt 0 ]] && sleep 0.5
     done
+    assigned="${slot_gpu[$assigned_slot]}"
     run_dataset_worker "${assigned}" \
       "${model_id}" "${model_path}" "${model_tag}" "${model_family}" \
       "${variant}" "${pred_dir}" "${report_prefix}_${ds}.json" \
       "${ds}" "${max_gen}" "${verbosity}" &
     p=$!
-    slot_pid["${assigned}"]="${p}"; pid_gpu["${p}"]="${assigned}"; pid_ds["${p}"]="${ds}"
-    echo "[parallel] dispatch dataset=${ds} -> GPU${assigned} (pid ${p})"
+    slot_pid[$assigned_slot]="${p}"; pid_ds["${p}"]="${ds}"
+    echo "[parallel] dispatch dataset=${ds} -> GPU${assigned} (slot ${assigned_slot}, pid ${p})"
   done
 
-  for g in "${gpus[@]}"; do
-    p="${slot_pid[${g}]}"
+  for ((s = 0; s < n_slots; s++)); do
+    p="${slot_pid[$s]}"
     [[ -z "${p}" ]] && continue
     rc=0; wait "${p}" || rc=$?
     if [[ "${rc}" -ne 0 ]]; then
-      overall_rc=1; failures+=("${pid_ds[${p}]}(gpu${g},rc=${rc})")
-      echo "[parallel] FAILED dataset=${pid_ds[${p}]} on GPU${g} (rc=${rc})" >&2
+      overall_rc=1; failures+=("${pid_ds[${p}]}(gpu${slot_gpu[$s]},rc=${rc})")
+      echo "[parallel] FAILED dataset=${pid_ds[${p}]} on GPU${slot_gpu[$s]} (rc=${rc})" >&2
     fi
-    slot_pid["${g}"]=""
+    slot_pid[$s]=""
   done
 
   if [[ "${overall_rc}" -ne 0 ]]; then

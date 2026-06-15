@@ -442,9 +442,63 @@ datasets across GPUs, use a single target, e.g. `run_exp.sh llama32 --gpus 0,1,2
 | `quest_kitty_page16_sim` | `quest-kitty-sim` | Pure-torch QUEST+Kitty page16 accuracy proxy (real query-aware selection, no Triton, any arch). |
 | `quest_kitty_page16_kernel` | `quest-kitty-kernel` | Real Triton QUEST+Kitty page16 sparse decode (speed proof; Llama/Qwen/GLM). |
 | `custom` | `custom-kitty` | Custom Kitty config. |
+| `qlutattn_k1v4` | `qlutattn-k1v4` | σ²-binned mixed-codebook K quant (sim fake-quant). Per-layer channels are binned by residual σ²; low-σ² bins use cheap codebooks (sign), high-σ² bins use richer ones (nf2). Winner `["sign","sign","sign","tern","nf2","nf2"]` ≈ K **1.68 bit**, V per-token 4-bit. See `docs/qlutattn_k1v4.md`. |
+| `tern_uniform` | `tern-uniform` | Uniform-tern K (all channels tern) + V 4-bit, K ≈ 1.83 bit — the iso-tern baseline `qlutattn-k1v4` is compared against. |
 
 The `fp16`, `kivi_2`, and `kivi_star_2` baselines keep dense fp16 KV, so they do
 not save KV memory; only `kitty` / `*_kernel` actually compress the cache.
+
+### QLUT-Attn k1v4 (σ²-binned K) test (variants `qlutattn-k1v4` / `tern_uniform`)
+
+`qlutattn-k1v4` is a per-channel mixed-codebook K quant: channels are binned by residual σ²
+and given different codebooks (low σ² → cheap `sign`, high σ² → richer `nf2`), so the
+average K bit-width (≈1.68) drops below uniform tern (≈1.83) while accuracy is kept
+or improved. Full design + usage: `docs/qlutattn_k1v4.md`. The matched baseline is
+`tern_uniform` (uniform tern K, ≈1.83 bit); `fp16` is the ceiling. V is per-token
+4-bit for both quantized variants. Override the policy without code edits via
+`QLUT_BIN_CODEBOOKS=sign,sign,sign,tern,nf2,nf2`.
+
+Validated on full LongBench (21 datasets, 32k); full test guide + per-dataset results:
+`docs/qlutattn_k1v4_testing.md`. Mean over 21:
+
+| model | fp16 | tern_uniform (1.83b) | qlutattn-k1v4 (1.68b) | k1v4 retains |
+| --- | ---: | ---: | ---: | ---: |
+| Llama-3.2-1B | 27.59 | 22.96 | 24.88 | 90.2% |
+| Llama-3.2-3B | 36.33 | 30.72 | 34.28 | 94.4% |
+
+qlutattn-k1v4 Pareto-beats uniform tern at both scales (fewer bits + higher score;
+k1v4−tern = +1.91 on 1B, +3.56 on 3B), the gap widening with model size; gains
+concentrate on retrieval tasks (3B multifieldqa_en +13.1, qasper +10.0, hotpotqa +7.6).
+`nf2` (per-group Lloyd) is the runtime bottleneck. **3B needs 1 worker/GPU at 32k
+(2/card OOMs); 1B can use 3/card.**
+
+```bash
+# smoke (2 samples/dataset, long-context datasets so the K path is exercised)
+cd /mnt/data/tzj/Code/Kitty
+LLAMA32_MODEL_PATH=/mnt/data/tzj/models/Llama-3.2-1B-Instruct \
+MAX_MODEL_LEN=32768 LLAMA32_MAX_GEN=256 DATASETS_CSV=multifieldqa_en,hotpotqa \
+bash scripts/run_exp.sh llama32 --gpu 0 --variant qlutattn_k1v4 --max-samples 2
+# -> longbench_out/smoke/llama32-1b-instruct_qlutattn-k1v4/{pred,logs}
+```
+
+```bash
+# full comparison (all 21 datasets, 32k context): qlutattn-k1v4 vs its baselines
+cd /mnt/data/tzj/Code/Kitty
+LLAMA32_MODEL_PATH=/mnt/data/tzj/models/Llama-3.2-1B-Instruct \
+MAX_MODEL_LEN=32768 LLAMA32_MAX_GEN=256 \
+bash scripts/run_exp.sh llama32 --gpu 0 --variant qlutattn_k1v4         # -> longbench_out/llama32-1b-instruct_qlutattn-k1v4
+LLAMA32_MODEL_PATH=/mnt/data/tzj/models/Llama-3.2-1B-Instruct \
+MAX_MODEL_LEN=32768 LLAMA32_MAX_GEN=256 \
+bash scripts/run_exp.sh llama32 --gpu 0 --variant tern_uniform  # -> longbench_out/llama32-1b-instruct_tern-uniform
+LLAMA32_MODEL_PATH=/mnt/data/tzj/models/Llama-3.2-1B-Instruct \
+MAX_MODEL_LEN=32768 LLAMA32_MAX_GEN=256 \
+bash scripts/run_exp.sh llama32 --gpu 0 --variant fp16          # -> longbench_out/llama32-1b-instruct_fp16
+```
+
+Fan one variant's 21 datasets across several GPUs (faster, explicit override of the
+GPU1-only rule): replace `--gpu 0` with `--gpus 0,1,3`. A fast offline overlap proxy
+for policy search (no LongBench) lives in `scripts/build_kq_cache.py` +
+`scripts/eval_qlut_policy.py` (see `docs/qlutattn_k1v4.md` §5b).
 
 The old fixed-ratio low-bit-K variants (`kitty_k1v2`, `kitty_k1v2_pr50/75`,
 `kitty_k1v4_pr50/75`) were REMOVED: the boost fraction is now supplied

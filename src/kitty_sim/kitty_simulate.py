@@ -40,9 +40,9 @@ class KittyKVCacheConfig(CacheConfig):
         channel_selection: int = 1,               # -1: Unspecified, 0: Random, 1: Magnitude-based, 3: Cross-head Magnitude (layer-global budget)
         VCache_BitDecoding: bool = False,         # The behavior of Value Cache, set to True means BitDecoding, otherwise KIVI Style Value Cache
         PostQuant: bool = True,                   # Post Quantization is always enabled
-        k_codebook: str = "kivi",                 # "kivi" = existing min-max groupwise K quant; "typed" = per-channel sigma^2-binned codebooks
-        bin_codebooks: Optional[list] = None,     # typed only: list[str] mapping sigma^2-bin -> codebook (meanonly/sign/tern/uni2/nf2/uni3)
-        n_bins: int = 6,                          # typed only: number of per-layer sigma^2 quantile bins
+        k_codebook: str = "kivi",                 # "kivi" = existing min-max groupwise K quant; "qlut" = per-channel sigma^2-binned codebooks (qlutattn-k1v4)
+        bin_codebooks: Optional[list] = None,     # qlut only: list[str] mapping sigma^2-bin -> codebook (meanonly/sign/tern/uni2/nf2/uni3)
+        n_bins: int = 6,                          # qlut only: number of per-layer sigma^2 quantile bins
     ):
         super().__init__("kitty_kv")
         self.sink_length = sink_length
@@ -74,12 +74,12 @@ class KittyKVCacheConfig(CacheConfig):
             "Some of the keys in `cache_config` are defined incorrectly. `{key}` should be {correct_value}` "
             "but found {found_value}"
         )
-        if self.k_codebook not in ("kivi", "typed"):
+        if self.k_codebook not in ("kivi", "qlut"):
             raise ValueError(
-                incorrect_arg_msg.format(key="k_codebook", correct_value="'kivi' or 'typed'",
+                incorrect_arg_msg.format(key="k_codebook", correct_value="'kivi' or 'qlut'",
                                          found_value=self.k_codebook))
-        if self.k_codebook == "typed" and not self.bin_codebooks:
-            raise ValueError("k_codebook='typed' requires a non-empty bin_codebooks list")
+        if self.k_codebook == "qlut" and not self.bin_codebooks:
+            raise ValueError("k_codebook='qlut' requires a non-empty bin_codebooks list")
         if self.channel_selection not in [0, 1, 3]:
             raise ValueError(
                 incorrect_arg_msg.format(
@@ -215,7 +215,7 @@ class KittyKVCache(DynamicCache):
         self.VCache_BitDecoding = cache_config.VCache_BitDecoding
         self.PostQuant = cache_config.PostQuant
         self.cache_implementation = cache_config.cache_implementation
-        # Typed (sigma^2-binned) K codebook support. k_bin_ids[layer_idx] = [nh,D]
+        # QLUT (sigma^2-binned) K codebook support. k_bin_ids[layer_idx] = [nh,D]
         # per-channel bin id, computed once (from the prompt quant region at prefill)
         # then reused for every buffer flush + decode. None for the default 'kivi' path.
         self.k_codebook = cache_config.k_codebook
@@ -235,19 +235,19 @@ class KittyKVCache(DynamicCache):
     def _ensure_k_bins(self, layer_idx, key_region_t):
         """Cache per-channel sigma^2-bins for a layer from a [B,nh,D,Tq] region.
         Called once with the full prompt quant region at prefill; no-op if set."""
-        if self.k_codebook != "typed" or layer_idx in self.k_bin_ids:
+        if self.k_codebook != "qlut" or layer_idx in self.k_bin_ids:
             return
-        from .typed_quant import compute_sigma_bins
+        from .qlut_quant import compute_sigma_bins
         self.k_bin_ids[layer_idx] = compute_sigma_bins(key_region_t, self.group_size, self.n_bins)
 
     def _quant_k_buffer(self, key_slice_t, layer_idx):
-        """Quantize a [B,nh,D,buffer] post-RoPE K buffer. 'typed' uses the layer's
+        """Quantize a [B,nh,D,buffer] post-RoPE K buffer. 'qlut' uses the layer's
         sigma^2-bins (lazily binned from this buffer if prefill never set them);
         default 'kivi' uses the existing min-max groupwise + promote path."""
-        if self.k_codebook == "typed":
-            from .typed_quant import fake_quant_typed_buffer
+        if self.k_codebook == "qlut":
+            from .qlut_quant import fake_quant_qlut_buffer
             self._ensure_k_bins(layer_idx, key_slice_t)
-            return fake_quant_typed_buffer(
+            return fake_quant_qlut_buffer(
                 key_slice_t, self.k_bin_ids[layer_idx], self.bin_codebooks, self.group_size)
         promote_mask = build_promote_mask(key_slice_t, self._layer_pr(layer_idx), self.channel_selection)
         return fake_quant_groupwise_lastdim(
@@ -337,7 +337,7 @@ class KittyKVCache(DynamicCache):
                 num_token_to_buffer = num_tokens % self.buffer_length
                 num_token_to_quantize = num_tokens - num_token_to_buffer
                 end_idx = start_idx + num_token_to_quantize
-                # Quantize Key Cache. Typed path bins channels by sigma^2 once over
+                # Quantize Key Cache. QLUT path bins channels by sigma^2 once over
                 # the full prompt quant region [sink, end_idx) before flushing buffers.
                 self._ensure_k_bins(
                     layer_idx,

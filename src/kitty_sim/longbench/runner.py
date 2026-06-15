@@ -69,7 +69,7 @@ class VariantConfig:
     # promote_ratio_config_path keeps the source JSON path for provenance.
     promote_ratio_per_layer: tuple[tuple[int, float], ...] | None = None
     promote_ratio_config_path: str | None = None
-    # Typed (sigma^2-binned) K codebook (autoresearch study). k_codebook='typed'
+    # QLUT (sigma^2-binned) K codebook = qlutattn-k1v4. k_codebook='qlut'
     # uses bin_codebooks (a per-sigma^2-bin codebook list); 'kivi' = default path.
     k_codebook: str = "kivi"
     bin_codebooks: tuple[str, ...] | None = None
@@ -80,7 +80,7 @@ class VariantConfig:
         if not self.use_kitty:
             return "fp16"
         ratio = str(self.promote_ratio).replace(".", "p")
-        if self.k_codebook == "typed":
+        if self.k_codebook == "qlut":
             h = hashlib.sha256(repr(self.bin_codebooks).encode()).hexdigest()[:6]
             return f"{self.name}_nb{self.n_bins}_v{self.vbits}_cb{h}"
         if self.shadowkv:
@@ -241,21 +241,21 @@ def build_variant(args: Any) -> VariantConfig:
             promote_ratio_per_layer=per_layer,
             promote_ratio_config_path=config_path,
         )
-    if variant in ("typed", "typed_winner"):
-        # Autoresearch winner: per-layer sigma^2-binned K codebooks (6 bins,
+    if variant in ("qlutattn_k1v4", "qlutattn-k1v4"):
+        # QLUT-Attn k1v4 winner: per-layer sigma^2-binned K codebooks (6 bins,
         # low sigma^2 -> sign, high sigma^2 -> nf2). V per-token 4-bit. Effective
-        # K ~1.68 bit (vs uniform tern 1.83); proxy-iso-tern accuracy.
-        cb = os.environ.get("TYPED_BIN_CODEBOOKS")
+        # K ~1.68 bit (vs uniform tern 1.83); beats iso-tern on LongBench.
+        cb = os.environ.get("QLUT_BIN_CODEBOOKS")
         bins = tuple(cb.split(",")) if cb else ("sign", "sign", "sign", "tern", "nf2", "nf2")
         return VariantConfig(
-            name="typed", use_kitty=True, k_codebook="typed", bin_codebooks=bins,
+            name="qlutattn_k1v4", use_kitty=True, k_codebook="qlut", bin_codebooks=bins,
             n_bins=len(bins), vbits=4, promote_ratio=0.0, channel_selection=0,
             sink_length=32, buffer_length=128, group_size=128)
     if variant in ("tern_uniform", "tern_k"):
         # Uniform-tern K baseline (all channels tern) + V 4-bit: the iso-accuracy
-        # reference the typed winner is compared against (~1.83 bit K).
+        # reference the qlutattn-k1v4 winner is compared against (~1.83 bit K).
         return VariantConfig(
-            name="tern_uniform", use_kitty=True, k_codebook="typed",
+            name="tern_uniform", use_kitty=True, k_codebook="qlut",
             bin_codebooks=("tern",) * 6, n_bins=6, vbits=4, promote_ratio=0.0,
             channel_selection=0, sink_length=32, buffer_length=128, group_size=128)
     if variant == "kivi_2":
@@ -392,7 +392,7 @@ def method_layout_slug(variant: VariantConfig | str) -> str:
         "kivi_star_2": "kivi-star-2",
         "custom": "custom-kitty",
         "shadowkv": "shadowkv",
-        "typed": "typed",
+        "qlutattn_k1v4": "qlutattn-k1v4",
         "tern_uniform": "tern-uniform",
     }.get(name.lower(), _layout_slug(name))
 
