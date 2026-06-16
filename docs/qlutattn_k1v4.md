@@ -124,7 +124,7 @@ channels where the marginal accuracy gain is large — a rate-distortion bit-all
   σ²-bins once at prefill and applies per-bin codebooks at every K flush. V is
   unchanged (per-token, `vbits`).
 - `src/kitty_sim/longbench/runner.py` — variants `qlutattn-k1v4` (winner policy, override via
-  `QLUT_BIN_CODEBOOKS`) and `tern_uniform` (all-tern K baseline), both V 4-bit.
+  `QLUT_BIN_CODEBOOKS`) and `qlutattn_k184v4` (all-tern K baseline), both V 4-bit.
 
 The `k_codebook="kivi"` default means every existing variant is byte-for-byte
 unchanged.
@@ -133,7 +133,7 @@ unchanged.
 
 ### 5a. LongBench accuracy test (the deliverable)
 
-`qlutattn-k1v4` (winner, K≈1.68 bit) vs `tern_uniform` (uniform tern K≈1.83 bit, the iso-tern
+`qlutattn-k1v4` (winner, K≈1.68 bit) vs `qlutattn_k184v4` (uniform tern K≈1.83 bit, the iso-tern
 baseline) vs `fp16` (ceiling). V is per-token 4-bit for both quantized variants.
 
 ```bash
@@ -141,7 +141,7 @@ cd <repo>
 LLAMA32_MODEL_PATH=/path/to/Llama-3.2-1B-Instruct \
 MAX_MODEL_LEN=32768 LLAMA32_MAX_GEN=256 \
 bash scripts/run_exp.sh llama32 --gpu 0 --variant qlutattn_k1v4          # -> longbench_out/llama32-1b-instruct_qlutattn-k1v4
-bash scripts/run_exp.sh llama32 --gpu 0 --variant tern_uniform   # -> longbench_out/llama32-1b-instruct_tern-uniform
+bash scripts/run_exp.sh llama32 --gpu 0 --variant qlutattn_k184v4   # -> longbench_out/llama32-1b-instruct_qlutattn-k184v4
 bash scripts/run_exp.sh llama32 --gpu 0 --variant fp16           # ceiling
 ```
 
@@ -209,7 +209,7 @@ quantile bin (bin 0 = lowest σ²). Codebook names: see §2.
 
 **LongBench** (9 hardest QA/retrieval datasets, the discriminating subset):
 
-| | fp16 | tern_uniform (1.83b) | qlutattn-k1v4 (1.68b) |
+| | fp16 | qlutattn_k184v4 (1.83b) | qlutattn-k1v4 (1.68b) |
 | --- | ---: | ---: | ---: |
 | avg (9 common) | 25.67 | 20.16 | **22.82** |
 | retain vs fp16 | 100% | 78.5% | **88.9%** |

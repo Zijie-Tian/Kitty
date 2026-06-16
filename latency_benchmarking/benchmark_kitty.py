@@ -124,14 +124,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--warmup_runs",            type=int, default=2,                help="Number of warmup runs")
     parser.add_argument("--repeat_runs",            type=int, default=3,                help="Number of repeat runs for benchmarking")
     parser.add_argument("--max_new_tokens",         type=int, default=None,             help="Maximum number of decode tokens to generate. If omitted, generation uses --max_seq_len as the total max length.")
-    parser.add_argument("--page_size",              type=int, default=128,              help="Kitty KV-cache page size. Keep 128 for the paper default; use 16 for QUEST-aligned experiments.")
+    parser.add_argument("--page_size",              type=int, default=128,              help="Kitty KV-cache page size. Keep 128 for the paper default; use 16 for the page16 experiment.")
     parser.add_argument("--promote_ratio",          type=float, default=0.125,            help="Fraction of key-cache channels promoted to INT4. Use 0.125 for paper Kitty; 0.25 for Kitty-Pro.")
-    parser.add_argument("--quest-enabled",          action="store_true",                 help="Enable correctness-first QUEST sparse page selection in the Kitty cache.")
-    parser.add_argument("--quest-topk-pages",       type=int, default=None,               help="QUEST sparse page budget in page16 logical pages.")
-    parser.add_argument("--quest-token-budget",     type=int, default=None,               help="QUEST sparse token budget; converted to pages by the cache page size.")
-    parser.add_argument("--quest-skip-layers",      type=int, default=0,                  help="Disable QUEST sparse selection for the first N layers (0 = all layers use QUEST).")
-    parser.add_argument("--force-sparse-for-equivalence", action="store_true",           help="Force sparse all-pages path for dense-equivalence tests.")
-    parser.add_argument("--compare-quest-kitty",    action="store_true",                 help="Run a decode-only comparison: pure Kitty page16 vs QUEST+Kitty page16. Defaults QUEST token budget to 2048 when no QUEST budget is supplied.")
     parser.add_argument("--attn-implementation",    type=str, default="sdpa",             choices=["eager", "sdpa", "flash_attention_2"], help="Transformers attention backend used while loading the model. Use sdpa when flash_attn is not installed.")
     return parser
 
@@ -142,33 +136,12 @@ def _generation_length_kwargs(max_seq_len: int, max_new_tokens: int | None) -> d
     return {"max_new_tokens": max_new_tokens}
 
 
-def _repeat_inputs_to_length(inputs: BatchEncoding, target_length: int) -> BatchEncoding:
-    if target_length <= 0:
-        raise ValueError(f"target_length must be positive; got {target_length}.")
-    input_ids = inputs.input_ids
-    current_length = input_ids.size(1)
-    if current_length <= 0:
-        raise ValueError("Cannot expand an empty prompt for a decode-speed gate.")
-    repeats = (target_length + current_length - 1) // current_length
-    expanded_input_ids = input_ids.repeat(1, repeats)[:, :target_length].contiguous()
-    if "attention_mask" in inputs:
-        attention_mask = inputs.attention_mask.repeat(1, repeats)[:, :target_length].contiguous()
-    else:
-        attention_mask = torch.ones_like(expanded_input_ids)
-    return BatchEncoding({"input_ids": expanded_input_ids, "attention_mask": attention_mask})
-
-
 def _new_kitty_cache(
     model_config: PretrainedConfig,
     max_batch_size: int,
     max_length: int,
     page_size: int,
     promote_ratio: float,
-    quest_enabled: bool,
-    quest_topk_pages: int | None,
-    quest_token_budget: int | None,
-    quest_skip_layers: int,
-    force_sparse_for_equivalence: bool,
 ):
     return get_kvcache_kitty(
         model_config,
@@ -176,66 +149,7 @@ def _new_kitty_cache(
         max_length,
         page_size=page_size,
         promote_ratio=promote_ratio,
-        quest_enabled=quest_enabled,
-        quest_topk_pages=quest_topk_pages,
-        quest_token_budget=quest_token_budget,
-        quest_skip_layers=quest_skip_layers,
-        force_sparse_for_equivalence=force_sparse_for_equivalence,
     )
-
-
-def _collect_quest_cache_stats(kitty_kv_cache) -> dict:
-    stats = {
-        "qk_page_loads": 0,
-        "sv_page_loads": 0,
-        "sparse_qk_hits": 0,
-        "sparse_sv_hits": 0,
-        "selected_pages": [],
-        "selected_tokens": [],
-        "shared_pages": [],
-        "paths": {},
-    }
-    for layer in getattr(kitty_kv_cache, "kv_cache", []):
-        path = getattr(layer, "last_quest_path", "unknown")
-        stats["paths"][path] = stats["paths"].get(path, 0) + 1
-        stats["sparse_qk_hits"] += int(getattr(layer, "last_sparse_qk_hits", 0) or 0)
-        stats["sparse_sv_hits"] += int(getattr(layer, "last_sparse_sv_hits", 0) or 0)
-        stats["shared_pages"].append(int(getattr(layer, "last_shared_page_count", 0) or 0))
-        selected = getattr(layer, "last_selected_pages", None)
-        if selected is not None:
-            qk_page_loads = int(getattr(layer, "last_sparse_qk_pages_loaded", 0) or 0)
-            sv_page_loads = int(getattr(layer, "last_sparse_sv_pages_loaded", 0) or 0)
-            # Fall back to selected-page count for older caches, but prefer real
-            # sparse-kernel page-load evidence when available.
-            if qk_page_loads == 0 and sv_page_loads == 0:
-                qk_page_loads = int(selected.numel())
-                sv_page_loads = int(selected.numel())
-            stats["qk_page_loads"] += qk_page_loads
-            stats["sv_page_loads"] += sv_page_loads
-            if selected.ndim > 0:
-                stats["selected_pages"].append(int(selected.shape[-1]))
-        selected_tokens = int(getattr(layer, "last_selected_tokens", 0) or 0)
-        if selected_tokens:
-            stats["selected_tokens"].append(selected_tokens)
-    return stats
-
-
-def _merge_quest_cache_stats(total: dict, step: dict) -> None:
-    total["qk_page_loads"] += step["qk_page_loads"]
-    total["sv_page_loads"] += step["sv_page_loads"]
-    total["sparse_qk_hits"] += step["sparse_qk_hits"]
-    total["sparse_sv_hits"] += step["sparse_sv_hits"]
-    total["selected_pages"].extend(step["selected_pages"])
-    total["selected_tokens"].extend(step["selected_tokens"])
-    total["shared_pages"].extend(step["shared_pages"])
-    for path, count in step["paths"].items():
-        total["paths"][path] = total["paths"].get(path, 0) + count
-
-
-def _summarize_ints(values: list[int]) -> str:
-    if not values:
-        return "n/a"
-    return f"min={min(values)}, median={statistics.median(values):.1f}, max={max(values)}, mean={statistics.mean(values):.1f}"
 
 
 def _run_kitty_decode_only_trial(
@@ -246,11 +160,6 @@ def _run_kitty_decode_only_trial(
     cache_length: int,
     page_size: int,
     promote_ratio: float,
-    quest_enabled: bool,
-    quest_topk_pages: int | None,
-    quest_token_budget: int | None,
-    quest_skip_layers: int,
-    force_sparse_for_equivalence: bool,
 ) -> dict:
     max_batch_size = inputs.input_ids.size(0)
     kitty_kv_cache = _new_kitty_cache(
@@ -259,11 +168,6 @@ def _run_kitty_decode_only_trial(
         cache_length,
         page_size,
         promote_ratio,
-        quest_enabled,
-        quest_topk_pages,
-        quest_token_budget,
-        quest_skip_layers,
-        force_sparse_for_equivalence,
     )
     input_ids = inputs.input_ids.cuda()
     attention_mask = inputs.attention_mask.cuda() if "attention_mask" in inputs else None
@@ -278,16 +182,6 @@ def _run_kitty_decode_only_trial(
         next_token = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
         torch.cuda.synchronize()
         start_time = time.perf_counter()
-        quest_stats = {
-            "qk_page_loads": 0,
-            "sv_page_loads": 0,
-            "sparse_qk_hits": 0,
-            "sparse_sv_hits": 0,
-            "selected_pages": [],
-            "selected_tokens": [],
-            "shared_pages": [],
-            "paths": {},
-        }
         for _ in range(max_new_tokens):
             outputs = model(
                 input_ids=next_token,
@@ -296,7 +190,6 @@ def _run_kitty_decode_only_trial(
                 use_cache=True,
                 logits_to_keep=1,
             )
-            _merge_quest_cache_stats(quest_stats, _collect_quest_cache_stats(kitty_kv_cache))
             next_token = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
         torch.cuda.synchronize()
         elapsed_time = time.perf_counter() - start_time
@@ -306,7 +199,6 @@ def _run_kitty_decode_only_trial(
         "decode_tokens": max_new_tokens,
         "ms_per_token": (elapsed_time / max_new_tokens) * 1000,
         "tokens_per_s": max_new_tokens / elapsed_time,
-        "quest_stats": quest_stats,
     }
 
 
@@ -320,11 +212,6 @@ def benchmark_kitty_decode_only(
     page_size: int,
     promote_ratio: float,
     max_new_tokens: int,
-    quest_enabled: bool = False,
-    quest_topk_pages: int | None = None,
-    quest_token_budget: int | None = None,
-    quest_skip_layers: int = 0,
-    force_sparse_for_equivalence: bool = False,
 ) -> dict:
     if max_new_tokens <= 0:
         raise ValueError(f"max_new_tokens must be positive for decode-only benchmarking; got {max_new_tokens}.")
@@ -334,8 +221,7 @@ def benchmark_kitty_decode_only(
     cache_length = input_length + max_new_tokens
     print(
         f"[decode-only:{label}] prefill_tokens={input_length}, decode_tokens={max_new_tokens}, "
-        f"page_size={page_size}, promote_ratio={promote_ratio}, quest_enabled={quest_enabled}, "
-        f"quest_topk_pages={quest_topk_pages}, quest_token_budget={quest_token_budget}, quest_skip_layers={quest_skip_layers}"
+        f"page_size={page_size}, promote_ratio={promote_ratio}"
     )
     for _ in range(warmup_runs):
         _run_kitty_decode_only_trial(
@@ -346,11 +232,6 @@ def benchmark_kitty_decode_only(
             cache_length,
             page_size,
             promote_ratio,
-            quest_enabled,
-            quest_topk_pages,
-            quest_token_budget,
-            quest_skip_layers,
-            force_sparse_for_equivalence,
         )
     if warmup_runs:
         print(f"[decode-only:{label}] Warmup done.")
@@ -366,29 +247,12 @@ def benchmark_kitty_decode_only(
                 cache_length,
                 page_size,
                 promote_ratio,
-                quest_enabled,
-                quest_topk_pages,
-                quest_token_budget,
-                quest_skip_layers,
-                force_sparse_for_equivalence,
             )
         )
 
     ms_per_token_values = [run["ms_per_token"] for run in runs]
     tokens_per_s_values = [run["tokens_per_s"] for run in runs]
     elapsed_values = [run["elapsed_s"] for run in runs]
-    total_stats = {
-        "qk_page_loads": 0,
-        "sv_page_loads": 0,
-        "sparse_qk_hits": 0,
-        "sparse_sv_hits": 0,
-        "selected_pages": [],
-        "selected_tokens": [],
-        "shared_pages": [],
-        "paths": {},
-    }
-    for run in runs:
-        _merge_quest_cache_stats(total_stats, run["quest_stats"])
 
     result = {
         "label": label,
@@ -398,7 +262,6 @@ def benchmark_kitty_decode_only(
         "median_ms_per_token": statistics.median(ms_per_token_values),
         "avg_tokens_per_s": statistics.mean(tokens_per_s_values),
         "median_tokens_per_s": statistics.median(tokens_per_s_values),
-        "quest_stats": total_stats,
     }
     print(
         f"[decode-only:{label}] avg_elapsed_s={result['avg_elapsed_s']:.6f}, "
@@ -408,87 +271,13 @@ def benchmark_kitty_decode_only(
         f"avg_tokens_per_s={result['avg_tokens_per_s']:.2f}, "
         f"median_tokens_per_s={result['median_tokens_per_s']:.2f}"
     )
-    print(
-        f"[decode-only:{label}] qk_page_loads={total_stats['qk_page_loads']}, "
-        f"sv_page_loads={total_stats['sv_page_loads']}, sparse_qk_hits={total_stats['sparse_qk_hits']}, "
-        f"sparse_sv_hits={total_stats['sparse_sv_hits']}, paths={total_stats['paths']}, "
-        f"selected_pages={_summarize_ints(total_stats['selected_pages'])}, "
-        f"selected_tokens={_summarize_ints(total_stats['selected_tokens'])}, "
-        f"shared_pages={_summarize_ints(total_stats['shared_pages'])}"
-    )
     return result
 
 
-def benchmark_quest_kitty_comparison(
-    model: PreTrainedModel,
-    inputs: BatchEncoding,
-    model_config: PretrainedConfig,
-    max_seq_len: int,
-    warmup_runs: int,
-    repeat_runs: int,
-    page_size: int,
-    promote_ratio: float,
-    max_new_tokens: int,
-    quest_topk_pages: int | None = None,
-    quest_token_budget: int | None = None,
-    quest_skip_layers: int = 0,
-    force_sparse_for_equivalence: bool = False,
-) -> None:
-    if page_size != 16:
-        raise ValueError("--compare-quest-kitty is the page16 speed gate; pass --page_size 16.")
-    if quest_topk_pages is None and quest_token_budget is None:
-        quest_token_budget = 2048
-    gate_inputs = _repeat_inputs_to_length(inputs, max_seq_len)
-    print(
-        f"[decode-only:comparison] expanded prompt to {gate_inputs.input_ids.size(1)} tokens; "
-        f"QUEST budget defaults to {quest_token_budget} tokens when no explicit QUEST budget is supplied."
-    )
-    pure = benchmark_kitty_decode_only(
-        "pure_kitty_page16",
-        model,
-        gate_inputs,
-        model_config,
-        warmup_runs,
-        repeat_runs,
-        page_size,
-        promote_ratio,
-        max_new_tokens,
-        quest_enabled=False,
-        quest_topk_pages=None,
-        quest_token_budget=None,
-        quest_skip_layers=quest_skip_layers,
-        force_sparse_for_equivalence=False,
-    )
-    quest = benchmark_kitty_decode_only(
-        "quest_kitty_page16",
-        model,
-        gate_inputs,
-        model_config,
-        warmup_runs,
-        repeat_runs,
-        page_size,
-        promote_ratio,
-        max_new_tokens,
-        quest_enabled=True,
-        quest_topk_pages=quest_topk_pages,
-        quest_token_budget=quest_token_budget,
-        quest_skip_layers=quest_skip_layers,
-        force_sparse_for_equivalence=force_sparse_for_equivalence,
-    )
-    decode_speedup = pure["avg_ms_per_token"] / quest["avg_ms_per_token"]
-    median_decode_speedup = pure["median_ms_per_token"] / quest["median_ms_per_token"]
-    print(
-        f"[decode-only:comparison] decode_speedup={decode_speedup:.3f} "
-        f"(kitty_avg_ms_per_token / quest_avg_ms_per_token); "
-        f"median_decode_speedup={median_decode_speedup:.3f}"
-    )
-
-
-def benchmark_kitty(model: PreTrainedModel, tokenizer: AutoTokenizer, inputs: dict, max_seq_len, model_config: PretrainedConfig, warmup_runs: int, repeat_runs: int, page_size: int, promote_ratio: float, max_new_tokens: int | None = None, quest_enabled: bool = False, quest_topk_pages: int | None = None, quest_token_budget: int | None = None, quest_skip_layers: int = 0, force_sparse_for_equivalence: bool = False) -> None:
+def benchmark_kitty(model: PreTrainedModel, tokenizer: AutoTokenizer, inputs: dict, max_seq_len, model_config: PretrainedConfig, warmup_runs: int, repeat_runs: int, page_size: int, promote_ratio: float, max_new_tokens: int | None = None) -> None:
     max_batch_size = inputs.input_ids.size(0)
     print(f"Kitty page_size: {page_size}")
     print(f"Kitty promote_ratio: {promote_ratio}")
-    print(f"Kitty QUEST: enabled={quest_enabled}, topk_pages={quest_topk_pages}, token_budget={quest_token_budget}, skip_layers={quest_skip_layers}, force_sparse_for_equivalence={force_sparse_for_equivalence}")
     length_kwargs = _generation_length_kwargs(max_seq_len, max_new_tokens)
     cache_max_length = max_seq_len
     if max_new_tokens is not None:
@@ -501,11 +290,6 @@ def benchmark_kitty(model: PreTrainedModel, tokenizer: AutoTokenizer, inputs: di
             cache_max_length,
             page_size,
             promote_ratio,
-            quest_enabled,
-            quest_topk_pages,
-            quest_token_budget,
-            quest_skip_layers,
-            force_sparse_for_equivalence,
         )
         outputs = model.generate(
             input_ids=inputs.input_ids.cuda(),
@@ -534,11 +318,6 @@ def benchmark_kitty(model: PreTrainedModel, tokenizer: AutoTokenizer, inputs: di
             cache_max_length,
             page_size,
             promote_ratio,
-            quest_enabled,
-            quest_topk_pages,
-            quest_token_budget,
-            quest_skip_layers,
-            force_sparse_for_equivalence,
         )
         outputs = model.generate(
             input_ids=inputs.input_ids.cuda(),
@@ -641,13 +420,6 @@ def benchmark_fp16_kv(model: PreTrainedModel, tokenizer: AutoTokenizer, inputs: 
 
 def main() -> None:
     args = build_parser().parse_args()
-    if args.compare_quest_kitty:
-        if args.cache_implementation != 0:
-            raise ValueError("--compare-quest-kitty only supports --cache_implementation 0.")
-        if args.max_new_tokens is None:
-            raise ValueError("--compare-quest-kitty requires --max_new_tokens so decode-only timing is explicit.")
-        if args.page_size != 16:
-            raise ValueError("--compare-quest-kitty is the page16 speed gate; pass --page_size 16.")
     print("Model: ",args.model)
     #
     prompt_choice = args.prompt_choice
@@ -690,24 +462,7 @@ def main() -> None:
     model.eval()
 
     # Benchmarking
-    if args.compare_quest_kitty:
-        print("Using decode-only comparison: pure Kitty page16 vs QUEST+Kitty page16.")
-        benchmark_quest_kitty_comparison(
-            model,
-            inputs,
-            config,
-            args.max_seq_len,
-            args.warmup_runs,
-            args.repeat_runs,
-            args.page_size,
-            args.promote_ratio,
-            args.max_new_tokens,
-            quest_topk_pages=args.quest_topk_pages,
-            quest_token_budget=args.quest_token_budget,
-            quest_skip_layers=args.quest_skip_layers,
-            force_sparse_for_equivalence=args.force_sparse_for_equivalence,
-        )
-    elif args.cache_implementation == 1:
+    if args.cache_implementation == 1:
         print("Using FP16 static KV cache implementation of Huggingface transformers.")
         benchmark_fp16_kv(model, tokenizer, inputs, args.max_seq_len, args.max_new_tokens, args.warmup_runs, args.repeat_runs, "static", None)
     elif args.cache_implementation == 2:
@@ -731,11 +486,6 @@ def main() -> None:
             args.page_size,
             args.promote_ratio,
             max_new_tokens=args.max_new_tokens,
-            quest_enabled=args.quest_enabled,
-            quest_topk_pages=args.quest_topk_pages,
-            quest_token_budget=args.quest_token_budget,
-            quest_skip_layers=args.quest_skip_layers,
-            force_sparse_for_equivalence=args.force_sparse_for_equivalence,
         )
 
     #

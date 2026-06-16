@@ -70,12 +70,14 @@ K≈1.68 bit），但有两个工程上的别扭：
 条 update 分支都改为在 `per_token` 模式下调用它。sink（前 `sink_length=32` token）仍保
 持 fp16。
 
-### 2.2 两个 variant（`src/kitty_sim/longbench/runner.py`）
+### 2.2 per-token variant（`src/kitty_sim/longbench/runner.py`）
 
 | variant | method slug | tag 后缀 | 配置 |
 | --- | --- | --- | --- |
-| `kitty_pertoken` | `kitty-pertoken` | `_kpt` | uniform：`kbits=2 vbits=4 promote_ratio=0 channel_selection=0 k_quant_mode=per_token` |
 | `qlutattn_pertoken`（别名 `qlut_pertoken`） | `qlutattn-pertoken` | `_kpt` | qlut 单码本：`k_codebook=qlut n_bins=1`，码本由 `QLUT_BIN_CODEBOOKS` 给（默认 `nf2`），V per-token 4-bit |
+
+> uniform-codebook per-token（旧 `kitty_pertoken`，已移除专门 variant）可用
+> `--variant custom --k_quant_mode per_token`（`kbits=2 vbits=4 promote_ratio=0`）复现。
 
 > per-token 是单码本：`QLUT_BIN_CODEBOOKS` 只取一个码本名（默认 `nf2`）。要扫 `sign`/
 > `tern`/`nf2`，改这个 env 即可。
@@ -289,7 +291,7 @@ CUDA_VISIBLE_DEVICES=0 PYTHONPATH=src python scripts/calibrate_smooth_qk.py \
 
 ### 6.4 跑 per-token variant（±smooth）
 
-`kitty_pertoken`（uniform）/ `qlutattn_pertoken`（qlut，`QLUT_BIN_CODEBOOKS` 选码本，默认
+`qlutattn_pertoken`（qlut，`QLUT_BIN_CODEBOOKS` 选码本，默认
 nf2）。`+smooth` 就是把 `LLAMA32_MODEL_PATH` 指向 smoothed checkpoint。
 
 ```bash
@@ -305,7 +307,7 @@ LLAMA32_MODEL_PATH=/path/to/models/Llama-3.2-1B-Instruct-smooth \
 LLAMA32_MODEL_SLUG=llama32-1b-instruct-smooth \
 QLUT_BIN_CODEBOOKS=nf2 MAX_MODEL_LEN=32768 LLAMA32_MAX_GEN=256 \
 bash scripts/run_exp.sh llama32 --gpus 0,0,0,1,1,1,2,2,2,3,3,3,4,4,4,5,5,5 --variant qlutattn_pertoken
-# uniform 版把 --variant 换成 kitty_pertoken（无需 QLUT_BIN_CODEBOOKS）。
+# uniform-codebook 版：--variant custom --k_quant_mode per_token（无需 QLUT_BIN_CODEBOOKS）。
 ```
 
 ### 6.5 画图
@@ -325,7 +327,7 @@ PYTHONPATH=src python scripts/plot_pertoken_smooth.py
 | `src/kitty_sim/qk_reorder.py` | loader patch：加载 reorder checkpoint 时重排 `rotary_emb.inv_freq`（已接入 `runner.py`） |
 | `scripts/calibrate_smooth_qk.py` | offline SmoothAttention 标定：收 K absmax → λ → 折进 W_q/W_k，存 smoothed checkpoint（仅 Llama 类） |
 | `src/kitty_sim/kitty_simulate.py` | `k_quant_mode={per_channel,per_token}` + `_quant_k_pertoken` |
-| `src/kitty_sim/longbench/runner.py` | variant `kitty_pertoken` / `qlutattn_pertoken`；reorder loader 接入 |
+| `src/kitty_sim/longbench/runner.py` | variant `qlutattn_pertoken`；reorder loader 接入 |
 | `src/kitty_sim/cli/{utils_cli,eval_longbench}.py` | `--k_quant_mode` CLI + variant choices |
 | `scripts/plot_pertoken_smooth.py` | per-token ±smooth vs per-channel 对比图 |
 | `tests/test_kitty_pertoken_smooth.py` | per-token / smooth 单元测试 |

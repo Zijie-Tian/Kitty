@@ -15,12 +15,10 @@ from kitty_sim.longbench.scorer import score_directory
 from kitty_sim.longbench.templates import build_chat, format_longbench_prompt
 from kitty_sim.longbench.runner import (
     build_variant,
-    output_model_dir,
     default_prediction_dir,
     resolve_prediction_dir,
 )
 from kitty_sim.utils_quant import fake_quant_groupwise_lastdim
-from latency_benchmarking.benchmark_kitty import build_parser as build_latency_parser
 
 
 class DummyEncoding:
@@ -70,94 +68,21 @@ class LongBenchTests(unittest.TestCase):
         self.assertEqual(kitty.buffer_length, 128)
         self.assertEqual(kitty.group_size, 128)
 
-    def test_quest_sim_variant_is_pure_torch_quest(self):
-        variant = build_variant(
-            SimpleNamespace(variant="quest_kitty_page16_sim", quest_token_budget=2048, quest_skip_layers=0)
-        )
-        self.assertTrue(variant.use_kitty)
-        self.assertTrue(variant.sim_quest)
-        self.assertFalse(variant.real_kernel)
-        self.assertEqual(variant.name, "quest_kitty_page16_sim")
-        # page16 fake-quant config the sim KittyKVCache is built from.
-        self.assertEqual(variant.sink_length, 32)
-        self.assertEqual(variant.buffer_length, 16)
-        self.assertEqual(variant.group_size, 16)
-        self.assertEqual(variant.page_size, 16)
-        self.assertTrue(variant.quest_enabled)
-        self.assertEqual(variant.quest_token_budget, 2048)
-        self.assertTrue(variant.tag.endswith("_sim"))
-
-    def test_quest_kernel_variant_is_real_kernel(self):
-        variant = build_variant(
-            SimpleNamespace(variant="quest_kitty_page16_kernel", quest_token_budget=2048, quest_skip_layers=0)
-        )
-        self.assertTrue(variant.real_kernel)
-        self.assertFalse(variant.sim_quest)
-        self.assertEqual(variant.page_size, 16)
-        self.assertEqual(variant.quest_token_budget, 2048)
-        self.assertTrue(variant.tag.endswith("_kernel"))
-
-    def test_output_model_dir_uses_quest_sim_variant_tag(self):
-        variant = build_variant(
-            SimpleNamespace(variant="quest_kitty_page16_sim", quest_token_budget=2048, quest_skip_layers=0)
-        )
-
-        pred_dir = output_model_dir("longbench_out/pred", "qwen3-8b-gpu1-smoke2", variant)
-
-        self.assertEqual(
-            pred_dir.name,
-            "qwen3-8b-gpu1-smoke2-quest_kitty_page16_sim_p16_pr0p125_qb2048_qsl0_sim",
-        )
-
-    def test_longbench_cli_accepts_quest_sim_and_kernel_variants(self):
-        for v in ("quest_kitty_page16_sim", "quest_kitty_page16_kernel"):
-            args = build_parser().parse_args(["Qwen/Qwen3-8B", "--variant", v])
-            self.assertEqual(args.variant, v)
-
     def test_longbench_cli_rejects_removed_page16_proxy_variant(self):
         for v in ("kitty_page16", "quest_proxy_kitty_page16"):
             with self.assertRaises(SystemExit):
                 build_parser().parse_args(["Qwen/Qwen3-8B", "--variant", v])
 
-    def test_latency_parser_accepts_page16_smoke_plumbing(self):
-        args = build_latency_parser().parse_args(
-            [
-                "--cache_implementation",
-                "0",
-                "--page_size",
-                "16",
-                "--warmup_runs",
-                "1",
-                "--repeat_runs",
-                "1",
-                "--batch_size",
-                "1",
-                "--promote_ratio",
-                "0.125",
-                "--quest-enabled",
-                "--quest-token-budget",
-                "2048",
-                "--quest-skip-layers",
-                "2",
-            ]
-        )
-
-        self.assertEqual(args.page_size, 16)
-        self.assertEqual(args.promote_ratio, 0.125)
-        self.assertTrue(args.quest_enabled)
-        self.assertEqual(args.quest_token_budget, 2048)
-        self.assertEqual(args.quest_skip_layers, 2)
-
     def test_flat_prediction_dir_does_not_append_variant_subdir(self):
-        variant = build_variant(SimpleNamespace(variant="quest_kitty_page16_sim"))
+        variant = build_variant(SimpleNamespace(variant="kitty"))
         self.assertEqual(
             resolve_prediction_dir(
-                "longbench_out/llama31-8b-instruct-quest-kitty-sim/pred",
+                "longbench_out/llama31-8b-instruct-kitty/pred",
                 "ignored",
                 variant,
                 flat_output_dir=True,
             ),
-            Path("longbench_out/llama31-8b-instruct-quest-kitty-sim/pred"),
+            Path("longbench_out/llama31-8b-instruct-kitty/pred"),
         )
         self.assertEqual(
             resolve_prediction_dir("longbench_out/root", "model-tag", variant).name,
@@ -165,85 +90,15 @@ class LongBenchTests(unittest.TestCase):
         )
 
     def test_default_prediction_dir_uses_normalized_smoke_and_full_layout(self):
-        variant = build_variant(SimpleNamespace(variant="quest_kitty_page16_sim"))
+        variant = build_variant(SimpleNamespace(variant="kitty"))
         self.assertEqual(
             default_prediction_dir("meta-llama/Llama-3.1-8B-Instruct", None, variant, max_samples=1),
-            Path("longbench_out/smoke/llama31-8b-instruct-quest-kitty-sim/pred"),
+            Path("longbench_out/smoke/llama31-8b-instruct-kitty/pred"),
         )
         self.assertEqual(
             default_prediction_dir("meta-llama/Llama-3.1-8B-Instruct", None, variant, max_samples=-1),
-            Path("longbench_out/llama31-8b-instruct-quest-kitty-sim/pred"),
+            Path("longbench_out/llama31-8b-instruct-kitty/pred"),
         )
-
-    def test_sim_quest_hook_accepts_hf_singular_cache_argument(self):
-        from transformers import LlamaConfig, LlamaForCausalLM
-
-        from kitty_sim import get_kvcache_kitty
-        from kitty_sim.quest_sparse import QuestConfig
-        from kitty_sim.sim_quest import install_sim_quest
-
-        model = LlamaForCausalLM(
-            LlamaConfig(
-                vocab_size=64,
-                hidden_size=32,
-                intermediate_size=64,
-                num_hidden_layers=1,
-                num_attention_heads=4,
-                num_key_value_heads=4,
-                max_position_embeddings=64,
-            )
-        ).eval()
-        stats = install_sim_quest(
-            model,
-            QuestConfig(page_size=16, token_budget=16, skip_layers=0, sink_length=0, recent_length=0),
-        )
-        cache = get_kvcache_kitty(
-            SimpleNamespace(
-                sink_length=0,
-                buffer_length=16,
-                group_size=16,
-                kbits=2,
-                vbits=2,
-                promote_ratio=0.125,
-                promote_bit=4,
-                channel_selection=1,
-            )
-        )
-
-        with torch.inference_mode():
-            model(input_ids=torch.tensor([[1, 2, 3, 4]]), past_key_values=cache, use_cache=True)
-
-        self.assertEqual(cache.get_seq_length(), 4)
-        self.assertEqual(stats["prefill_calls"], 1)
-
-    def test_real_kernel_llama_hook_accepts_singular_and_plural_cache(self):
-        # Regression: HF passes the cache as `past_key_value` (singular) to attention
-        # modules on some transformers versions/call sites, and `past_key_values`
-        # (plural) on others. The real-kernel Llama hook must accept BOTH, else the
-        # KittyCache is silently lost ("requires a KittyCache ... got None").
-        import inspect
-
-        from kitty.models.llama.modeling_llama import _llama_kitty_attention_forward
-
-        params = inspect.signature(_llama_kitty_attention_forward).parameters
-        self.assertIn("past_key_value", params)
-        self.assertIn("past_key_values", params)
-
-    def test_glm_real_kitty_kernel_install_is_importable(self):
-        # No-GPU wiring check: the GLM real-kernel installer + shared plumbing are
-        # importable and the GLM family is recognized (GPU smoke covers behavior).
-        from kitty_sim.glm_kitty_patch import (
-            install_glm_real_kitty_kernel,
-            set_glm_real_kitty_sample_length,
-            install_glm_cache_plumbing,
-            is_glm_family,
-        )
-
-        self.assertTrue(is_glm_family("glm4"))
-        self.assertTrue(is_glm_family("chatglm"))
-        self.assertFalse(is_glm_family("llama3"))
-        for fn in (install_glm_real_kitty_kernel, set_glm_real_kitty_sample_length, install_glm_cache_plumbing):
-            self.assertTrue(callable(fn))
 
     def test_kitty_cache_accepts_short_prefill_without_assertion(self):
         cache = KittyKVCache(

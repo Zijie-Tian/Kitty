@@ -101,47 +101,6 @@ class TestPerTokenKQuant(unittest.TestCase):
         torch.testing.assert_close(cache.key_cache[0][:, :, 4:12, :], expected)
 
 
-class TestTernaryK(unittest.TestCase):
-    def setUp(self):
-        torch.manual_seed(0)
-
-    def _tern_cache(self, sink=4, buffer=8, group=8):
-        args = SimpleNamespace(
-            sink_length=sink, buffer_length=buffer, group_size=group,
-            kbits=2, vbits=4, promote_ratio=0.0, promote_bit=4,
-            channel_selection=0, k_quant_mode="per_channel",
-            k_codebook="ternary", k_tern_threshold=0.5, k_tern_submean=True,
-        )
-        return get_kvcache_kitty(args)
-
-    def test_validate_rejects_bad_combos(self):
-        with self.assertRaises(ValueError):
-            KittyKVCacheConfig(k_codebook="ternary", promote_ratio=0.125)
-        with self.assertRaises(ValueError):
-            KittyKVCacheConfig(k_codebook="ternary", k_quant_mode="per_token", promote_ratio=0.0)
-        with self.assertRaises(ValueError):
-            KittyKVCacheConfig(k_codebook="bogus", promote_ratio=0.0)
-        KittyKVCacheConfig(k_codebook="ternary", promote_ratio=0.0)
-
-    def test_prefill_matches_reference_ternary(self):
-        from kitty_sim.utils_quant import fake_quant_ternary_lastdim
-        sink, buffer, t = 4, 8, 20
-        cache = self._tern_cache(sink=sink, buffer=buffer)
-        k = torch.randn(1, 2, t, 16)
-        v = torch.randn(1, 2, t, 16)
-        cache.update(k.clone(), v.clone(), 0)
-        stored = cache.key_cache[0]
-        # sink + residual fp16 (per-channel path quantizes whole buffer blocks)
-        torch.testing.assert_close(stored[:, :, :sink, :], k[:, :, :sink, :])
-        expected = fake_quant_ternary_lastdim(
-            k[:, :, 4:12, :].transpose(2, 3).contiguous(), 8, 0.5, True
-        ).transpose(2, 3)
-        torch.testing.assert_close(stored[:, :, 4:12, :], expected)
-        # V still uniform 4-bit per-token
-        expected_v = fake_quant_groupwise_lastdim(v[:, :, 4:12, :].clone(), 8, 4)
-        torch.testing.assert_close(cache.value_cache[0][:, :, 4:12, :], expected_v)
-
-
 class TestSmoothScales(unittest.TestCase):
     def test_rope_pair_constraint(self):
         absmax = torch.rand(2, 16) * 10 + 0.1

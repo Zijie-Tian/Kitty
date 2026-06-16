@@ -21,9 +21,9 @@ POINTS = [
     ("k1v4 (KIVI 1-bit)",    "llama32-1b-instruct-k1v4pr0_kitty-k1v4", 1.25),
     ("k1v4 +25% promote",    "llama32-1b-instruct_kitty-k1v4",         1.50),
     ("qlutattn-k1v4",        "llama32-1b-instruct_qlutattn-k1v4",      1.68),
-    ("tern",                 "llama32-1b-instruct_tern-uniform",       1.83),
-    ("KIVI-2",               "llama32-1b-instruct_kivi-2",             2.25),
-    ("KIVI*-2",              "llama32-1b-instruct_kivi-star-2",        2.25),
+    ("tern",                 "llama32-1b-instruct_qlutattn-k184v4",    1.83),
+    ("KIVI-2",               "llama32-1b-instruct_kivi-k2v2",          2.25),
+    ("KIVI*-2",              "llama32-1b-instruct_kivi-star-k2v2",     2.25),
     ("kitty",                "llama32-1b-instruct_kitty",              2.50),
 ]
 FP16_DIR = "llama32-1b-instruct_fp16"

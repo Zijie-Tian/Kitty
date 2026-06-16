@@ -17,7 +17,7 @@ and folds them offline into the attention projections:
 The smoothed checkpoint is mathematically equivalent (QK^T unchanged in exact
 arithmetic; bf16 weight rounding only), but its post-RoPE K channels are
 flattened toward their geometric mean -- which is exactly what per-token
-(head_dim-axis) low-bit K quantization needs (--variant kitty_pertoken).
+(head_dim-axis) low-bit K quantization needs (--variant qlutattn_pertoken).
 
 Outputs under --output (default calib/<model basename>/):
   - full save_pretrained checkpoint + tokenizer (drop-in for <T>_MODEL_PATH)

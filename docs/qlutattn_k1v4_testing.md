@@ -6,7 +6,7 @@
 均匀 tern 基线。方法设计见 `docs/qlutattn_k1v4.md`;本文件是**复现/测试手册**。
 
 > 纯 PyTorch `kitty_sim` fake-quant:**精度代理**,不省真实显存、无 kernel。`nf2` 走
-> per-group Lloyd-Max,是运行时瓶颈(`qlutattn-k1v4` 比 `tern_uniform` 慢约 2x)。
+> per-group Lloyd-Max,是运行时瓶颈(`qlutattn-k1v4` 比 `qlutattn_k184v4` 慢约 2x)。
 
 ---
 
@@ -15,10 +15,10 @@
 | variant | method slug（输出目录后缀） | K 位宽 | 说明 |
 | --- | --- | ---: | --- |
 | `qlutattn_k1v4` | `qlutattn-k1v4` | ≈1.68 | 主方法,winner policy `["sign","sign","sign","tern","nf2","nf2"]` |
-| `tern_uniform` | `tern-uniform` | ≈1.83 | 等精度 iso-tern 基线(全 tern K) |
+| `qlutattn_k184v4` | `qlutattn-k184v4` | ≈1.83 | 等精度 iso-tern 基线(全 tern K) |
 | `fp16` | `fp16` | 16 | 天花板(dense fp16 KV) |
 
-三者 V 都是 per-token 4-bit(`fp16` 除外)。`qlutattn_k1v4` / `tern_uniform` 内部均走
+三者 V 都是 per-token 4-bit(`fp16` 除外)。`qlutattn_k1v4` / `qlutattn_k184v4` 内部均走
 `k_codebook="qlut"` 的 σ²-分箱码本路径,差别只在 policy。winner policy 可用环境变量
 `QLUT_BIN_CODEBOOKS=sign,sign,sign,tern,nf2,nf2` 覆盖(逗号分隔,长度 = `n_bins`)。
 
@@ -49,7 +49,7 @@ bash scripts/run_exp.sh llama32 --gpus 0,0 --variant qlutattn_k1v4 --max-samples
 ```
 
 预期日志:`variant=qlutattn_k1v4_nb6_v4_cb<hash>`、`status: ok`、自动 score。基线同法:
-`--variant tern_uniform`(慢约 1/2)。
+`--variant qlutattn_k184v4`(慢约 1/2)。
 
 ---
 
@@ -60,11 +60,11 @@ bash scripts/run_exp.sh llama32 --gpus 0,0 --variant qlutattn_k1v4 --max-samples
 ```bash
 cd /home/zijie/Code/Kitty
 GPUS=0,0,0,1,1,1,2,2,2,3,3,3,4,4,4,5,5,5
-for V in qlutattn_k1v4 tern_uniform fp16; do
+for V in qlutattn_k1v4 qlutattn_k184v4 fp16; do
   MAX_MODEL_LEN=32768 LLAMA32_MAX_GEN=256 \
   bash scripts/run_exp.sh llama32 --gpus "$GPUS" --variant "$V"
 done
-# -> longbench_out/llama32-1b-instruct_{qlutattn-k1v4,tern-uniform,fp16}/
+# -> longbench_out/llama32-1b-instruct_{qlutattn-k1v4,qlutattn-k184v4,fp16}/
 ```
 
 ### 4b. Llama-3.2-3B（**每卡 1 worker = 6 worker** — 2/卡@32k 会 OOM,见 §7）
@@ -72,7 +72,7 @@ done
 ```bash
 cd /home/zijie/Code/Kitty
 GPUS=0,1,2,3,4,5
-for V in qlutattn_k1v4 tern_uniform fp16; do
+for V in qlutattn_k1v4 qlutattn_k184v4 fp16; do
   LLAMA32_MODEL_ID=meta-llama/Llama-3.2-3B-Instruct \
   LLAMA32_MODEL_PATH=/home/zijie/models/Llama-3.2-3B-Instruct \
   LLAMA32_MODEL_SLUG=llama32-3b-instruct \
@@ -80,12 +80,12 @@ for V in qlutattn_k1v4 tern_uniform fp16; do
   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   bash scripts/run_exp.sh llama32 --gpus "$GPUS" --variant "$V"
 done
-# -> longbench_out/llama32-3b-instruct_{qlutattn-k1v4,tern-uniform,fp16}/
+# -> longbench_out/llama32-3b-instruct_{qlutattn-k1v4,qlutattn-k184v4,fp16}/
 ```
 
 > `LLAMA32_MODEL_SLUG=llama32-3b-instruct` **必须设**,否则 3B 结果会写进 1B 目录。
 > full 模式可断点续跑(按数据集 jsonl 行数 skip 已完成的)。`nf2` 慢:1B 全量 typed≈2.5h
-> (18 worker),3B 全量 qlutattn-k1v4≈6.6h(6 worker),tern_uniform 约其一半。
+> (18 worker),3B 全量 qlutattn-k1v4≈6.6h(6 worker),qlutattn_k184v4 约其一半。
 
 ---
 
@@ -93,7 +93,7 @@ done
 
 全量 21 数据集均分:
 
-| 模型 | fp16 | tern_uniform (1.83b) | **qlutattn-k1v4 (1.68b)** | 留存 fp16 | k1v4 − tern |
+| 模型 | fp16 | qlutattn_k184v4 (1.83b) | **qlutattn-k1v4 (1.68b)** | 留存 fp16 | k1v4 − tern |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | **1B** | 27.59 | 22.96 (83.2%) | **24.88 (90.2%)** | 90.2% | **+1.91** |
 | **3B** | 36.33 | 30.72 (84.6%) | **34.28 (94.4%)** | 94.4% | **+3.56** |
@@ -140,7 +140,7 @@ PYTHONPATH=src python -m kitty_sim.cli.score_longbench \
    等 init 回收后显存才释放。`pgrep`/`pkill` 模式用 `[.]`(如 `run_exp[.]sh`)避免匹配到
    自己的命令行而误伤当前 shell。
 4. **共享 GPU**:启动前 `nvidia-smi` 确认目标卡空闲;别抢别人的训练任务(会双方 OOM)。
-5. `qlutattn-k1v4` 与 `tern_uniform` 对比时,两臂都不传 `QLUT_BIN_CODEBOOKS` 即用各自内置
+5. `qlutattn-k1v4` 与 `qlutattn_k184v4` 对比时,两臂都不传 `QLUT_BIN_CODEBOOKS` 即用各自内置
    policy;若要扫别的 policy,用 `LLAMA32_MODEL_SLUG` 把 policy 编进输出目录名,避免不同
    policy 混入同一目录(resume 只看行数)。
 

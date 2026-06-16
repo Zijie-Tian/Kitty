@@ -158,7 +158,7 @@ class BuildVariantTests(unittest.TestCase):
 
     def test_config_rejected_for_non_k1v4(self):
         path = self._write({"default": 0.5})
-        for bad in ("kitty", "kitty_pro", "custom", "fp16", "kivi_2"):
+        for bad in ("kitty", "kitty_pro", "custom", "fp16", "kivi"):
             with self.assertRaises(ValueError):
                 build_variant(SimpleNamespace(
                     variant=bad, promote_ratio_config=path,

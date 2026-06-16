@@ -12,7 +12,7 @@ def update_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.add_argument("--channel_selection",  type=int, default=1,        choices=[-1, 0, 1, 2, 3], help="Channel selection method: 0 for Random, 1 for Magnitude, 2 for Variance, 3 for Cross-head Magnitude (layer-global budget)")
     parser.add_argument("--k_quant_mode",       type=str, default="per_channel", choices=["per_channel", "per_token"], help="K-cache quant orientation (variant=custom): per_channel = KIVI-style token-axis groups; per_token = K quantized like V along head_dim, no promote")
     parser.add_argument("--promote-ratio-config", dest="promote_ratio_config", default=None,
-                        help="Path to a JSON per-layer promote_ratio schedule (kitty_k1v4 / kitty_k1v4_xhead only): "
+                        help="Path to a JSON per-layer promote_ratio schedule (kitty_k1v4 only): "
                              "{\"default\": r, \"layers\": {idx: r}} or a bare [r0, r1, ...] list.")
     return parser
 

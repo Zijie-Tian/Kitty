@@ -28,7 +28,7 @@ PT = {
 }
 # per-channel references: (label, K bit, score)
 PC = [("qlut σ²-mix", 1.68, mean("llama32-1b-instruct_qlutattn-k1v4")),
-      ("KIVI-2",      2.25, mean("llama32-1b-instruct_kivi-2")),
+      ("KIVI-2",      2.25, mean("llama32-1b-instruct_kivi-k2v2")),
       ("kitty",       2.50, mean("llama32-1b-instruct_kitty"))]
 
 fig, ax = plt.subplots(figsize=(10, 6.4))

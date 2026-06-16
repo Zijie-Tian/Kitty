@@ -49,9 +49,9 @@ class KVCache_Layer:
             (MAX_BS * self.MAX_PAGE, self.bytes_per_page_K), dtype=torch.uint8, device='cuda')
         self.KeyCache_metadata = torch.zeros( # scale & zero_point
             (MAX_BS * self.MAX_PAGE, H_KV, D, 2), dtype=torch.half, device='cuda')
-        # Query-aware QUEST selector bounds by logical page. These are metadata,
-        # not dequantized page tensors, and let the selector avoid all-page K
-        # dequantization.
+        # Per-logical-page K min/max bounds (metadata, not dequantized page
+        # tensors). Retained for the dense kernel's prefill/decode packing path;
+        # dense attention does not read them.
         self.KeyPage_Min = torch.zeros((MAX_BS, H_KV, self.MAX_PAGE, D), dtype=torch.float16, device='cuda')
         self.KeyPage_Max = torch.zeros((MAX_BS, H_KV, self.MAX_PAGE, D), dtype=torch.float16, device='cuda')
         # Initialize Value Cache
@@ -94,21 +94,7 @@ class KVCache_Layer:
         )
         self.Local_Count_V = 0
         self.Write_Offset_Local_V = 0       # To track the write offset in the local buffer, circular buffer.
-        # QUEST sparse debug/evidence fields. They are written by the optional
-        # correctness-first sparse attention path and ignored by dense Kitty.
         self.layer_idx = 0
-        self.quest_config = None
-        self.last_quest_path = "dense"
-        self.last_selected_pages_shape = None
-        self.last_shared_page_count = 0
-        self.last_selected_pages = None
-        self.last_selected_tokens = 0
-        self.last_sparse_qk_hits = 0
-        self.last_sparse_sv_hits = 0
-        self.last_effective_topk_pages = 0
-        self.last_effective_token_budget = None
-        self.last_sparse_qk_pages_loaded = 0
-        self.last_sparse_sv_pages_loaded = 0
         # Legacy for compatibility of prefills
         self.key_states: Optional[torch.Tensor] = None
         self.value_states: Optional[torch.Tensor] = None
