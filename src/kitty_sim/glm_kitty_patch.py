@@ -56,6 +56,7 @@ def cache_config_from_variant(variant) -> KittyKVCacheConfig:
             else None
         ),
         channel_selection=variant.channel_selection,
+        k_quant_mode=getattr(variant, "k_quant_mode", "per_channel"),
     )
 
 

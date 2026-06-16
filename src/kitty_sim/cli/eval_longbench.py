@@ -27,6 +27,8 @@ def build_parser() -> argparse.ArgumentParser:
             "kitty_pro",
             "kitty_k1v4",
             "kitty_k1v4_xhead",
+            "kitty_pertoken",
+            "qlutattn_pertoken",
             "kivi_2",
             "kivi_star_2",
             "custom",

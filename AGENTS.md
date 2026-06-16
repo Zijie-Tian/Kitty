@@ -767,6 +767,94 @@ while pure dense Kitty grows roughly linearly with context. The runner's
 first-sample guardrail also prints `[sim-quest] ... decode_calls=... last_selected_pages=...`
 and refuses to proceed if the QUEST hook never ran.
 
+## qlutattn-k1v4 per-token exploration (reorder + SmoothAttention)
+
+Research probes pushing qlutattn-k1v4's K quant from **per-channel** to
+**per-token** (KIVI-V-style, decode-friendly head_dim-axis grouping). All on the
+pure-torch `kitty_sim` fake-quant path: accuracy proxy only, no memory/speed
+savings. Full design doc + roadmap: `docs/qlutattn_reorder_smooth.md`.
+
+Three orthogonal pieces:
+
+- **per-token K quant** (`k_quant_mode=per_token`, variants `kitty_pertoken` /
+  `qlutattn_pertoken`): K grouped along head_dim, uniform, no promote/channel-
+  select. The per-token loss is codebook-driven, NOT axis-driven — per-token
+  nf2 (Lloyd, self-adaptive) ≈ per-channel KIVI, while per-token uniform
+  collapses. `qlutattn_pertoken` is single-codebook (`QLUT_BIN_CODEBOOKS`, one
+  name, default `nf2`); V per-token 4-bit.
+- **SmoothAttention** (`scripts/calibrate_smooth_qk.py`, Llama-family only):
+  QServe-style `λ=max(absmax_K pair)^0.5` with the RoPE rotate-half pair
+  constraint (`λ_i==λ_{i+D/2}`), folded offline into `W_q*=λ` / `W_k/=λ`.
+  Flattens per-channel K outliers. q_norm/k_norm models (Qwen3) raise (the norm
+  renormalizes the fold away).
+- **channel reorder** (`scripts/preprocess_qlutattn_model.py` + loader
+  `kitty_sim.qk_reorder.apply_qk_reorder`): offline reorder Q/K_proj output
+  channels by post-RoPE K σ² so same-energy channels are contiguous on head_dim
+  (prerequisite for per-token segmented mixed-codebook quant). A SINGLE GLOBAL
+  RoPE-pair permutation (model-level inv_freq is shared across layers), folded
+  into every layer's W_q/W_k; `inv_freq[pair_perm]` is re-applied at load
+  (`persistent=False`, not saved). Mathematically identity (fp16 logits top-1
+  99.76%); the loader prints `[qk-reorder] applied` per worker.
+
+### Results (Llama-3.2-1B, full LongBench, 21 datasets, 32k, sim)
+
+| K quant | codebook | K bit/value | score | +smooth |
+| --- | --- | ---: | ---: | ---: |
+| per-token | uniform 2-bit | 2.5 | 12.95 | 16.61 |
+| per-token | qlut nf2 (Lloyd) | 2.5 | 23.50 | 24.08 |
+| per-channel (ref) | KIVI-2 | 2.25 | 24.24 | — |
+| per-channel (ref) | qlut σ²-mix | 1.68 | 24.88 | — |
+| reorder + per-channel qlut σ²-mix | identity check | 1.68 | **24.82** (Δ−0.06 vs 24.88) | — |
+
+fp16 ceiling 27.59. smooth rescues uniform (+3.66, outlier-dominated) but barely
+helps nf2 (+0.58, Lloyd already self-absorbs outliers). The reorder row should
+reproduce the non-reorder per-channel 24.88, confirming route-a reorder is an
+identity for LongBench.
+
+### Usage
+
+Offline reorder model (single card ~5min; default `--output` writes to the
+gitignored `reorder/<name>`, prefer an explicit `~/models` path so the reordered
+checkpoint sits next to the source model):
+
+```bash
+CUDA_VISIBLE_DEVICES=0 PYTHONPATH=src python scripts/preprocess_qlutattn_model.py \
+  --model /path/to/Llama-3.2-1B-Instruct \
+  --calib-data /path/to/wikitext-2-raw-v1/train-00000-of-00001.parquet \
+  --output /path/to/models/Llama-3.2-1B-Instruct-reorder
+```
+
+Offline SmoothAttention calibration (single card ~5min; Llama-family only):
+
+```bash
+CUDA_VISIBLE_DEVICES=0 PYTHONPATH=src python scripts/calibrate_smooth_qk.py \
+  --model /path/to/Llama-3.2-1B-Instruct \
+  --calib-data /path/to/wikitext-2-raw-v1/train-00000-of-00001.parquet \
+  --alpha 0.5 --output /path/to/models/Llama-3.2-1B-Instruct-smooth
+```
+
+LongBench (point `LLAMA32_MODEL_PATH` at the reorder/smooth checkpoint; set
+`LLAMA32_MODEL_SLUG` so output dirs don't collide). smoke adds `--max-samples 2`
+(+ `DATASETS_CSV=multifieldqa_en,hotpotqa` to exercise the K path), full omits it:
+
+```bash
+# reorder + qlutattn-k1v4 per-channel (verify identity ≈ 24.88), full 6-card×3
+LLAMA32_MODEL_PATH=/path/to/models/Llama-3.2-1B-Instruct-reorder \
+LLAMA32_MODEL_SLUG=llama32-1b-instruct-reorder \
+MAX_MODEL_LEN=32768 LLAMA32_MAX_GEN=256 \
+bash scripts/run_exp.sh llama32 --gpus 0,0,0,1,1,1,2,2,2,3,3,3,4,4,4,5,5,5 --variant qlutattn_k1v4
+# -> longbench_out/llama32-1b-instruct-reorder_qlutattn-k1v4
+
+# per-token qlut-nf2 + smooth (full): model = smoothed checkpoint
+LLAMA32_MODEL_PATH=/path/to/models/Llama-3.2-1B-Instruct-smooth \
+LLAMA32_MODEL_SLUG=llama32-1b-instruct-smooth \
+QLUT_BIN_CODEBOOKS=nf2 MAX_MODEL_LEN=32768 LLAMA32_MAX_GEN=256 \
+bash scripts/run_exp.sh llama32 --gpus 0,0,0,1,1,1,2,2,2,3,3,3,4,4,4,5,5,5 --variant qlutattn_pertoken
+# uniform per-token: --variant kitty_pertoken (drop QLUT_BIN_CODEBOOKS)
+```
+
+`reorder/` and `calib/` checkpoint dirs are gitignored; use `--output ~/models/...`.
+
 ## Experimental low-bit K-cache exploration (K1V2 / K1V4 families)
 
 This is an ongoing exploration of how far the **K cache can be pushed below

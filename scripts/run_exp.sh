@@ -267,6 +267,8 @@ method_slug() {
     kitty_pro) printf 'kitty-pro\n' ;;
     kitty_k1v4) printf 'kitty-k1v4\n' ;;
     kitty_k1v4_xhead) printf 'kitty-k1v4-xhead\n' ;;
+    kitty_pertoken) printf 'kitty-pertoken\n' ;;
+    qlutattn_pertoken) printf 'qlutattn-pertoken\n' ;;
     fp16) printf 'fp16\n' ;;
     kivi_2) printf 'kivi-2\n' ;;
     kivi_star_2) printf 'kivi-star-2\n' ;;

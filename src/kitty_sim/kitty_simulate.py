@@ -38,6 +38,7 @@ class KittyKVCacheConfig(CacheConfig):
         promote_bit: int = 4,
         promote_ratio_per_layer: Optional[dict] = None,  # {layer_idx: ratio} overriding promote_ratio per layer; None = scalar for every layer
         channel_selection: int = 1,               # -1: Unspecified, 0: Random, 1: Magnitude-based, 3: Cross-head Magnitude (layer-global budget)
+        k_quant_mode: str = "per_channel",        # "per_channel": KIVI-style token-axis groups (+promote/qlut codebook); "per_token": K quantized like V along head_dim (uniform, no promote)
         VCache_BitDecoding: bool = False,         # The behavior of Value Cache, set to True means BitDecoding, otherwise KIVI Style Value Cache
         PostQuant: bool = True,                   # Post Quantization is always enabled
         k_codebook: str = "kivi",                 # "kivi" = existing min-max groupwise K quant; "qlut" = per-channel sigma^2-binned codebooks (qlutattn-k1v4)
@@ -60,6 +61,7 @@ class KittyKVCacheConfig(CacheConfig):
             else None
         )
         self.channel_selection = channel_selection
+        self.k_quant_mode = k_quant_mode
         self.VCache_BitDecoding = VCache_BitDecoding
         self.PostQuant = PostQuant
         self.k_codebook = k_codebook
@@ -80,6 +82,14 @@ class KittyKVCacheConfig(CacheConfig):
                                          found_value=self.k_codebook))
         if self.k_codebook == "qlut" and not self.bin_codebooks:
             raise ValueError("k_codebook='qlut' requires a non-empty bin_codebooks list")
+        if self.k_quant_mode not in ("per_channel", "per_token"):
+            raise ValueError(
+                incorrect_arg_msg.format(key="k_quant_mode", correct_value="'per_channel' or 'per_token'",
+                                         found_value=self.k_quant_mode))
+        if self.k_quant_mode == "per_token" and (self.promote_ratio != 0.0 or self.promote_ratio_per_layer is not None):
+            raise ValueError(
+                "k_quant_mode='per_token' requires promote_ratio=0.0 and no per-layer override "
+                "(per-token K has no channel axis at quantization time)")
         if self.channel_selection not in [0, 1, 3]:
             raise ValueError(
                 incorrect_arg_msg.format(
@@ -218,6 +228,7 @@ class KittyKVCache(DynamicCache):
         # QLUT (sigma^2-binned) K codebook support. k_bin_ids[layer_idx] = [nh,D]
         # per-channel bin id, computed once (from the prompt quant region at prefill)
         # then reused for every buffer flush + decode. None for the default 'kivi' path.
+        self.k_quant_mode = cache_config.k_quant_mode
         self.k_codebook = cache_config.k_codebook
         self.bin_codebooks = cache_config.bin_codebooks
         self.n_bins = cache_config.n_bins
@@ -239,6 +250,24 @@ class KittyKVCache(DynamicCache):
             return
         from .qlut_quant import compute_sigma_bins
         self.k_bin_ids[layer_idx] = compute_sigma_bins(key_region_t, self.group_size, self.n_bins)
+
+    def _quant_k_pertoken(self, ks):
+        """Per-token K quant of a [B,nh,T,D] slice: one quantizer per token per
+        head along head_dim (like the KIVI-style V cache). k_codebook='qlut'
+        applies a SINGLE submean codebook along head_dim -- sigma^2 binning has no
+        per-channel axis in per-token mode, so bin_codebooks[0] is used for every
+        token (mu = per-token mean over head_dim channels); 'kivi' uses uniform
+        min-max. Pair with a SmoothAttention checkpoint to flatten per-channel
+        outliers that per-token sharing would otherwise smear into one scale."""
+        if self.k_codebook == "qlut":
+            from .qlut_quant import apply_codebook
+            cb = self.bin_codebooks[0]
+            G = ks.shape[-1]  # head_dim -> one submean group per token
+            out = ks.clone()
+            for b in range(ks.shape[0]):
+                out[b] = apply_codebook(ks[b].float(), G, cb).to(ks.dtype)
+            return out
+        return fake_quant_groupwise_lastdim(ks, self.group_size, self.kbits)
 
     def _quant_k_buffer(self, key_slice_t, layer_idx):
         """Quantize a [B,nh,D,buffer] post-RoPE K buffer. 'qlut' uses the layer's
@@ -337,15 +366,27 @@ class KittyKVCache(DynamicCache):
                 num_token_to_buffer = num_tokens % self.buffer_length
                 num_token_to_quantize = num_tokens - num_token_to_buffer
                 end_idx = start_idx + num_token_to_quantize
-                # Quantize Key Cache. QLUT path bins channels by sigma^2 once over
-                # the full prompt quant region [sink, end_idx) before flushing buffers.
-                self._ensure_k_bins(
-                    layer_idx,
-                    current_key_cache[:, :, start_idx:end_idx, :].transpose(2, 3).contiguous())
-                for idx in range(start_idx, end_idx, self.buffer_length):
-                    key_slice = current_key_cache[:, :, idx:idx+self.buffer_length, :].transpose(2, 3).contiguous()
-                    key_slice = self._quant_k_buffer(key_slice, layer_idx).transpose(2, 3).contiguous()
-                    current_key_cache[:, :, idx:idx+self.buffer_length, :] = key_slice
+                # Quantize Key Cache.
+                if self.k_quant_mode == "per_token":
+                    # Per-token K mirrors the KIVI-style V cache: keep the most
+                    # recent buffer_length tokens fp16, quantize the rest with
+                    # groups along head_dim (no transpose, no promote). k_codebook
+                    # 'qlut' uses a single submean codebook here; 'kivi' uniform.
+                    k_end_idx = start_idx + (num_tokens - self.buffer_length)
+                    if k_end_idx > start_idx:
+                        ks = current_key_cache[:, :, start_idx:k_end_idx, :]
+                        ks = self._quant_k_pertoken(ks)
+                        current_key_cache[:, :, start_idx:k_end_idx, :] = ks
+                else:
+                    # QLUT/KIVI per-channel path: bin channels by sigma^2 once over
+                    # the full prompt quant region [sink, end_idx) before flushing buffers.
+                    self._ensure_k_bins(
+                        layer_idx,
+                        current_key_cache[:, :, start_idx:end_idx, :].transpose(2, 3).contiguous())
+                    for idx in range(start_idx, end_idx, self.buffer_length):
+                        key_slice = current_key_cache[:, :, idx:idx+self.buffer_length, :].transpose(2, 3).contiguous()
+                        key_slice = self._quant_k_buffer(key_slice, layer_idx).transpose(2, 3).contiguous()
+                        current_key_cache[:, :, idx:idx+self.buffer_length, :] = key_slice
                 # Quantize Value Cache
                 if not self.VCache_BitDecoding:
                     num_token_to_quantize = num_tokens - self.buffer_length   # KIVI Style Value Cache
@@ -368,7 +409,14 @@ class KittyKVCache(DynamicCache):
 
             # quantize
             num_tokens_kv_to_quantize = current_cache_length - self.sink_length - self.buffer_length
-            if num_tokens_kv_to_quantize > 0 and (num_tokens_kv_to_quantize % self.buffer_length == 1):  # need to quantize
+            if self.k_quant_mode == "per_token":
+                # Per-token K follows the KIVI-style V schedule: quantize the
+                # single token sliding out of the recent fp16 window each step.
+                if num_tokens_kv_to_quantize > 0:
+                    ks = current_key_cache[:, :, -self.buffer_length-1:-self.buffer_length, :]
+                    ks = self._quant_k_pertoken(ks)
+                    current_key_cache[:, :, -self.buffer_length-1:-self.buffer_length, :] = ks
+            elif num_tokens_kv_to_quantize > 0 and (num_tokens_kv_to_quantize % self.buffer_length == 1):  # need to quantize
                 # Quantize Key Cache
                 key_slice = current_key_cache[:, :, -self.buffer_length-1:-1, :].transpose(2, 3).contiguous()
                 key_slice = self._quant_k_buffer(key_slice, layer_idx).transpose(2, 3).contiguous()
@@ -407,6 +455,7 @@ def get_kvcache_kitty(args: argparse.Namespace) -> KittyKVCache:
         promote_bit         = args.promote_bit,
         promote_ratio_per_layer = getattr(args, "promote_ratio_per_layer", None),
         channel_selection   = args.channel_selection,
+        k_quant_mode        = getattr(args, "k_quant_mode", "per_channel"),
         VCache_BitDecoding  = False,  # Using KIVI Style V Cache
         PostQuant           = True,  # Post Quantization is always enabled for Kitty KV Cache
         k_codebook          = getattr(args, "k_codebook", "kivi"),

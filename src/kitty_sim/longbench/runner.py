@@ -41,6 +41,11 @@ class VariantConfig:
     promote_ratio: float = 0.125
     promote_bit: int = 4
     channel_selection: int = 1
+    # K-cache quant orientation: "per_channel" (KIVI-style token-axis groups +
+    # promote/qlut codebook) or "per_token" (K quantized like V along head_dim,
+    # uniform, no promote) -- the QServe SmoothAttention study mode, pair with a
+    # smooth-calibrated checkpoint (scripts/calibrate_smooth_qk.py).
+    k_quant_mode: str = "per_channel"
     # Real Triton Kitty decode kernel + QUEST query-aware page selection.
     # When True the runner loads the architecture-specific *_Kitty model class
     # and builds the real paged KittyCache (kitty.kvcache) instead of the
@@ -95,6 +100,8 @@ class VariantConfig:
         if self.promote_ratio_per_layer:
             h = hashlib.sha256(repr(self.promote_ratio_per_layer).encode()).hexdigest()[:6]
             suffix = f"-prcfg{h}"
+        if self.k_quant_mode == "per_token":
+            suffix += "_kpt"
         return (
             f"{self.name}_g{self.group_size}_b{self.buffer_length}_s{self.sink_length}"
             f"_sel{self.channel_selection}_k{self.kbits}_v{self.vbits}"
@@ -258,6 +265,29 @@ def build_variant(args: Any) -> VariantConfig:
             name="tern_uniform", use_kitty=True, k_codebook="qlut",
             bin_codebooks=("tern",) * 6, n_bins=6, vbits=4, promote_ratio=0.0,
             channel_selection=0, sink_length=32, buffer_length=128, group_size=128)
+    if variant == "kitty_pertoken":
+        # QServe SmoothAttention study: K AND V both per-token fake-quant.
+        # K 2-bit / V 4-bit, K quantized like the KIVI-style V cache (one
+        # asymmetric min-max group per token per head along head_dim), NO
+        # promote, NO channel selection. Pair with a SmoothAttention checkpoint
+        # from scripts/calibrate_smooth_qk.py (point <T>_MODEL_PATH at calib/<m>/
+        # + set <T>_MODEL_SLUG) to measure how much offline QK smoothing rescues
+        # per-token K quant.
+        return VariantConfig(
+            name="kitty_pertoken", use_kitty=True, kbits=2, vbits=4,
+            promote_ratio=0.0, channel_selection=0, k_quant_mode="per_token")
+    if variant in ("qlutattn_pertoken", "qlut_pertoken"):
+        # qlutattn-k1v4 turned per-token: a SINGLE submean codebook applied along
+        # head_dim per token (sigma^2 binning has no per-channel axis in per-token
+        # mode, so QLUT_BIN_CODEBOOKS gives one codebook, default nf2). V per-token
+        # 4-bit, no promote. Pair with a SmoothAttention checkpoint
+        # (scripts/calibrate_smooth_qk.py) to flatten per-channel K outliers that
+        # the shared per-token scale would otherwise smear.
+        cb = os.environ.get("QLUT_BIN_CODEBOOKS", "nf2")
+        return VariantConfig(
+            name="qlutattn_pertoken", use_kitty=True, k_codebook="qlut",
+            bin_codebooks=(cb,), n_bins=1, vbits=4, promote_ratio=0.0,
+            channel_selection=0, k_quant_mode="per_token")
     if variant == "kivi_2":
         return VariantConfig(name="kivi_2", use_kitty=True, sink_length=0, promote_ratio=0.0, channel_selection=0)
     if variant == "kivi_star_2":
@@ -274,6 +304,7 @@ def build_variant(args: Any) -> VariantConfig:
             promote_ratio=args.promote_ratio,
             promote_bit=args.promote_bit,
             channel_selection=args.channel_selection,
+            k_quant_mode=getattr(args, "k_quant_mode", "per_channel"),
         )
     raise ValueError(f"Unknown variant: {args.variant}")
 
@@ -293,6 +324,7 @@ def _cache_factory(config: VariantConfig):
             dict(config.promote_ratio_per_layer) if config.promote_ratio_per_layer else None
         ),
         channel_selection=config.channel_selection,
+        k_quant_mode=config.k_quant_mode,
         k_codebook=config.k_codebook,
         bin_codebooks=(list(config.bin_codebooks) if config.bin_codebooks else None),
         n_bins=config.n_bins,
@@ -387,6 +419,8 @@ def method_layout_slug(variant: VariantConfig | str) -> str:
         "kitty_pro": "kitty-pro",
         "kitty_k1v4": "kitty-k1v4",
         "kitty_k1v4_xhead": "kitty-k1v4-xhead",
+        "kitty_pertoken": "kitty-pertoken",
+        "qlutattn_pertoken": "qlutattn-pertoken",
         "fp16": "fp16",
         "kivi_2": "kivi-2",
         "kivi_star_2": "kivi-star-2",
@@ -530,6 +564,11 @@ def load_model_and_tokenizer(
             local_files_only=local_files_only,
         )
     model_obj.eval()
+    # If this is a QK-channel-reordered checkpoint (scripts/preprocess_qlutattn_model.py),
+    # re-apply RoPE inv_freq[pair_perm] (persistent=False, not saved). No-op otherwise.
+    from ..qk_reorder import apply_qk_reorder
+    if apply_qk_reorder(model_obj, resolved):
+        print(f"[qk-reorder] applied RoPE inv_freq permutation from {resolved}")
     return model_obj, tokenizer, resolved
 
 
