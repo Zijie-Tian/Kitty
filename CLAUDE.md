@@ -120,20 +120,25 @@ is pinned back to an older Transformers API.
 
 ## Kitty paper-style quantization defaults
 
-Use these settings for the paper-style `Kitty` variant unless the user asks for a different variant:
+The `kitty` variant fixes the Kitty machinery (magnitude channel-select
+`channel_selection=1` + `sink_length=32`, `buffer/group=128`) and makes the four
+bit/ratio knobs tunable via `KBITS` / `PROMOTE_BIT` / `PROMOTE_RATIO` / `VBITS`
+(or `--promote-ratio-config` / `PROMOTE_RATIO_CONFIG` for a per-layer ratio
+schedule). Defaults reproduce the paper-style Kitty:
 
 ```text
-sink_length=32
-buffer_length=128
-group_size=128
-kbits=2
-vbits=2
-promote_bit=4
-promote_ratio=0.125
-channel_selection=1  # magnitude-based Key-channel selection
+kbits=2              # KBITS       — K base bit
+promote_bit=4        # PROMOTE_BIT — bit of the magnitude-boosted K channels
+promote_ratio=0.125  # PROMOTE_RATIO — boosted-channel fraction
+vbits=2              # VBITS       — V bit
+sink_length=32, buffer_length=128, group_size=128, channel_selection=1   # fixed
 ```
 
-Use `promote_ratio=0.25` only for an intentional Kitty-Pro run.
+The output slug encodes all four: `kitty-k{kbits}b{promote_bit}v{vbits}-pr{ratio}`
+(default → `kitty-k2b4v2-pr0p125`). This single parametric `kitty` **subsumes the
+removed `kitty_pro`** (`PROMOTE_RATIO=0.25` → `kitty-k2b4v2-pr0p25`) **and
+`kitty_k1v4`** (`KBITS=1 PROMOTE_BIT=2 VBITS=4 PROMOTE_RATIO=0.25` →
+`kitty-k1b2v4-pr0p25`).
 
 ## GSM8K LLaMA3.1-8B-Instruct GPU1 reproduction
 
@@ -225,9 +230,7 @@ datasets across GPUs, use a single target, e.g. `run_exp.sh llama32 --gpus 0,1,2
 
 | Variant | Method slug | What it is |
 | --- | --- | --- |
-| `kitty` | `kitty` | Paper-style 2-bit Kitty, 128-token pages (sim fake-quant). |
-| `kitty_pro` | `kitty-pro` | Kitty with `promote_ratio=0.25`. |
-| `kitty_k1v4` | `kitty-k1v4` | K1V4 low-bit-K research config: 1-bit K base + 2-bit magnitude channel boost, V per-token **4-bit**. Boost fraction defaults to `promote_ratio=0.25`; override it (globally or per layer) via `--promote-ratio-config` / `PROMOTE_RATIO_CONFIG`. |
+| `kitty` | `kitty-k{kbits}b{promote_bit}v{vbits}-pr{ratio}` | Kitty machinery (magnitude channel-select + sink=32) with tunable K base (`KBITS`), boost bit (`PROMOTE_BIT`), boost fraction (`PROMOTE_RATIO`, or `--promote-ratio-config` for per-layer), V (`VBITS`). Defaults = paper Kitty (k2/b4/v2/pr0.125 → `kitty-k2b4v2-pr0p125`). Subsumes the removed `kitty_pro` (`PROMOTE_RATIO=0.25`) and `kitty_k1v4` (`KBITS=1 PROMOTE_BIT=2 VBITS=4 PROMOTE_RATIO=0.25`). |
 | `qlutattn_k1v4` | `qlutattn-k1v4` | σ²-binned mixed-codebook K quant (sim fake-quant). Per-layer channels are binned by residual σ²; low-σ² bins use cheap codebooks (sign), high-σ² bins use richer ones (nf2). Winner `["sign","sign","sign","tern","nf2","nf2"]` ≈ K **1.68 bit**, V per-token 4-bit. See `docs/qlutattn_k1v4.md`. |
 | `qlutattn_k184v4` | `qlutattn-k184v4` | Uniform-tern K (all channels tern) + V per-token 4-bit, K ≈ 1.84 bit — the iso-tern baseline `qlutattn-k1v4` is compared against. |
 | `qlutattn_pertoken` | `qlutattn-pertoken` | Per-token K quant (head_dim-axis grouping), single codebook (`QLUT_BIN_CODEBOOKS`, default `nf2`), V per-token 4-bit. |
@@ -237,8 +240,8 @@ datasets across GPUs, use a single target, e.g. `run_exp.sh llama32 --gpus 0,1,2
 | `shadowkv` | `shadowkv` | ShadowKV pure-torch sim (accuracy proxy; no memory/speed savings). |
 | `custom` | `custom-kitty` | Custom Kitty config. |
 
-The `fp16`, `kivi`, and `kivi_star` baselines keep dense fp16 KV, so they do
-not save KV memory; only `kitty` actually compresses the cache.
+All LongBench variants here run on the pure-torch sim fake-quant path (accuracy
+proxy, no real KV-memory savings); `fp16`/`kivi`/`kivi_star` keep dense fp16 KV.
 
 ### KIVI K/V bit-width sweep (variants `kivi` / `kivi_star`)
 
@@ -324,14 +327,14 @@ GPU1-only rule): replace `--gpu 0` with `--gpus 0,1,3`. A fast offline overlap p
 for policy search (no LongBench) lives in `scripts/build_kq_cache.py` +
 `scripts/eval_qlut_policy.py` (see `docs/qlutattn_k1v4.md` §5b).
 
-The old fixed-ratio low-bit-K variants (`kitty_k1v2`, `kitty_k1v2_pr50/75`,
-`kitty_k1v4_pr50/75`) were REMOVED: the boost fraction is now supplied
-externally via `--promote-ratio-config` (a `{"default": r}` JSON reproduces any
-old fixed-pr run), and the K1V2 (V 2-bit) family was superseded by K1V4. When
-sweeping several ratios of the SAME variant, set `LLAMA32_MODEL_SLUG` (or the
-target's `<T>_MODEL_SLUG`) to encode the ratio in the output dir — the method
-slug alone does not, and resume/skip only counts rows, so two ratios sharing a
-dir would silently mix.
+The old low-bit-K variants (`kitty_k1v2*`, `kitty_k1v4*`, `kitty_pro`) were
+REMOVED and folded into the parametric `kitty`: K base / boost bit / V are
+`KBITS`/`PROMOTE_BIT`/`VBITS`, and the boost fraction is `PROMOTE_RATIO` (or
+`--promote-ratio-config` for a per-layer schedule). The slug now encodes
+`pr{ratio}`, so different scalar ratios auto-split into separate dirs (no
+`LLAMA32_MODEL_SLUG` needed). Only a per-layer *schedule* still needs
+`LLAMA32_MODEL_SLUG` to disambiguate, since the slug's `pr` reflects only the
+default ratio, not the full schedule.
 
 **Environment overrides.**
 
@@ -372,7 +375,7 @@ QWEN_MODEL_PATH=/path/to/Qwen3-4B-Instruct-2507 \
 QWEN_MODEL_SLUG=qwen3-4b-instruct-2507 \
 QWEN_MAX_GEN=512 MAX_MODEL_LEN=32768 \
 bash scripts/run_exp.sh qwen --gpus 0,1,2 --variant kitty
-# -> longbench_out/qwen3-4b-instruct-2507_kitty/{pred,logs}
+# -> longbench_out/qwen3-4b-instruct-2507_kitty-k2b4v2-pr0p125/{pred,logs}
 ```
 
 Two non-overlapping GPU groups run different variants at once (distinct output
@@ -400,7 +403,7 @@ bash scripts/run_exp.sh qwen --gpus 3,4,5 --variant kivi
   `logs/` holds the per-dataset `report_<dataset>.json`.
 - `<model>` / `<method>` are the slugs from `src/kitty_sim/longbench/runner.py`
   (`model_layout_slug` / `method_layout_slug`) joined by an underscore, e.g.
-  `llama31-8b-instruct_kitty`, `qwen3-8b_qlutattn-k1v4`.
+  `llama31-8b-instruct_kitty-k2b4v2-pr0p125`, `qwen3-8b_qlutattn-k1v4`.
 
 Unless a task explicitly asks for a shorter smoke/proxy run, full LongBench runs
 must use `MAX_MODEL_LEN=32768` (32k context) and the per-target generation
@@ -434,7 +437,7 @@ Full paper-style Kitty LongBench on GPU1 for LLaMA3.1-8B-Instruct:
 
 ```bash
 bash scripts/run_exp.sh llama --gpu 1
-# -> longbench_out/llama31-8b-instruct_kitty/{pred,logs}
+# -> longbench_out/llama31-8b-instruct_kitty-k2b4v2-pr0p125/{pred,logs}
 ```
 
 Smoke example (LLaMA3.2-1B, 2 samples each, GPU1; llama32 defaults to fp16):
@@ -573,7 +576,7 @@ buffer_length=128, group_size=128, channel_selection=1`.
 | Family | V cache | How to run |
 | --- | --- | --- |
 | **K1V2** | per-token **2-bit** | REMOVED from code (results below retained for reference). |
-| **K1V4** | per-token **4-bit** | `--variant kitty_k1v4` + `PROMOTE_RATIO_CONFIG` JSON (`{"default": r}` for a flat ratio, per-layer form for schedules). |
+| **K1V4** | per-token **4-bit** | `KBITS=1 PROMOTE_BIT=2 VBITS=4 PROMOTE_RATIO=<r> --variant kitty` (flat ratio); per-layer schedule via `PROMOTE_RATIO_CONFIG` JSON. |
 
 All of these run on the pure-torch sim fake-quant path (`kitty_sim`), so they are
 an **accuracy proxy only and save no KV memory** — the real Triton kernel
@@ -623,25 +626,25 @@ Canonical GPU1 single-card form; model path resolves via
 output dir via `LLAMA32_MODEL_SLUG` (e.g. `llama32-1b-instruct-pr625`):
 
 ```bash
-# smoke (2 samples/dataset)
+# smoke (2 samples/dataset): K1V4 with a flat boost ratio = the old kitty_k1v4
 cd /home/zijie/Code/Kitty
-printf '{"default": 0.5}' > configs/pr50.json
+KBITS=1 PROMOTE_BIT=2 VBITS=4 PROMOTE_RATIO=0.5 \
 LLAMA32_MODEL_PATH=/path/to/Llama-3.2-1B-Instruct \
-PROMOTE_RATIO_CONFIG=$PWD/configs/pr50.json \
 MAX_MODEL_LEN=32768 LLAMA32_MAX_GEN=256 \
-bash scripts/run_exp.sh llama32 --gpu 1 --variant kitty_k1v4 --max-samples 2
-# -> longbench_out/smoke/llama32-1b-instruct_kitty-k1v4/{pred,logs}
+bash scripts/run_exp.sh llama32 --gpu 1 --variant kitty --max-samples 2
+# -> longbench_out/smoke/llama32-1b-instruct_kitty-k1b2v4-pr0p5/{pred,logs}
 ```
 
 ```bash
-# full (all 21 datasets, 32k context)
+# full (all 21 datasets, 32k context). Per-layer schedule instead of a flat
+# ratio: drop PROMOTE_RATIO and pass PROMOTE_RATIO_CONFIG=$PWD/configs/sched.json
+# (+ LLAMA32_MODEL_SLUG to keep different schedules in separate dirs).
 cd /home/zijie/Code/Kitty
-printf '{"default": 0.5}' > configs/pr50.json
+KBITS=1 PROMOTE_BIT=2 VBITS=4 PROMOTE_RATIO=0.5 \
 LLAMA32_MODEL_PATH=/path/to/Llama-3.2-1B-Instruct \
-PROMOTE_RATIO_CONFIG=$PWD/configs/pr50.json \
 MAX_MODEL_LEN=32768 LLAMA32_MAX_GEN=256 \
-bash scripts/run_exp.sh llama32 --gpu 1 --variant kitty_k1v4
-# -> longbench_out/llama32-1b-instruct_kitty-k1v4/{pred,logs}
+bash scripts/run_exp.sh llama32 --gpu 1 --variant kitty
+# -> longbench_out/llama32-1b-instruct_kitty-k1b2v4-pr0p5/{pred,logs}
 ```
 
 Set `PROMOTE_RATIO_CONFIG` to apply a per-layer ratio schedule — an arm launched

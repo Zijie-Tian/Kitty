@@ -7,12 +7,12 @@ def update_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.add_argument("--group_size",         type=int, default=128,      help="Group size")
     parser.add_argument("--kbits",              type=int, default=2,        help="Number of bits for K Cache")
     parser.add_argument("--vbits",              type=int, default=2,        help="Number of bits for V Cache")
-    parser.add_argument("--promote_ratio",      type=float, default=0.0,    help="Keep ratio (fp16) for mixed-precision K cache, default=0.0")
+    parser.add_argument("--promote_ratio",      type=float, default=None,   help="K boost fraction for mixed-precision K (kitty/custom). Unset lets the variant pick its default: kitty 0.125, custom 0.0")
     parser.add_argument("--promote_bit",        type=int, default=4,        help="Promote bit for K cache, default=4")
     parser.add_argument("--channel_selection",  type=int, default=1,        choices=[-1, 0, 1, 2, 3], help="Channel selection method: 0 for Random, 1 for Magnitude, 2 for Variance, 3 for Cross-head Magnitude (layer-global budget)")
     parser.add_argument("--k_quant_mode",       type=str, default="per_channel", choices=["per_channel", "per_token"], help="K-cache quant orientation (variant=custom): per_channel = KIVI-style token-axis groups; per_token = K quantized like V along head_dim, no promote")
     parser.add_argument("--promote-ratio-config", dest="promote_ratio_config", default=None,
-                        help="Path to a JSON per-layer promote_ratio schedule (kitty_k1v4 only): "
+                        help="Path to a JSON per-layer promote_ratio schedule (kitty only): "
                              "{\"default\": r, \"layers\": {idx: r}} or a bare [r0, r1, ...] list.")
     return parser
 

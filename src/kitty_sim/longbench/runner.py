@@ -53,7 +53,7 @@ class VariantConfig:
     sparse_budget: int = 2048
     rank: int = 160
     chunk_size: int = 8
-    # Per-layer promote_ratio override (kitty_k1v4 only): a tuple of
+    # Per-layer promote_ratio override (kitty only): a tuple of
     # (layer_idx, ratio) pairs -- hashable (frozen dataclass safe) and
     # asdict-friendly. None => scalar promote_ratio for every layer.
     # promote_ratio_config_path keeps the source JSON path for provenance.
@@ -133,15 +133,44 @@ def _load_promote_ratio_config(
 def build_variant(args: Any) -> VariantConfig:
     variant = args.variant.lower()
     config_path = getattr(args, "promote_ratio_config", None)
-    if config_path and variant != "kitty_k1v4":
+    if config_path and variant != "kitty":
         raise ValueError(
-            "--promote-ratio-config is only supported for --variant kitty_k1v4; "
+            "--promote-ratio-config is only supported for --variant kitty; "
             f"got '{variant}'."
         )
     if variant == "fp16":
         return VariantConfig(name="fp16", use_kitty=False, promote_ratio=0.0)
     if variant == "kitty":
-        return VariantConfig(name="kitty", use_kitty=True, promote_ratio=0.125)
+        # Paper-style Kitty machinery (magnitude channel-select + sink=32),
+        # generalized so K base (kbits), boost (promote_bit), boost fraction
+        # (promote_ratio) and V (vbits) are all tunable. Defaults reproduce the
+        # paper Kitty (k2 / boost4 / pr0.125 / v2). promote_ratio is per-layer
+        # when --promote-ratio-config is given (JSON {"default": r, "layers": {..}}
+        # or a bare [r0, r1, ...]); else the scalar --promote_ratio (default
+        # 0.125) applies to every layer. Subsumes the old kitty_pro (pr=0.25) and
+        # kitty_k1v4 (k1 / boost2 / v4 / pr0.25).
+        kb = int(getattr(args, "kbits", 2))
+        vb = int(getattr(args, "vbits", 2))
+        pbit = int(getattr(args, "promote_bit", 4))
+        if not (1 <= kb <= 16 and 1 <= vb <= 16 and 1 <= pbit <= 16):
+            raise ValueError(
+                f"kitty kbits/vbits/promote_bit must be in [1, 16]; "
+                f"got kbits={kb}, vbits={vb}, promote_bit={pbit}.")
+        default_ratio = 0.125
+        per_layer = None
+        if config_path:
+            default_ratio, per_layer = _load_promote_ratio_config(config_path, default_ratio)
+        else:
+            pr = getattr(args, "promote_ratio", None)
+            if pr is not None:
+                default_ratio = float(pr)
+        return VariantConfig(
+            name="kitty", use_kitty=True,
+            kbits=kb, vbits=vb, promote_bit=pbit, promote_ratio=default_ratio,
+            channel_selection=1, sink_length=32, buffer_length=128, group_size=128,
+            promote_ratio_per_layer=per_layer,
+            promote_ratio_config_path=config_path,
+        )
     if variant == "shadowkv":
         # Faithful pure-torch port of ShadowKV's accuracy cache (SVD low-rank
         # pre-RoPE keys + landmark chunk selection). Accuracy proxy, not a
@@ -157,26 +186,6 @@ def build_variant(args: Any) -> VariantConfig:
             sparse_budget=budget,
             rank=rank,
             chunk_size=chunk,
-        )
-    if variant == "kitty_pro":
-        return VariantConfig(name="kitty_pro", use_kitty=True, promote_ratio=0.25)
-    if variant == "kitty_k1v4":
-        # Low-bit K (1-bit base + 2-bit magnitude channel boost), V relaxed to
-        # 4-bit. The K boost fraction (promote_ratio) is PER-LAYER when
-        # --promote-ratio-config is supplied: a JSON object
-        # {"default": r, "layers": {idx: r}} or a bare list [r0, r1, ...].
-        # Without a config, the scalar default below applies to every layer.
-        default_ratio = 0.25
-        per_layer = None
-        if config_path:
-            default_ratio, per_layer = _load_promote_ratio_config(config_path, default_ratio)
-        return VariantConfig(
-            name="kitty_k1v4", use_kitty=True,
-            kbits=1, vbits=4, promote_bit=2, promote_ratio=default_ratio,
-            sink_length=32, buffer_length=128, group_size=128,
-            channel_selection=1,
-            promote_ratio_per_layer=per_layer,
-            promote_ratio_config_path=config_path,
         )
     if variant in ("qlutattn_k1v4", "qlutattn-k1v4"):
         # QLUT-Attn k1v4 winner: per-layer sigma^2-binned K codebooks (6 bins,
@@ -231,7 +240,7 @@ def build_variant(args: Any) -> VariantConfig:
             group_size=args.group_size,
             kbits=args.kbits,
             vbits=args.vbits,
-            promote_ratio=args.promote_ratio,
+            promote_ratio=(args.promote_ratio if getattr(args, "promote_ratio", None) is not None else 0.0),
             promote_bit=args.promote_bit,
             channel_selection=args.channel_selection,
             k_quant_mode=getattr(args, "k_quant_mode", "per_channel"),
@@ -324,10 +333,14 @@ def method_layout_slug(variant: VariantConfig | str) -> str:
         if isinstance(variant, VariantConfig):
             return f"{base}-k{variant.kbits}v{variant.vbits}"
         return base  # str fallback: no bit info available
+    # kitty encodes K base / boost / V / ratio into the slug (subsumes the old
+    # kitty / kitty_pro / kitty_k1v4), e.g. kitty-k2b4v2-pr0p125.
+    if name == "kitty":
+        if isinstance(variant, VariantConfig):
+            pr = str(variant.promote_ratio).replace(".", "p")
+            return f"kitty-k{variant.kbits}b{variant.promote_bit}v{variant.vbits}-pr{pr}"
+        return "kitty"  # str fallback: no bit info available
     return {
-        "kitty": "kitty",
-        "kitty_pro": "kitty-pro",
-        "kitty_k1v4": "kitty-k1v4",
         "qlutattn_pertoken": "qlutattn-pertoken",
         "fp16": "fp16",
         "custom": "custom-kitty",

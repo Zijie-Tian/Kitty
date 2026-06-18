@@ -120,227 +120,25 @@ is pinned back to an older Transformers API.
 
 ## Kitty paper-style quantization defaults
 
-Use these settings for the paper-style `Kitty` variant unless the user asks for a different variant:
+The `kitty` variant fixes the Kitty machinery (magnitude channel-select
+`channel_selection=1` + `sink_length=32`, `buffer/group=128`) and makes the four
+bit/ratio knobs tunable via `KBITS` / `PROMOTE_BIT` / `PROMOTE_RATIO` / `VBITS`
+(or `--promote-ratio-config` / `PROMOTE_RATIO_CONFIG` for a per-layer ratio
+schedule). Defaults reproduce the paper-style Kitty:
 
 ```text
-sink_length=32
-buffer_length=128
-group_size=128
-kbits=2
-vbits=2
-promote_bit=4
-promote_ratio=0.125
-channel_selection=1  # magnitude-based Key-channel selection
+kbits=2              # KBITS       — K base bit
+promote_bit=4        # PROMOTE_BIT — bit of the magnitude-boosted K channels
+promote_ratio=0.125  # PROMOTE_RATIO — boosted-channel fraction
+vbits=2              # VBITS       — V bit
+sink_length=32, buffer_length=128, group_size=128, channel_selection=1   # fixed
 ```
 
-Use `promote_ratio=0.25` only for an intentional Kitty-Pro run.
-
-## Kitty page16 experiment configuration
-
-Keep paper-style Kitty defaults at 128-token pages unless the task explicitly
-asks for the QUEST-aligned page16 experiment. Page16 is opt-in and should be
-reported as an experimental variant, not as the default Kitty setting.
-
-Real Triton Kitty path:
-
-```python
-from kitty.kvcache import get_kvcache_kitty
-
-kv_cache = get_kvcache_kitty(
-    config,
-    max_batch_size=max_batch_size,
-    max_length=max_length,
-    page_size=16,
-)
-```
-
-Latency benchmark path:
-
-```bash
-CUDA_VISIBLE_DEVICES=1 PYTHONPATH=src python latency_benchmarking/benchmark_kitty.py \
-  --cache_implementation 0 \
-  --page_size 16 \
-  --max_seq_len 4096 \
-  --batch_size 1 \
-  --warmup_runs 1 \
-  --repeat_runs 2
-```
-
-LongBench QUEST accuracy proxy (sole entry point is `scripts/run_exp.sh`;
-a smoke run uses `--max-samples N`, a full run omits it):
-
-```bash
-bash scripts/run_exp.sh llama32 --gpu 1 --max-samples 2   # default variant: quest_kitty_page16_sim
-```
-
-The temporary `kitty_page16` / `quest_proxy_kitty_page16` fake-quant proxy
-(dense KV quant, NO query-aware selection) has been REMOVED. There are now two
-QUEST variants, both genuinely query-aware:
-
-- `quest_kitty_page16_sim`: pure-PyTorch (no-Triton) QUEST + Kitty. The sim
-  `KittyKVCache` applies page16 fake-quant (`sink=32`, `buffer=16`, `group=16`)
-  and a per-arch attention hook (`kitty_sim/sim_quest.py`) runs the gather-based
-  QUEST oracle (`kitty_sim/quest_sparse.py`) on decode (budget 2048 -> 128
-  pages). Architecture-portable accuracy + relative-timing proxy; it does NOT
-  save KV memory and is not a kernel-speed proof. Verify it is real QUEST (not
-  pure Kitty) by comparing 16k vs 128k decode ms/token: sim QUEST stays
-  near-flat (bounded to budget) while pure dense Kitty grows with context.
-- `quest_kitty_page16_kernel`: the real Triton kernel path (below), Llama/Qwen
-  only, the genuine speed proof.
-
-## True QUEST + Kitty page16 kernel usage
-
-The true QUEST + Kitty kernel path is the real Qwen3/Llama Kitty decode path with
-16-token pages, query-aware page selection, and Triton sparse QK/SV kernels. It is
-not the same as the `quest_kitty_page16_sim` pure-torch proxy.
-
-Naming rules:
-
-- `quest_kitty_page16_sim` is the pure-PyTorch QUEST accuracy/relative-timing
-  proxy. It performs real query-aware selection but on a dense gather (no Triton);
-  do not use it for kernel-speed claims.
-- A real `quest+kitty` / `quest_kitty_page16_kernel` result must show
-  `last_quest_path` values like `triton_sparse_reduced_budget` or
-  `triton_sparse_forced_all_pages`.
-- `python_sparse_debug` is an internal correctness/debug path only and does not
-  count as true QUEST kernel evidence.
-
-Default true QUEST settings:
-
-```text
-page_size=16
-promote_ratio=0.125
-quest_enabled=True
-quest_token_budget=2048  # default when no explicit QUEST budget is supplied
-quest_skip_layers=0      # default: every decode layer uses QUEST sparse selection
-```
-
-`quest_skip_layers=0` is the current default: all decode layers use query-aware
-QUEST page selection. Older builds defaulted to `2` (the QUEST-paper convention
-of keeping the first two layers dense). The skip fallback is still available via
-`--quest-skip-layers N` / `quest_skip_layers=N`, but each skipped layer runs
-dense full attention with an O(context) cost, and the fallback has not been
-accuracy-validated in this repo.
-
-QUEST budget rule: always set the QUEST token budget explicitly to `2048` for
-QUEST + Kitty experiments and commands. Do not rely on an implicit default, do
-not substitute `MAX_GEN`/generation length for the QUEST budget, and do not use
-other QUEST budgets unless the user explicitly requests a budget sweep or a
-different budget. For CLI paths, pass the interface-specific equivalent such as
-`--quest-token-budget 2048` or `QUEST_BUDGET=2048` when that path supports true
-QUEST selection.
-
-Budget mapping for page16:
-
-| QUEST token budget | Selected logical pages |
-| ---: | ---: |
-| 512 | 32 |
-| 1024 | 64 |
-| 2048 | 128 |
-
-### GPU decode speed gate
-
-Use this command shape to prove the real QUEST + Kitty implementation on a
-32k input. It compares pure Kitty page16 against QUEST + Kitty page16 using
-only decode-token timing; prefill is excluded from the reported ms/token.
-
-Note: the benchmark loads the model with `attn_implementation="flash_attention_2"`,
-which is used only for prefill — decode runs the Triton Kitty kernel, so the
-reported decode ms/token is independent of the prefill backend. The documented
-`kitty` conda env does not ship `flash_attn`; either install it, or override the
-prefill backend to `sdpa` (decode numbers are unchanged).
-
-Default GPU1 command:
-
-```bash
-CUDA_VISIBLE_DEVICES=1 PYTHONPATH=src:. python latency_benchmarking/benchmark_kitty.py \
-  --model /mnt/data/tzj/models/Qwen3-8B \
-  --cache_implementation 0 \
-  --page_size 16 \
-  --promote_ratio 0.125 \
-  --max_seq_len 32768 \
-  --max_new_tokens 32 \
-  --batch_size 1 \
-  --warmup_runs 1 \
-  --repeat_runs 3 \
-  --compare-quest-kitty \
-  --quest-enabled \
-  --quest-token-budget 2048 \
-  --quest-skip-layers 0
-```
-
-Use GPU0 only when the user explicitly overrides the GPU1-only evaluation rule:
-
-```bash
-CUDA_VISIBLE_DEVICES=0 PYTHONPATH=src:. python latency_benchmarking/benchmark_kitty.py \
-  --model /mnt/data/tzj/models/Qwen3-8B \
-  --cache_implementation 0 \
-  --page_size 16 \
-  --promote_ratio 0.125 \
-  --max_seq_len 32768 \
-  --max_new_tokens 32 \
-  --batch_size 1 \
-  --warmup_runs 1 \
-  --repeat_runs 3 \
-  --compare-quest-kitty \
-  --quest-enabled \
-  --quest-token-budget 2048 \
-  --quest-skip-layers 0
-```
-
-Expected evidence in output:
-
-```text
-paths={'triton_sparse_reduced_budget': <eligible decode layer-steps>}
-selected_pages=128
-selected_tokens=2048
-decode_speedup=<pure Kitty page16 ms/token / QUEST+Kitty ms/token>
-```
-
-With `quest_skip_layers=0` there should be no `'dense'` skip-layer entries; a
-`'dense_full_budget'` entry only appears when the context has fewer logical
-pages than the budget (nothing to drop). A real implementation should be
-materially faster than pure Kitty page16 on a long decode (e.g. roughly 3x at
-16k and ~20x at 128k with budget 2048). If `decode_speedup` is unexpectedly low
-(e.g. `< 1.5` at 32k+), first suspect dense fallback, Python debug fallback,
-selector-side all-page dequantization, or unselected pages still being loaded by
-the sparse kernels.
-
-Recent local GPU0 sample evidence with Qwen3-8B, page16, `quest_token_budget=2048`,
-`quest_skip_layers=0`, `max_new_tokens=32`, `warmup_runs=1`, `repeat_runs=2`,
-decode-only ms/token across context lengths:
-
-| Context | QUEST ms/token | QUEST tok/s | Shared pages |
-| ---: | ---: | ---: | ---: |
-| 8k | 40.41 | 24.75 | ~509 |
-| 16k | 41.47 | 24.11 | ~1021 |
-| 32k | 42.84 | 23.34 | ~2045 |
-| 64k | 45.16 | 22.14 | ~4093 |
-| 96k | 47.15 | 21.21 | ~6141 |
-| 128k | 49.18 | 20.33 | ~8189 |
-
-With `quest_skip_layers=0` the decode cost is nearly flat in context length
-(linear fit roughly `40.3 ms + 0.07 ms per 1k context tokens`); the small
-residual is the O(context) page-selection scan over all logical pages, not the
-budget-bound sparse attention. For reference, pure Kitty page16 decode is about
-`139.5 ms/token` at 16k and about `1013 ms/token` at 128k, so QUEST+Kitty decode
-speedup grows with context (about 3.4x at 16k and about 20x at 128k).
-
-Treat these as environment-specific smoke numbers, not a formal benchmark.
-
-### GPU0-only correctness tests for true sparse kernels
-
-When a task explicitly says to restrict this QUEST + Kitty work to GPU0, use:
-
-```bash
-CUDA_VISIBLE_DEVICES=0 PYTHONPATH=src python -m unittest tests.test_kitty_quest_sparse -v
-```
-
-These tests require `CUDA_VISIBLE_DEVICES=0` and exactly one visible CUDA
-device. They assert true Triton sparse path labels, budget behavior, dense
-full-budget fallback behavior, and that `python_sparse_debug` is not accepted as
-real kernel evidence. The documented `kitty` conda env has no `pytest`, so use
-`unittest` (or run from an env that provides `pytest`).
+The output slug encodes all four: `kitty-k{kbits}b{promote_bit}v{vbits}-pr{ratio}`
+(default → `kitty-k2b4v2-pr0p125`). This single parametric `kitty` **subsumes the
+removed `kitty_pro`** (`PROMOTE_RATIO=0.25` → `kitty-k2b4v2-pr0p25`) **and
+`kitty_k1v4`** (`KBITS=1 PROMOTE_BIT=2 VBITS=4 PROMOTE_RATIO=0.25` →
+`kitty-k1b2v4-pr0p25`).
 
 ## GSM8K LLaMA3.1-8B-Instruct GPU1 reproduction
 
@@ -398,7 +196,7 @@ table). `qwen` is an alias of `qwen3`, `glm` of `glm4`, `llama32` of `llama3.2`.
 | Target | Default GPU | Model id | Family | Default variant | Default max-gen |
 | --- | ---: | --- | --- | --- | --- |
 | `llama` | 0 | meta-llama/Llama-3.1-8B-Instruct | llama3 | `kitty` | per-dataset |
-| `llama32` | 1 | meta-llama/Llama-3.2-1B-Instruct | llama3 | `quest_kitty_page16_sim` | 256 |
+| `llama32` | 1 | meta-llama/Llama-3.2-1B-Instruct | llama3 | `fp16` | 256 |
 | `qwen` | 1 | Qwen/Qwen3-8B | qwen | `kitty` | 2048 |
 | `glm` | 2 | THUDM/GLM-4-9B-Chat-1M | glm4 | `kitty` | per-dataset |
 | `deepseek` | 0 | deepseek-ai/DeepSeek-R1-Distill-Llama-8B | llama3 | `kitty` | 1024 |
@@ -432,36 +230,65 @@ datasets across GPUs, use a single target, e.g. `run_exp.sh llama32 --gpus 0,1,2
 
 | Variant | Method slug | What it is |
 | --- | --- | --- |
-| `kitty` | `kitty` | Paper-style 2-bit Kitty, 128-token pages (sim fake-quant). |
-| `kitty_pro` | `kitty-pro` | Kitty with `promote_ratio=0.25`. |
-| `kitty_k1v4` | `kitty-k1v4` | K1V4 low-bit-K research config: 1-bit K base + 2-bit magnitude channel boost, V per-token **4-bit**. Boost fraction defaults to `promote_ratio=0.25`; override it (globally or per layer) via `--promote-ratio-config` / `PROMOTE_RATIO_CONFIG`. |
-| `kitty_k1v4_xhead` | `kitty-k1v4-xhead` | `kitty_k1v4` with `channel_selection=3` (cross-head): the layer's promote budget (`nh * int(head_dim*pr)`, bit-identical to the uniform variant) is allocated jointly across all KV heads by magnitude topk, so per-head counts may differ. Measured: at FLAT ratios never better than uniform (worst at pr=0.5, −0.45), but paired with a sensitivity-aligned per-layer pr schedule it is the best 1.5-bit config (S1-X 18.39 vs flat-U 17.49; see low-bit-K section). |
-| `fp16` | `fp16` | Full-precision baseline — no Kitty cache, HF dense fp16 KV. |
-| `kivi_2` | `kivi-2` | KIVI-2 baseline (sim fake-quant; no promote, no channel-select, no sink). |
-| `kivi_star_2` | `kivi-star-2` | KIVI*-2 — same as `kivi_2` but `sink_length=32`. |
-| `quest_kitty_page16_sim` | `quest-kitty-sim` | Pure-torch QUEST+Kitty page16 accuracy proxy (real query-aware selection, no Triton, any arch). |
-| `quest_kitty_page16_kernel` | `quest-kitty-kernel` | Real Triton QUEST+Kitty page16 sparse decode (speed proof; Llama/Qwen/GLM). |
-| `custom` | `custom-kitty` | Custom Kitty config. |
+| `kitty` | `kitty-k{kbits}b{promote_bit}v{vbits}-pr{ratio}` | Kitty machinery (magnitude channel-select + sink=32) with tunable K base (`KBITS`), boost bit (`PROMOTE_BIT`), boost fraction (`PROMOTE_RATIO`, or `--promote-ratio-config` for per-layer), V (`VBITS`). Defaults = paper Kitty (k2/b4/v2/pr0.125 → `kitty-k2b4v2-pr0p125`). Subsumes the removed `kitty_pro` (`PROMOTE_RATIO=0.25`) and `kitty_k1v4` (`KBITS=1 PROMOTE_BIT=2 VBITS=4 PROMOTE_RATIO=0.25`). |
 | `qlutattn_k1v4` | `qlutattn-k1v4` | σ²-binned mixed-codebook K quant (sim fake-quant). Per-layer channels are binned by residual σ²; low-σ² bins use cheap codebooks (sign), high-σ² bins use richer ones (nf2). Winner `["sign","sign","sign","tern","nf2","nf2"]` ≈ K **1.68 bit**, V per-token 4-bit. See `docs/qlutattn_k1v4.md`. |
-| `tern_uniform` | `tern-uniform` | Uniform-tern K (all channels tern) + V 4-bit, K ≈ 1.83 bit — the iso-tern baseline `qlutattn-k1v4` is compared against. |
+| `qlutattn_k184v4` | `qlutattn-k184v4` | Uniform-tern K (all channels tern) + V per-token 4-bit, K ≈ 1.84 bit — the iso-tern baseline `qlutattn-k1v4` is compared against. |
+| `qlutattn_pertoken` | `qlutattn-pertoken` | Per-token K quant (head_dim-axis grouping), single codebook (`QLUT_BIN_CODEBOOKS`, default `nf2`), V per-token 4-bit. |
+| `fp16` | `fp16` | Full-precision baseline — no Kitty cache, HF dense fp16 KV. |
+| `kivi` | `kivi-k{kbits}v{vbits}` | KIVI-style uniform quant (no promote, no channel-select, no sink). K/V bit-width is set via `KBITS`/`VBITS` (default 2/2 = the old `kivi_2`); the slug encodes the bits so each combo gets its own dir (e.g. `kivi-k2v4`). |
+| `kivi_star` | `kivi-star-k{kbits}v{vbits}` | Same as `kivi` but `sink_length=32` (the old `kivi_star_2`). |
+| `shadowkv` | `shadowkv` | ShadowKV pure-torch sim (accuracy proxy; no memory/speed savings). |
+| `custom` | `custom-kitty` | Custom Kitty config. |
 
-The `fp16`, `kivi_2`, and `kivi_star_2` baselines keep dense fp16 KV, so they do
-not save KV memory; only `kitty` / `*_kernel` actually compress the cache.
+All LongBench variants here run on the pure-torch sim fake-quant path (accuracy
+proxy, no real KV-memory savings); `fp16`/`kivi`/`kivi_star` keep dense fp16 KV.
 
-### QLUT-Attn k1v4 (σ²-binned K) test (variants `qlutattn-k1v4` / `tern_uniform`)
+### KIVI K/V bit-width sweep (variants `kivi` / `kivi_star`)
+
+`kivi` (no sink) and `kivi_star` (sink=32) are KIVI-style uniform quant (no
+promote, no channel-select); the **K and V bit-widths are free**, set via
+`KBITS` / `VBITS` (default 2/2 = the old `kivi_2` / `kivi_star_2`). The output
+slug encodes the bits (`kivi-k{KBITS}v{VBITS}`), so different combinations never
+collide and no `LLAMA32_MODEL_SLUG` is needed. `KBITS`/`VBITS` accept 1–16
+(≥16 = no quant).
+
+Smoke one combo (2 samples, long-context datasets):
+
+```bash
+KBITS=2 VBITS=4 \
+LLAMA32_MODEL_PATH=/home/zijie/models/Llama-3.2-1B-Instruct \
+MAX_MODEL_LEN=32768 LLAMA32_MAX_GEN=256 DATASETS_CSV=multifieldqa_en,hotpotqa \
+bash scripts/run_exp.sh llama32 --gpu 1 --variant kivi --max-samples 2
+# -> longbench_out/smoke/llama32-1b-instruct_kivi-k2v4/{pred,logs}
+```
+
+Full K×V sweep (all 21 datasets, 32k):
+
+```bash
+for kb in 1 2 4; do for vb in 2 4; do
+  KBITS=$kb VBITS=$vb \
+  LLAMA32_MODEL_PATH=/home/zijie/models/Llama-3.2-1B-Instruct \
+  MAX_MODEL_LEN=32768 LLAMA32_MAX_GEN=256 \
+  bash scripts/run_exp.sh llama32 --gpu 1 --variant kivi
+  # -> longbench_out/llama32-1b-instruct_kivi-k${kb}v${vb}/{pred,logs}
+done; done
+# kivi_star (sink=32): same loop with --variant kivi_star -> ..._kivi-star-k{kb}v{vb}
+```
+
+### QLUT-Attn k1v4 (σ²-binned K) test (variants `qlutattn-k1v4` / `qlutattn_k184v4`)
 
 `qlutattn-k1v4` is a per-channel mixed-codebook K quant: channels are binned by residual σ²
 and given different codebooks (low σ² → cheap `sign`, high σ² → richer `nf2`), so the
-average K bit-width (≈1.68) drops below uniform tern (≈1.83) while accuracy is kept
+average K bit-width (≈1.68) drops below uniform tern (≈1.84) while accuracy is kept
 or improved. Full design + usage: `docs/qlutattn_k1v4.md`. The matched baseline is
-`tern_uniform` (uniform tern K, ≈1.83 bit); `fp16` is the ceiling. V is per-token
+`qlutattn_k184v4` (uniform tern K, ≈1.84 bit); `fp16` is the ceiling. V is per-token
 4-bit for both quantized variants. Override the policy without code edits via
 `QLUT_BIN_CODEBOOKS=sign,sign,sign,tern,nf2,nf2`.
 
 Validated on full LongBench (21 datasets, 32k); full test guide + per-dataset results:
 `docs/qlutattn_k1v4_testing.md`. Mean over 21:
 
-| model | fp16 | tern_uniform (1.83b) | qlutattn-k1v4 (1.68b) | k1v4 retains |
+| model | fp16 | qlutattn_k184v4 (1.84b) | qlutattn-k1v4 (1.68b) | k1v4 retains |
 | --- | ---: | ---: | ---: | ---: |
 | Llama-3.2-1B | 27.59 | 22.96 | 24.88 | 90.2% |
 | Llama-3.2-3B | 36.33 | 30.72 | 34.28 | 94.4% |
@@ -489,7 +316,7 @@ MAX_MODEL_LEN=32768 LLAMA32_MAX_GEN=256 \
 bash scripts/run_exp.sh llama32 --gpu 0 --variant qlutattn_k1v4         # -> longbench_out/llama32-1b-instruct_qlutattn-k1v4
 LLAMA32_MODEL_PATH=/mnt/data/tzj/models/Llama-3.2-1B-Instruct \
 MAX_MODEL_LEN=32768 LLAMA32_MAX_GEN=256 \
-bash scripts/run_exp.sh llama32 --gpu 0 --variant tern_uniform  # -> longbench_out/llama32-1b-instruct_tern-uniform
+bash scripts/run_exp.sh llama32 --gpu 0 --variant qlutattn_k184v4  # -> longbench_out/llama32-1b-instruct_qlutattn-k184v4
 LLAMA32_MODEL_PATH=/mnt/data/tzj/models/Llama-3.2-1B-Instruct \
 MAX_MODEL_LEN=32768 LLAMA32_MAX_GEN=256 \
 bash scripts/run_exp.sh llama32 --gpu 0 --variant fp16          # -> longbench_out/llama32-1b-instruct_fp16
@@ -500,14 +327,14 @@ GPU1-only rule): replace `--gpu 0` with `--gpus 0,1,3`. A fast offline overlap p
 for policy search (no LongBench) lives in `scripts/build_kq_cache.py` +
 `scripts/eval_qlut_policy.py` (see `docs/qlutattn_k1v4.md` §5b).
 
-The old fixed-ratio low-bit-K variants (`kitty_k1v2`, `kitty_k1v2_pr50/75`,
-`kitty_k1v4_pr50/75`) were REMOVED: the boost fraction is now supplied
-externally via `--promote-ratio-config` (a `{"default": r}` JSON reproduces any
-old fixed-pr run), and the K1V2 (V 2-bit) family was superseded by K1V4. When
-sweeping several ratios of the SAME variant, set `LLAMA32_MODEL_SLUG` (or the
-target's `<T>_MODEL_SLUG`) to encode the ratio in the output dir — the method
-slug alone does not, and resume/skip only counts rows, so two ratios sharing a
-dir would silently mix.
+The old low-bit-K variants (`kitty_k1v2*`, `kitty_k1v4*`, `kitty_pro`) were
+REMOVED and folded into the parametric `kitty`: K base / boost bit / V are
+`KBITS`/`PROMOTE_BIT`/`VBITS`, and the boost fraction is `PROMOTE_RATIO` (or
+`--promote-ratio-config` for a per-layer schedule). The slug now encodes
+`pr{ratio}`, so different scalar ratios auto-split into separate dirs (no
+`LLAMA32_MODEL_SLUG` needed). Only a per-layer *schedule* still needs
+`LLAMA32_MODEL_SLUG` to disambiguate, since the slug's `pr` reflects only the
+default ratio, not the full schedule.
 
 **Environment overrides.**
 
@@ -523,10 +350,6 @@ Run control:
 
 GPU selection (precedence `--gpus` > `--gpu` > `GPU_IDS_CSV` > per-target default):
 - `GPU_OVERRIDE` (= `--gpu`), `GPUS_OVERRIDE` (= `--gpus`), `GPU_IDS_CSV`.
-
-QUEST controls (only used by `quest_kitty_page16_kernel`; ignored by other variants):
-- `QUEST_BUDGET` (= `--quest-token-budget`, always `2048` for QUEST+Kitty),
-  `QUEST_SKIP_LAYERS` (= `--quest-skip-layers`, default `0`).
 
 Per-target overrides — `<T>` is one of `LLAMA`, `LLAMA32`, `QWEN`, `GLM`, `DEEPSEEK`:
 - `<T>_GPU`, `<T>_MODEL_ID`, `<T>_MODEL_PATH`, `<T>_MODEL_SLUG`, `<T>_MAX_GEN`, `<T>_DEFAULT_VARIANT`.
@@ -551,8 +374,8 @@ QWEN_MODEL_ID=Qwen/Qwen3-4B-Instruct-2507 \
 QWEN_MODEL_PATH=/path/to/Qwen3-4B-Instruct-2507 \
 QWEN_MODEL_SLUG=qwen3-4b-instruct-2507 \
 QWEN_MAX_GEN=512 MAX_MODEL_LEN=32768 \
-bash scripts/run_exp.sh qwen --gpus 0,1,2 --variant quest_kitty_page16_kernel
-# -> longbench_out/qwen3-4b-instruct-2507_quest-kitty-kernel/{pred,logs}
+bash scripts/run_exp.sh qwen --gpus 0,1,2 --variant kitty
+# -> longbench_out/qwen3-4b-instruct-2507_kitty-k2b4v2-pr0p125/{pred,logs}
 ```
 
 Two non-overlapping GPU groups run different variants at once (distinct output
@@ -564,10 +387,10 @@ QWEN_MODEL_ID=Qwen/Qwen3-4B-Instruct-2507 QWEN_MODEL_PATH=/path/to/Qwen3-4B-Inst
 QWEN_MODEL_SLUG=qwen3-4b-instruct-2507 QWEN_MAX_GEN=512 MAX_MODEL_LEN=32768 \
 bash scripts/run_exp.sh qwen --gpus 0,1,2 --variant fp16
 
-# terminal 2 — KIVI-2 baseline on GPUs 3,4,5
+# terminal 2 — KIVI baseline (K2V2) on GPUs 3,4,5
 QWEN_MODEL_ID=Qwen/Qwen3-4B-Instruct-2507 QWEN_MODEL_PATH=/path/to/Qwen3-4B-Instruct-2507 \
 QWEN_MODEL_SLUG=qwen3-4b-instruct-2507 QWEN_MAX_GEN=512 MAX_MODEL_LEN=32768 \
-bash scripts/run_exp.sh qwen --gpus 3,4,5 --variant kivi_2
+bash scripts/run_exp.sh qwen --gpus 3,4,5 --variant kivi
 ```
 
 ### Output layout
@@ -580,66 +403,48 @@ bash scripts/run_exp.sh qwen --gpus 3,4,5 --variant kivi_2
   `logs/` holds the per-dataset `report_<dataset>.json`.
 - `<model>` / `<method>` are the slugs from `src/kitty_sim/longbench/runner.py`
   (`model_layout_slug` / `method_layout_slug`) joined by an underscore, e.g.
-  `llama31-8b-instruct_kitty`, `qwen3-8b_quest-kitty`.
+  `llama31-8b-instruct_kitty-k2b4v2-pr0p125`, `qwen3-8b_qlutattn-k1v4`.
 
 Unless a task explicitly asks for a shorter smoke/proxy run, full LongBench runs
 must use `MAX_MODEL_LEN=32768` (32k context) and the per-target generation
 length. Use `--max-samples N` only for smoke runs. Do not use the old
 `MAX_MODEL_LEN=3500` default for full runs.
 
-LongBench command-answer rule: when the user asks for LongBench test commands, always provide both a smoke-test command and a full-test command. Both commands must be complete, directly runnable shell blocks with all relevant environment variables included; do not abbreviate with phrases like "change MAX_SAMPLES to -1" or omit paths, model tags, output dirs, report prefixes, GPU selection, variant, `MAX_MODEL_LEN`, `MAX_GEN`/runner-specific generation cap, or QUEST budget settings.
+LongBench command-answer rule: when the user asks for LongBench test commands, always provide both a smoke-test command and a full-test command. Both commands must be complete, directly runnable shell blocks with all relevant environment variables included; do not abbreviate with phrases like "change MAX_SAMPLES to -1" or omit paths, model tags, output dirs, report prefixes, GPU selection, variant, `MAX_MODEL_LEN`, and `MAX_GEN`/runner-specific generation cap.
 
-- The canonical QUEST + Kitty LongBench accuracy test is the pure-torch sim
-  variant `quest_kitty_page16_sim` (real query-aware page selection on Kitty
-  fake-quant, architecture-portable, no Triton). When asked for "QUEST + Kitty"
-  LongBench test commands, default to this variant and provide both smoke and
-  full forms. The real Triton variant `quest_kitty_page16_kernel` is the
-  latency/speed proof only (Llama/Qwen) and need not be the default test command.
-- For any QUEST + Kitty LongBench/runtime path, the QUEST budget must be
-  explicitly fixed at `2048` tokens (`QUEST_BUDGET=2048` or
-  `--quest-token-budget 2048`, depending on the runner). The `MAX_GEN=256`
-  generation cap is separate and must not be confused with the QUEST budget.
-
-Canonical QUEST + Kitty LongBench test commands (sim variant, Llama-3.2-1B; the
-`.env` here has no `KITTY_LLAMA32_1B_PATH`, so pass `LLAMA32_MODEL_PATH=`):
+Canonical LongBench test commands (Llama-3.2-1B; the `.env` here has no
+`KITTY_LLAMA32_1B_PATH`, so pass `LLAMA32_MODEL_PATH=`):
 
 ```bash
 # smoke (2 samples/dataset)
 cd /mnt/data/tzj/Code/Kitty
 LLAMA32_MODEL_PATH=/mnt/data/tzj/models/Llama-3.2-1B-Instruct \
-MAX_MODEL_LEN=32768 LLAMA32_MAX_GEN=256 QUEST_BUDGET=2048 QUEST_SKIP_LAYERS=0 \
-bash scripts/run_exp.sh llama32 --gpu 0 --variant quest_kitty_page16_sim --max-samples 2
-# -> longbench_out/smoke/llama32-1b-instruct_quest-kitty-sim/{pred,logs}
+MAX_MODEL_LEN=32768 LLAMA32_MAX_GEN=256 \
+bash scripts/run_exp.sh llama32 --gpu 0 --variant qlutattn_k1v4 --max-samples 2
+# -> longbench_out/smoke/llama32-1b-instruct_qlutattn-k1v4/{pred,logs}
 ```
 
 ```bash
 # full (all 21 datasets, 32k context)
 cd /mnt/data/tzj/Code/Kitty
 LLAMA32_MODEL_PATH=/mnt/data/tzj/models/Llama-3.2-1B-Instruct \
-MAX_MODEL_LEN=32768 LLAMA32_MAX_GEN=256 QUEST_BUDGET=2048 QUEST_SKIP_LAYERS=0 \
-bash scripts/run_exp.sh llama32 --gpu 0 --variant quest_kitty_page16_sim
-# -> longbench_out/llama32-1b-instruct_quest-kitty-sim/{pred,logs}
+MAX_MODEL_LEN=32768 LLAMA32_MAX_GEN=256 \
+bash scripts/run_exp.sh llama32 --gpu 0 --variant qlutattn_k1v4
+# -> longbench_out/llama32-1b-instruct_qlutattn-k1v4/{pred,logs}
 ```
 
 Full paper-style Kitty LongBench on GPU1 for LLaMA3.1-8B-Instruct:
 
 ```bash
 bash scripts/run_exp.sh llama --gpu 1
-# -> longbench_out/llama31-8b-instruct_kitty/{pred,logs}
+# -> longbench_out/llama31-8b-instruct_kitty-k2b4v2-pr0p125/{pred,logs}
 ```
 
-Pure-torch QUEST + Kitty (no Triton) for Qwen3-8B, full on GPU1:
-
-```bash
-bash scripts/run_exp.sh qwen --gpu 1 --variant quest_kitty_page16_sim
-# -> longbench_out/qwen3-8b_quest-kitty-sim/{pred,logs}
-```
-
-Smoke example (LLaMA3.2-1B, 2 samples each, GPU1; llama32 defaults to quest_kitty_page16_sim):
+Smoke example (LLaMA3.2-1B, 2 samples each, GPU1; llama32 defaults to fp16):
 
 ```bash
 bash scripts/run_exp.sh llama32 --gpu 1 --max-samples 2
-# -> longbench_out/smoke/llama32-1b-instruct_quest-kitty-sim/{pred,logs}
+# -> longbench_out/smoke/llama32-1b-instruct_fp16/{pred,logs}
 ```
 
 Scope datasets with `DATASETS_CSV`, and force the layout independently of the
@@ -648,124 +453,6 @@ that still writes to the full layout:
 `RUN_MODE=full bash scripts/run_exp.sh llama32 --gpu 1 --max-samples 2`).
 Local model paths come from `.env` (`KITTY_*_PATH`) or per-target `*_MODEL_PATH`
 overrides; never hardcode host paths in tracked files.
-
-### Real QUEST + Kitty kernel on LongBench (variant `quest_kitty_page16_kernel`)
-
-`--variant quest_kitty_page16_kernel` is the REAL Triton Kitty + QUEST sparse
-decode path on LongBench, NOT the `kitty_page16` fake-quant proxy. Decode runs the
-Triton sparse QK/SV kernels with query-aware page selection over the real paged
-`kitty.kvcache` cache.
-
-Supported model families: `llama`, `qwen`, and `glm`.
-- `llama` / `qwen`: the runner loads the architecture-specific `*_Kitty` model
-  class (`kitty.models.llama` `LlamaForCausalLM_Kitty` / `kitty.models.qwen3`
-  `Qwen3ForCausalLM_Kitty`, stock HF model with only the attention forward
-  replaced) and builds the real paged cache per sample via `past_key_values`.
-- `glm`: ChatGLM-4 loads its own remote code with a legacy tuple cache that can
-  NOT thread an HF cache via `past_key_values`, so the runner loads the stock
-  remote-code model (`AutoModelForCausalLM`, NOT a `*_Kitty` class) and installs
-  the kernel post-load with `kitty_sim.glm_kitty_patch.install_glm_real_kitty_kernel`
-  (per-layer 1-layer `KittyCache` on each `SelfAttention`; reuses the GLM
-  de-frag + generate shims). GLM must run in **fp16** (the GLM target already
-  passes `--torch-dtype float16`; the kitty cache/kernel buffers are fp16 while
-  GLM weights are bf16). The runner sizes each layer's cache per sample via
-  `set_glm_real_kitty_sample_length`, and the guardrail validates
-  `kitty_stats["paths"]` (printed as `[glm-quest-kernel] ... paths=...`).
-
-Always pass the QUEST budget explicitly: `QUEST_BUDGET=2048` (page16 -> 128
-logical pages). `QUEST_SKIP_LAYERS` defaults to 0 (every decode layer uses QUEST
-selection). The runner has a first-sample guardrail that refuses to proceed
-unless decode shows real kernel evidence (`last_quest_path` =
-`triton_sparse_reduced_budget` / `triton_sparse_forced_all_pages`, or
-`dense_full_budget` / `dense_no_shared_pages` when a context is smaller than the
-budget). A bare `dense` with `quest_skip_layers=0`, `python_sparse_debug`, or
-`unknown` is rejected as a silent degradation to dense fp16.
-
-Real QUEST+Kitty smoke for Llama-3.2-1B on GPU0 (scoped to long-context
-datasets so the sparse path is exercised):
-
-```bash
-cd /mnt/data/tzj/Code/Kitty
-LLAMA32_MODEL_PATH=/mnt/data/tzj/models/Llama-3.2-1B-Instruct \
-MAX_MODEL_LEN=32768 LLAMA32_MAX_GEN=256 \
-QUEST_BUDGET=2048 QUEST_SKIP_LAYERS=0 \
-DATASETS_CSV=multifieldqa_en,hotpotqa \
-bash scripts/run_exp.sh llama32 --gpu 0 --variant quest_kitty_page16_kernel --max-samples 2
-# -> longbench_out/smoke/llama32-1b-instruct_quest-kitty-kernel/{pred,logs}
-```
-
-Full real QUEST+Kitty for Llama-3.2-1B on GPU0 (all 21 datasets, 32k context):
-
-```bash
-cd /mnt/data/tzj/Code/Kitty
-LLAMA32_MODEL_PATH=/mnt/data/tzj/models/Llama-3.2-1B-Instruct \
-MAX_MODEL_LEN=32768 LLAMA32_MAX_GEN=256 \
-QUEST_BUDGET=2048 QUEST_SKIP_LAYERS=0 \
-bash scripts/run_exp.sh llama32 --gpu 0 --variant quest_kitty_page16_kernel
-# -> longbench_out/llama32-1b-instruct_quest-kitty-kernel/{pred,logs}
-```
-
-The `.env` here has no `KITTY_LLAMA32_1B_PATH`, so the model path must be passed
-explicitly via `LLAMA32_MODEL_PATH=` (otherwise it falls back to a non-existent
-`$HOME/models/...`). For Qwen3-8B, use `qwen --variant quest_kitty_page16_kernel`
-(the `kitty` env already resolves `KITTY_QWEN3_8B_PATH`).
-
-Real QUEST+Kitty for GLM-4-9B-Chat-1M on GPU0 (remote code, fp16 forced by the GLM
-target; `.env` has no `KITTY_GLM4_9B_1M_PATH`, so pass `GLM_MODEL_PATH=`; GLM-9B is
-memory-heavy, so smoke at `MAX_MODEL_LEN=8192` first, then scale to 32768 watching
-`nvidia-smi`):
-
-```bash
-cd /mnt/data/tzj/Code/Kitty
-GLM_MODEL_PATH=/mnt/data/tzj/models/GLM-4-9B-Chat-1M \
-MAX_MODEL_LEN=8192 QUEST_BUDGET=2048 QUEST_SKIP_LAYERS=0 \
-DATASETS_CSV=multifieldqa_en,hotpotqa \
-PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-bash scripts/run_exp.sh glm --variant quest_kitty_page16_kernel --gpu 0 --max-samples 2
-# -> longbench_out/smoke/glm4-9b-chat-1m_quest-kitty-kernel/{pred,logs}
-# full: drop --max-samples and raise MAX_MODEL_LEN to 32768 (watch GPU0 memory).
-```
-
-GLM evidence lines read `[glm-quest-kernel] ... paths={'triton_sparse_reduced_budget': N}`
-on long-context samples (short samples legitimately show `dense_full_budget`).
-
-### Pure-torch QUEST + Kitty on LongBench (variant `quest_kitty_page16_sim`)
-
-`quest_kitty_page16_sim` is the no-Triton QUEST accuracy proxy and the default
-for the `llama32` target. The sim `KittyKVCache` supplies the Kitty page16
-fake-quant; a per-arch attention hook (`kitty_sim/sim_quest.py`, covers Llama and
-Qwen3 via a `q_norm` attribute check) runs the gather-based QUEST oracle
-(`kitty_sim/quest_sparse.py`) on decode. It does genuine query-aware page
-selection (unlike the removed `kitty_page16`), is architecture-portable, but does
-not save KV memory and is not a kernel-speed proof.
-
-Smoke for Llama-3.2-1B on GPU0 (`llama32` already defaults to this variant):
-
-```bash
-cd /mnt/data/tzj/Code/Kitty
-LLAMA32_MODEL_PATH=/mnt/data/tzj/models/Llama-3.2-1B-Instruct \
-MAX_MODEL_LEN=32768 LLAMA32_MAX_GEN=256 \
-QUEST_BUDGET=2048 QUEST_SKIP_LAYERS=0 \
-bash scripts/run_exp.sh llama32 --gpu 0 --variant quest_kitty_page16_sim --max-samples 2
-# -> longbench_out/smoke/llama32-1b-instruct_quest-kitty-sim/{pred,logs}
-```
-
-Full (all 21 datasets, 32k context):
-
-```bash
-cd /mnt/data/tzj/Code/Kitty
-LLAMA32_MODEL_PATH=/mnt/data/tzj/models/Llama-3.2-1B-Instruct \
-MAX_MODEL_LEN=32768 LLAMA32_MAX_GEN=256 \
-QUEST_BUDGET=2048 QUEST_SKIP_LAYERS=0 \
-bash scripts/run_exp.sh llama32 --gpu 0 --variant quest_kitty_page16_sim
-# -> longbench_out/llama32-1b-instruct_quest-kitty-sim/{pred,logs}
-```
-
-To confirm it is real QUEST (not pure Kitty), compare decode ms/token at 16k vs
-128k: sim QUEST stays near-flat (attention bounded to the 2048-token budget)
-while pure dense Kitty grows roughly linearly with context. The runner's
-first-sample guardrail also prints `[sim-quest] ... decode_calls=... last_selected_pages=...`
-and refuses to proceed if the QUEST hook never ran.
 
 ## qlutattn-k1v4 per-token exploration (reorder + SmoothAttention)
 
@@ -776,12 +463,13 @@ savings. Full design doc + roadmap: `docs/qlutattn_reorder_smooth.md`.
 
 Three orthogonal pieces:
 
-- **per-token K quant** (`k_quant_mode=per_token`, variants `kitty_pertoken` /
-  `qlutattn_pertoken`): K grouped along head_dim, uniform, no promote/channel-
-  select. The per-token loss is codebook-driven, NOT axis-driven — per-token
-  nf2 (Lloyd, self-adaptive) ≈ per-channel KIVI, while per-token uniform
-  collapses. `qlutattn_pertoken` is single-codebook (`QLUT_BIN_CODEBOOKS`, one
-  name, default `nf2`); V per-token 4-bit.
+- **per-token K quant** (`k_quant_mode=per_token`, variant `qlutattn_pertoken`):
+  K grouped along head_dim, uniform, no promote/channel-select. The per-token
+  loss is codebook-driven, NOT axis-driven — per-token nf2 (Lloyd, self-adaptive)
+  ≈ per-channel KIVI, while per-token uniform collapses. `qlutattn_pertoken` is
+  single-codebook (`QLUT_BIN_CODEBOOKS`, one name, default `nf2`); V per-token
+  4-bit. (A uniform-codebook per-token run is reachable via `--variant custom
+  --k_quant_mode per_token`.)
 - **SmoothAttention** (`scripts/calibrate_smooth_qk.py`, Llama-family only):
   QServe-style `λ=max(absmax_K pair)^0.5` with the RoPE rotate-half pair
   constraint (`λ_i==λ_{i+D/2}`), folded offline into `W_q*=λ` / `W_k/=λ`.
@@ -850,7 +538,6 @@ LLAMA32_MODEL_PATH=/path/to/models/Llama-3.2-1B-Instruct-smooth \
 LLAMA32_MODEL_SLUG=llama32-1b-instruct-smooth \
 QLUT_BIN_CODEBOOKS=nf2 MAX_MODEL_LEN=32768 LLAMA32_MAX_GEN=256 \
 bash scripts/run_exp.sh llama32 --gpus 0,0,0,1,1,1,2,2,2,3,3,3,4,4,4,5,5,5 --variant qlutattn_pertoken
-# uniform per-token: --variant kitty_pertoken (drop QLUT_BIN_CODEBOOKS)
 ```
 
 `reorder/` and `calib/` checkpoint dirs are gitignored; use `--output ~/models/...`.
@@ -889,8 +576,7 @@ buffer_length=128, group_size=128, channel_selection=1`.
 | Family | V cache | How to run |
 | --- | --- | --- |
 | **K1V2** | per-token **2-bit** | REMOVED from code (results below retained for reference). |
-| **K1V4** | per-token **4-bit** | `--variant kitty_k1v4` + `PROMOTE_RATIO_CONFIG` JSON (`{"default": r}` for a flat ratio, per-layer form for schedules). |
-| **K1V4 cross-head** | per-token **4-bit** | `--variant kitty_k1v4_xhead` — same budget, allocated across heads jointly (`channel_selection=3`). |
+| **K1V4** | per-token **4-bit** | `KBITS=1 PROMOTE_BIT=2 VBITS=4 PROMOTE_RATIO=<r> --variant kitty` (flat ratio); per-layer schedule via `PROMOTE_RATIO_CONFIG` JSON. |
 
 All of these run on the pure-torch sim fake-quant path (`kitty_sim`), so they are
 an **accuracy proxy only and save no KV memory** — the real Triton kernel
@@ -900,13 +586,13 @@ a kernel-speed or memory-savings claim.
 
 ### Results so far (LLaMA-3.2-1B, full LongBench, 21 datasets, 32k context, sim)
 
-| `promote_ratio` | eff. K bitwidth | K1V2 (V 2-bit) | K1V4 uniform | K1V4 cross-head |
-| ---: | ---: | ---: | ---: | ---: |
-| 0.25 | 1.250 | **10.46** | **10.76** | 10.84 |
-| 0.5 | 1.500 | **15.96** | **17.49** | 17.04 |
-| 0.625 | 1.625 | — | **21.89** | 22.07 |
-| 0.75 | 1.750 | **23.36** | **24.31** | — |
-| 0.875 | 1.875 | — | **25.20** | 25.07 |
+| `promote_ratio` | eff. K bitwidth | K1V2 (V 2-bit) | K1V4 uniform |
+| ---: | ---: | ---: | ---: |
+| 0.25 | 1.250 | **10.46** | **10.76** |
+| 0.5 | 1.500 | **15.96** | **17.49** |
+| 0.625 | 1.625 | — | **21.89** |
+| 0.75 | 1.750 | **23.36** | **24.31** |
+| 0.875 | 1.875 | — | **25.20** |
 
 Baselines (same harness): fp16 27.59 / kitty (2-bit base, 4-bit boost) 26.25 /
 kivi (2-bit) 24.24.
@@ -925,89 +611,47 @@ modestly (+0.3 to +1.5 over K1V2) — the collapse is K-driven, not V-limited. T
 uniform K1V4 dose-response is cleanly monotone in effective K bits
 (10.76 → 17.49 → 21.89 → 24.31 → 25.20).
 
-**Finding (cross-head, final).** `kitty_k1v4_xhead` reallocates the SAME promote
-budget across the 8 KV heads by raw magnitude (per-head counts observed 10–58
-vs the uniform 32 at pr=0.5; the per-head "loudness" profile is stable across
-datasets, i.e. a model property). At equal bits it is **never meaningfully
-better** than the uniform per-head quota (best +0.18 avg at 0.625) and is
-**clearly worse at pr=0.5** (−0.45 avg; trec −2.5, qasper −3.2): raw |K|
-magnitude is not comparable across heads, so "loud" heads steal top channels
-from quiet heads whose own per-head softmax needs them — the uniform quota acts
-as a correct implicit regularizer. Task signature is stable across ratios (lsht
-consistently likes cross-head, narrativeqa/repobench-p/lcc consistently
-dislike it): the freedom redistributes damage across task types rather than
-reducing it. Head-level allocation, if pursued (P3), needs a head-normalized or
-quantization-error-driven signal, not raw magnitude.
-
-**Finding (per-layer schedule × cross-head, final).** At the 0.5 anchor, three
-strictly equal-bits per-layer pr schedules (16-layer Σ `int(64*pr_l)` = 512,
-i.e. 1.500 effective K bits each) were run with U/X paired arms on the full
-21-dataset LongBench:
-
-| schedule (all 1.5-bit equal bits) | U (sel=1) | X (sel=3) | Δ(X−U) |
-| --- | ---: | ---: | ---: |
-| flat 0.5 (control) | 17.49 | 17.04 | −0.45 |
-| S1 sensitivity-aligned (L10/L14→0.875, L0/L1→0.25, L2–L5→0.4375, rest 0.5) | 17.21 | **18.39** | **+1.18** |
-| S2 skew-protect (most head-skewed layers boosted) | 13.83 | 13.47 | −0.36 |
-| S3 inverted S1 (k′=64−k) | 13.41 | 13.16 | −0.25 |
-
-The interaction is SPECIFIC: S1-X is the best 1.5-bit operating point measured
-(+0.90 over flat-U), while the same schedule does nothing on the uniform arm
-(17.21 < 17.49, replicating the layer-diff "calibration doesn't beat uniform"
-negative result), and S2/S3 show it is not "any schedule rescues cross-head"
-(both Δ still negative). S1's X−U gain is broad (15/21 datasets positive,
-median +0.49) and concentrated in retrieval (triviaqa +6.2, multifieldqa_en
-+3.7, 2wikimqa +3.6, hotpotqa +3.2). S3's two-arm collapse (hotpotqa 5.7,
-triviaqa 28.7) independently confirms L10/L14 are genuinely sensitive layers.
-The sensitivity ranking (L10 > L14 > L9; front layers least sensitive) comes
-from the layer-diff leave-one-out probes: drop ONE layer's K to 1-bit at
-uniform references 0.6875/0.875, score on qasper/hotpotqa/multifieldqa_en.
-Caveats: qasper stays below flat-U under every schedule tried (11.71 → ~9);
-single model (1B) and single anchor (0.5) so far. The validated S1 schedule:
-
-```json
-{"default": 0.5, "layers": {"10": 0.875, "14": 0.875, "0": 0.25, "1": 0.25,
- "2": 0.4375, "3": 0.4375, "4": 0.4375, "5": 0.4375}}
-```
+A per-layer `promote_ratio` schedule (via `PROMOTE_RATIO_CONFIG`) does not beat a
+flat uniform ratio at equal bits on the uniform arm (replicating the layer-diff
+"calibration doesn't beat uniform" negative result). The cross-head allocation
+strategy and its per-layer-schedule interaction were studied under the
+now-removed `kitty_k1v4_xhead` variant; that exploration is archived in memory,
+not here.
 
 ### Reproduction
 
 Canonical GPU1 single-card form; model path resolves via
 `.env`/`LLAMA32_MODEL_PATH`. The boost fraction comes from a JSON config
-(`{"default": 0.5}` here); use `--variant kitty_k1v4_xhead` for the cross-head
-arm. When running several ratios, encode the ratio in the output dir via
-`LLAMA32_MODEL_SLUG` (e.g. `llama32-1b-instruct-pr625`):
+(`{"default": 0.5}` here). When running several ratios, encode the ratio in the
+output dir via `LLAMA32_MODEL_SLUG` (e.g. `llama32-1b-instruct-pr625`):
 
 ```bash
-# smoke (2 samples/dataset)
+# smoke (2 samples/dataset): K1V4 with a flat boost ratio = the old kitty_k1v4
 cd /home/zijie/Code/Kitty
-printf '{"default": 0.5}' > configs/pr50.json
+KBITS=1 PROMOTE_BIT=2 VBITS=4 PROMOTE_RATIO=0.5 \
 LLAMA32_MODEL_PATH=/path/to/Llama-3.2-1B-Instruct \
-PROMOTE_RATIO_CONFIG=$PWD/configs/pr50.json \
 MAX_MODEL_LEN=32768 LLAMA32_MAX_GEN=256 \
-bash scripts/run_exp.sh llama32 --gpu 1 --variant kitty_k1v4 --max-samples 2
-# -> longbench_out/smoke/llama32-1b-instruct_kitty-k1v4/{pred,logs}
+bash scripts/run_exp.sh llama32 --gpu 1 --variant kitty --max-samples 2
+# -> longbench_out/smoke/llama32-1b-instruct_kitty-k1b2v4-pr0p5/{pred,logs}
 ```
 
 ```bash
-# full (all 21 datasets, 32k context)
+# full (all 21 datasets, 32k context). Per-layer schedule instead of a flat
+# ratio: drop PROMOTE_RATIO and pass PROMOTE_RATIO_CONFIG=$PWD/configs/sched.json
+# (+ LLAMA32_MODEL_SLUG to keep different schedules in separate dirs).
 cd /home/zijie/Code/Kitty
-printf '{"default": 0.5}' > configs/pr50.json
+KBITS=1 PROMOTE_BIT=2 VBITS=4 PROMOTE_RATIO=0.5 \
 LLAMA32_MODEL_PATH=/path/to/Llama-3.2-1B-Instruct \
-PROMOTE_RATIO_CONFIG=$PWD/configs/pr50.json \
 MAX_MODEL_LEN=32768 LLAMA32_MAX_GEN=256 \
-bash scripts/run_exp.sh llama32 --gpu 1 --variant kitty_k1v4
-# -> longbench_out/llama32-1b-instruct_kitty-k1v4/{pred,logs}
+bash scripts/run_exp.sh llama32 --gpu 1 --variant kitty
+# -> longbench_out/llama32-1b-instruct_kitty-k1b2v4-pr0p5/{pred,logs}
 ```
 
-Set `PROMOTE_RATIO_CONFIG` for BOTH arms when comparing uniform vs cross-head —
-an arm launched without it silently runs the built-in `promote_ratio=0.25`
-default and still writes to the same output dir name.
-
-For the validated best 1.5-bit config, write the S1 schedule JSON above to a
-file and run `--variant kitty_k1v4_xhead` with `PROMOTE_RATIO_CONFIG` pointing
-at it; encode the schedule in the output dir via `LLAMA32_MODEL_SLUG`
-(e.g. `llama32-1b-instruct-s1sens`) so arms never share a dir.
+Set `PROMOTE_RATIO_CONFIG` to apply a per-layer ratio schedule — an arm launched
+without it silently runs the built-in `promote_ratio=0.25` default and still
+writes to the same output dir name. When sweeping several schedules, encode the
+schedule in the output dir via `LLAMA32_MODEL_SLUG` (e.g.
+`llama32-1b-instruct-s1sens`) so arms never share a dir.
 
 To fan one variant's 21 datasets across several GPUs for speed (an explicit
 override of the GPU1-only rule), use e.g. `--gpus 0,1,2,3,4,5` instead of `--gpu 1`.

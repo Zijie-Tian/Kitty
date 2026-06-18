@@ -61,7 +61,7 @@ class LongBenchTests(unittest.TestCase):
 
     def test_variant_defaults_match_plan(self):
         kitty = build_variant(SimpleNamespace(variant="kitty"))
-        pro = build_variant(SimpleNamespace(variant="kitty_pro"))
+        pro = build_variant(SimpleNamespace(variant="kitty", promote_ratio=0.25))  # old kitty_pro
         self.assertEqual(kitty.promote_ratio, 0.125)
         self.assertEqual(pro.promote_ratio, 0.25)
         self.assertEqual(kitty.sink_length, 32)
@@ -90,14 +90,14 @@ class LongBenchTests(unittest.TestCase):
         )
 
     def test_default_prediction_dir_uses_normalized_smoke_and_full_layout(self):
-        variant = build_variant(SimpleNamespace(variant="kitty"))
+        variant = build_variant(SimpleNamespace(variant="fp16"))
         self.assertEqual(
             default_prediction_dir("meta-llama/Llama-3.1-8B-Instruct", None, variant, max_samples=1),
-            Path("longbench_out/smoke/llama31-8b-instruct-kitty/pred"),
+            Path("longbench_out/smoke/llama31-8b-instruct-fp16/pred"),
         )
         self.assertEqual(
             default_prediction_dir("meta-llama/Llama-3.1-8B-Instruct", None, variant, max_samples=-1),
-            Path("longbench_out/llama31-8b-instruct-kitty/pred"),
+            Path("longbench_out/llama31-8b-instruct-fp16/pred"),
         )
 
     def test_kitty_cache_accepts_short_prefill_without_assertion(self):

@@ -1,10 +1,10 @@
-"""Per-layer promote_ratio (JSON-controlled, kitty_k1v4) — sim-path unit tests.
+"""Per-layer promote_ratio (JSON-controlled, kitty) — sim-path unit tests.
 
 These tests pin the behaviour added for per-layer K-channel boost:
   * KittyKVCache._layer_pr resolves per-layer overrides with scalar fallback.
   * KittyKVCache.update() actually feeds each layer its own promote_ratio.
   * _load_promote_ratio_config parses both JSON forms and validates ratios.
-  * build_variant wires kitty_k1v4 to the JSON and rejects the flag elsewhere.
+  * build_variant wires kitty to the JSON and rejects the flag elsewhere.
 
 Run with: python -m unittest tests.test_kitty_per_layer_promote_ratio -v
 """
@@ -141,24 +141,30 @@ class BuildVariantTests(unittest.TestCase):
         self.addCleanup(os.remove, path)
         return path
 
-    def test_k1v4_without_config_keeps_legacy_scalar(self):
-        v = build_variant(SimpleNamespace(variant="kitty_k1v4", promote_ratio_config=None))
-        self.assertEqual(v.kbits, 1)
-        self.assertEqual(v.vbits, 4)
-        self.assertEqual(v.promote_bit, 2)
-        self.assertEqual(v.promote_ratio, 0.25)
+    def test_kitty_without_config_uses_paper_default(self):
+        v = build_variant(SimpleNamespace(variant="kitty", promote_ratio_config=None))
+        self.assertEqual(v.kbits, 2)
+        self.assertEqual(v.vbits, 2)
+        self.assertEqual(v.promote_bit, 4)
+        self.assertEqual(v.promote_ratio, 0.125)
         self.assertIsNone(v.promote_ratio_per_layer)
 
-    def test_k1v4_with_config_sets_per_layer(self):
+    def test_kitty_reproduces_old_k1v4_params(self):
+        v = build_variant(SimpleNamespace(
+            variant="kitty", promote_ratio_config=None,
+            kbits=1, vbits=4, promote_bit=2, promote_ratio=0.25))
+        self.assertEqual((v.kbits, v.promote_bit, v.vbits, v.promote_ratio), (1, 2, 4, 0.25))
+
+    def test_kitty_with_config_sets_per_layer(self):
         path = self._write({"default": 0.5, "layers": {"0": 1.0, "1": 1.0}})
-        v = build_variant(SimpleNamespace(variant="kitty_k1v4", promote_ratio_config=path))
+        v = build_variant(SimpleNamespace(variant="kitty", promote_ratio_config=path))
         self.assertEqual(v.promote_ratio, 0.5)
         self.assertEqual(dict(v.promote_ratio_per_layer), {0: 1.0, 1: 1.0})
         self.assertEqual(v.promote_ratio_config_path, path)
 
-    def test_config_rejected_for_non_k1v4(self):
+    def test_config_rejected_for_non_kitty(self):
         path = self._write({"default": 0.5})
-        for bad in ("kitty", "kitty_pro", "custom", "fp16", "kivi"):
+        for bad in ("custom", "fp16", "kivi", "qlutattn_k1v4"):
             with self.assertRaises(ValueError):
                 build_variant(SimpleNamespace(
                     variant=bad, promote_ratio_config=path,
@@ -167,8 +173,8 @@ class BuildVariantTests(unittest.TestCase):
                 ))
 
     def test_deleted_variants_are_gone(self):
-        for gone in ("kitty_k1v2", "kitty_k1v2_pr50", "kitty_k1v2_pr75",
-                     "kitty_k1v4_pr50", "kitty_k1v4_pr75"):
+        for gone in ("kitty_pro", "kitty_k1v4", "kitty_k1v4_xhead",
+                     "kitty_k1v2", "kitty_pertoken", "tern_uniform"):
             with self.assertRaises(ValueError):
                 build_variant(SimpleNamespace(variant=gone, promote_ratio_config=None))
 

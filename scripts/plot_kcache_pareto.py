@@ -18,13 +18,13 @@ BASE = "longbench_out"
 # (label, output-dir, K bits/value)
 POINTS = [
     ("sign (submean 1-bit)", "llama32-1b-instruct-sign_qlutattn-k1v4", 1.25),
-    ("k1v4 (KIVI 1-bit)",    "llama32-1b-instruct-k1v4pr0_kitty-k1v4", 1.25),
-    ("k1v4 +25% promote",    "llama32-1b-instruct_kitty-k1v4",         1.50),
+    ("k1v4 (KIVI 1-bit)",    "llama32-1b-instruct-k1v4pr0_kitty-k1b2v4-pr0p0", 1.25),
+    ("k1v4 +25% promote",    "llama32-1b-instruct_kitty-k1b2v4-pr0p25", 1.50),
     ("qlutattn-k1v4",        "llama32-1b-instruct_qlutattn-k1v4",      1.68),
     ("tern",                 "llama32-1b-instruct_qlutattn-k184v4",    1.83),
     ("KIVI-2",               "llama32-1b-instruct_kivi-k2v2",          2.25),
     ("KIVI*-2",              "llama32-1b-instruct_kivi-star-k2v2",     2.25),
-    ("kitty",                "llama32-1b-instruct_kitty",              2.50),
+    ("kitty",                "llama32-1b-instruct_kitty-k2b4v2-pr0p125", 2.50),
 ]
 FP16_DIR = "llama32-1b-instruct_fp16"
 # methods using the submean (qlut) codebook family — drawn green; rest are KIVI-style.

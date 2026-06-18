@@ -258,9 +258,9 @@ select_gpus() {
 # Map a variant name to its output method slug (mirrors runner.py method_layout_slug).
 method_slug() {
   case "${1,,}" in
-    kitty) printf 'kitty\n' ;;
-    kitty_pro) printf 'kitty-pro\n' ;;
-    kitty_k1v4) printf 'kitty-k1v4\n' ;;
+    kitty)
+      local _pr="${PROMOTE_RATIO:-0.125}"
+      printf 'kitty-k%sb%sv%s-pr%s\n' "${KBITS:-2}" "${PROMOTE_BIT:-4}" "${VBITS:-2}" "${_pr//./p}" ;;
     qlutattn_pertoken) printf 'qlutattn-pertoken\n' ;;
     fp16) printf 'fp16\n' ;;
     kivi) printf 'kivi-k%sv%s\n' "${KBITS:-2}" "${VBITS:-2}" ;;
@@ -466,11 +466,17 @@ run_eval_dataset() {
   if [[ -n "${VBITS:-}" ]]; then
     cmd+=(--vbits "${VBITS}")
   fi
-  # Per-layer promote_ratio schedule (only meaningful for the kitty_k1v4
-  # variant; build_variant rejects it for any other variant). When sweeping
-  # several ratios, encode the ratio in the output dir via <T>_MODEL_SLUG --
-  # an arm launched without it silently runs the built-in promote_ratio=0.25
-  # default and still writes to the same output dir name.
+  # kitty boost bit + boost fraction (affect the kitty variant; the slug encodes
+  # them). PROMOTE_BIT = boost bit (default 4), PROMOTE_RATIO = scalar boost
+  # fraction (default 0.125). PROMOTE_RATIO_CONFIG is the per-layer schedule
+  # (kitty only); for a per-layer schedule also set <T>_MODEL_SLUG so different
+  # schedules don't share an output dir.
+  if [[ -n "${PROMOTE_BIT:-}" ]]; then
+    cmd+=(--promote_bit "${PROMOTE_BIT}")
+  fi
+  if [[ -n "${PROMOTE_RATIO:-}" ]]; then
+    cmd+=(--promote_ratio "${PROMOTE_RATIO}")
+  fi
   if [[ -n "${PROMOTE_RATIO_CONFIG:-}" ]]; then
     cmd+=(--promote-ratio-config "${PROMOTE_RATIO_CONFIG}")
   fi
