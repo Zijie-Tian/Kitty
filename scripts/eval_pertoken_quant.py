@@ -164,6 +164,13 @@ def build_registry():
                            lambda x, G: had_pertoken(lambda g: cb_nf_fixed(g, 4))(x, G), "rot + Gaussian NF, 1 side"))
     reg.append(make_method("pt/had+nf2 Lloyd", "per_token", 2.0, 2,
                            lambda x, G: had_pertoken(lambda g: cb_lloyd(g, 4))(x, G), "rot + per-group Lloyd"))
+    # ---- iter 2: SmoothAttention channel equalization (+/- Hadamard) ------- #
+    reg.append(make_method("pt/smooth+nf2 Lloyd", "per_token", 2.0, 2,
+                           lambda x, G: smooth_pertoken(lambda g: cb_lloyd(g, 4))(x, G), "QServe smooth + Lloyd"))
+    reg.append(make_method("pt/smooth+had+nf2 Lloyd", "per_token", 2.0, 2,
+                           lambda x, G: smooth_pertoken(lambda g: cb_lloyd(g, 4), then_hadamard=True)(x, G), "smooth then rot + Lloyd"))
+    reg.append(make_method("pt/smooth+had+nf2 fixed", "per_token", 2.0, 1,
+                           lambda x, G: smooth_pertoken(lambda g: cb_nf_fixed(g, 4), then_hadamard=True)(x, G), "smooth+rot+NF 2.25b"))
     return reg
 
 
