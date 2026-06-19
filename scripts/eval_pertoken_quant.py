@@ -113,6 +113,28 @@ def make_method(name, axis, cw_bits, n_side, recon, note=""):
     return dict(name=name, axis=axis, cw_bits=cw_bits, n_side=n_side, recon=recon, note=note)
 
 
+def had_pertoken(cb):
+    """Hadamard rotate head_dim -> per-token codebook -> rotate back (R==R^-1)."""
+    def fn(xreg, G):
+        R = hadamard_R(xreg.shape[1], xreg.device)
+        return rotate_D(quant_per_token(rotate_D(xreg, R), cb), R)
+    return fn
+
+
+def smooth_pertoken(cb, alpha=0.5, then_hadamard=False):
+    """QServe smooth (K/lam, lam folds to Q) -> [Hadamard] -> per-token cb -> fold lam back."""
+    def fn(xreg, G):
+        lam = smooth_lambda(xreg, alpha)            # [H,D,1]
+        xs = xreg / lam
+        if then_hadamard:
+            R = hadamard_R(xreg.shape[1], xreg.device)
+            xs = rotate_D(quant_per_token(rotate_D(xs, R), cb), R)
+        else:
+            xs = quant_per_token(xs, cb)
+        return xs * lam
+    return fn
+
+
 def build_registry():
     reg = []
     # ---- per-channel references (NOT eligible as per-token champion) -------- #
@@ -133,6 +155,15 @@ def build_registry():
                            lambda x, G: quant_per_token(x, lambda g: cb_lloyd(g, 4)), "已知较好 per-token"))
     reg.append(make_method("pt/nf2 fixed(std)", "per_token", 2.0, 1,
                            lambda x, G: quant_per_token(x, lambda g: cb_nf_fixed(g, 4)), "Gaussian NF, 1 side"))
+    # ---- iter 1: Hadamard rotation (incoherence) + per-token --------------- #
+    reg.append(make_method("pt/had+sign", "per_token", 1.0, 2,
+                           lambda x, G: had_pertoken(cb_sign)(x, G), "QuaRot rot + 1-bit"))
+    reg.append(make_method("pt/had+uni2", "per_token", 2.0, 2,
+                           lambda x, G: had_pertoken(lambda g: cb_uni(g, 4))(x, G), "QuaRot rot + uniform2"))
+    reg.append(make_method("pt/had+nf2 fixed", "per_token", 2.0, 1,
+                           lambda x, G: had_pertoken(lambda g: cb_nf_fixed(g, 4))(x, G), "rot + Gaussian NF, 1 side"))
+    reg.append(make_method("pt/had+nf2 Lloyd", "per_token", 2.0, 2,
+                           lambda x, G: had_pertoken(lambda g: cb_lloyd(g, 4))(x, G), "rot + per-group Lloyd"))
     return reg
 
 
