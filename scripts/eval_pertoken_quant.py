@@ -91,14 +91,16 @@ def quant_per_token_sub(xHDT, cb, n_sub):
     rec = cb(x.reshape(H, T, n_sub, D // n_sub))
     return rec.reshape(H, T, D).transpose(1, 2)
 
-def outlier_keep_pertoken(cb, k, outlier_bits=16):
-    """keep top-k energy channels (fixed per head) at `outlier_bits` (16=fp16, else
-    per-channel uniform); per-token quantize the rest with the scale over ONLY the
-    non-outlier channels (homogeneous group)."""
+def outlier_keep_pertoken(cb, k, outlier_bits=16, by="amax"):
+    """keep top-k channels (fixed per head, selected by `by`) at `outlier_bits`
+    (16=fp16, else per-channel uniform); per-token quantize the rest with the scale
+    over ONLY the non-outlier channels (homogeneous group). `by`: amax (peak
+    magnitude, what dominates the shared per-token scale) | var (residual sigma^2)."""
     def fn(xreg, G):
         H, D, T = xreg.shape
+        score = xreg.abs().amax(dim=2) if by == "amax" else xreg.var(dim=2, unbiased=False)
         keep = torch.zeros(H, D, dtype=torch.bool, device=xreg.device)
-        keep.scatter_(1, xreg.abs().amax(dim=2).topk(k, dim=1).indices, True)
+        keep.scatter_(1, score.topk(k, dim=1).indices, True)
         out = xreg.clone()
         for h in range(H):
             nb = ~keep[h]
@@ -244,6 +246,11 @@ def build_registry():
                                (lambda kk, obb: lambda x, G: smooth_then(
                                    outlier_keep_pertoken(lambda g: cb_lloyd(g, 4), kk, outlier_bits=obb))(x, G))(k, ob),
                                f"smooth + top-{k} @{ob}bit + Lloyd", bits_override=bo))
+    # ---- iter 7: outlier-selection signal (amax vs sigma^2) at the k=8 spot - #
+    reg.append(make_method("pt/smooth+outlier8-4b+Lloyd[var]", "per_token", 2.0, 1,
+                           lambda x, G: smooth_then(outlier_keep_pertoken(
+                               lambda g: cb_lloyd(g, 4), 8, outlier_bits=4, by="var"))(x, G),
+                           "k=8 selected by sigma^2 (vs amax champion)", bits_override=(56 * 2 + 8 * 4 + 16) / 64))
     return reg
 
 
