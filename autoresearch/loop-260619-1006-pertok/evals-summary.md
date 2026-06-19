@@ -54,3 +54,20 @@ QLUT_BIN_CODEBOOKS=nf2 PERTOKEN_OUTLIER_K=8 PERTOKEN_OUTLIER_BITS=4 \
 LLAMA32_MODEL_PATH=<smooth ckpt> LLAMA32_MODEL_SLUG=llama32-1b-instruct-smooth \
 MAX_MODEL_LEN=32768 LLAMA32_MAX_GEN=256 bash scripts/run_exp.sh llama32 --gpu 1 --variant qlutattn_pertoken
 # -> tag qlutattn_pertoken_nb1_v4_cb<h>_iso8b4. Code: kitty_simulate._quant_k_pertoken (outlier isolation, working-tree).
+
+## FULL LongBench (21 datasets, 32k, 4-GPU run) — FINAL
+| config | mean(21) | retain vs fp16 |
+| --- | ---: | ---: |
+| fp16 (ceiling) | 27.59 | 100% |
+| per-token nf2 (baseline) | 23.82 | 86.3% |
+| **CHAMPION smooth+outlier8@4b+Lloyd** | **26.48** | **96.0%** |
+
+champion +2.67 over per-token baseline; **closes 70.6% of the baseline→fp16 gap** (offline overlap proxy
+predicted 72% — near-perfect proxy↔LongBench correlation). Biggest per-dataset wins (K-fidelity-sensitive
+retrieval): multifieldqa_en +9.16, triviaqa +8.26, multifieldqa_zh +6.04, 2wikimqa +5.05, musique +4.77,
+samsum +4.52, qmsum +4.24, repobench-p +3.74. Minor regressions: lcc -1.37, lsht -1.0, qasper -0.94.
+
+NOTE (perf): champion's `_quant_k_pertoken` outlier path uses a per-head Python loop (gather/scatter +
+per-head Lloyd) that runs every decode step -> ~10-20x slower than the vectorized baseline (passage_retrieval_zh
+~183s/sample). Fake-quant accuracy proxy so it doesn't affect the result, but vectorize the per-head loop
+before any larger sweep. 4-GPU layout: GPU0 x6 + GPU1/2/3 x2 = 12 workers.
