@@ -1,0 +1,4 @@
+# metric_direction: higher_is_better  (top-32 attention overlap, per-token K, <=2.5 eff bits)
+# baseline refs (per-channel, ceiling): tern 0.7741 / sign 0.7320 / KIVI-uni2 0.7211
+iteration	timestamp	commit	metric	delta	guard	guard-metric	status	description
+0	2026-06-19T10:09:57	-	0.4609	0.0	pass	2.5	baseline	pt/nf2 Lloyd (best per-token baseline); sign 0.213 uni2 0.259 nf2fix 0.366
