@@ -1,0 +1,170 @@
+{
+  "cache": "kq_cache_llama32-1b.pt",
+  "src": "narrativeqa.jsonl#4",
+  "bit_ceiling": 2.5,
+  "topk": 32,
+  "n_layers": 16,
+  "head_dim": 64,
+  "results": [
+    {
+      "name": "ref/per-chan tern",
+      "axis": "per_channel",
+      "eff_bits": 1.835,
+      "overlap": 0.77405,
+      "nmse": 0.05573,
+      "note": "iso-tern"
+    },
+    {
+      "name": "ref/per-chan sign",
+      "axis": "per_channel",
+      "eff_bits": 1.25,
+      "overlap": 0.73205,
+      "nmse": 0.09922,
+      "note": "KIVI-K \u98ce\u683c 1-bit"
+    },
+    {
+      "name": "ref/per-chan KIVI uni2",
+      "axis": "per_channel",
+      "eff_bits": 2.25,
+      "overlap": 0.72112,
+      "nmse": 0.06304,
+      "note": "per-channel 2-bit min-max"
+    },
+    {
+      "name": "pt/outlier1+nf2 Lloyd",
+      "axis": "per_token",
+      "eff_bits": 2.4688,
+      "overlap": 0.55591,
+      "nmse": 0.08242,
+      "note": "keep top-1 chan fp16 + rest per-tok Lloyd"
+    },
+    {
+      "name": "pt/smooth+had+nf2 Lloyd",
+      "axis": "per_token",
+      "eff_bits": 2.5,
+      "overlap": 0.53723,
+      "nmse": 0.07717,
+      "note": "smooth then rot + Lloyd"
+    },
+    {
+      "name": "pt/outlier1+nf2 fixed",
+      "axis": "per_token",
+      "eff_bits": 2.4688,
+      "overlap": 0.52766,
+      "nmse": 0.10208,
+      "note": "keep top-1 chan fp16 + rest per-tok NF"
+    },
+    {
+      "name": "pt/smooth+had+nf2 fixed",
+      "axis": "per_token",
+      "eff_bits": 2.25,
+      "overlap": 0.51777,
+      "nmse": 0.0886,
+      "note": "smooth+rot+NF 2.25b"
+    },
+    {
+      "name": "pt/had+nf2 Lloyd",
+      "axis": "per_token",
+      "eff_bits": 2.5,
+      "overlap": 0.51126,
+      "nmse": 0.09657,
+      "note": "rot + per-group Lloyd"
+    },
+    {
+      "name": "pt/smooth+nf2 Lloyd",
+      "axis": "per_token",
+      "eff_bits": 2.5,
+      "overlap": 0.50056,
+      "nmse": 0.0905,
+      "note": "QServe smooth + Lloyd"
+    },
+    {
+      "name": "pt/had+2sub nf fixed",
+      "axis": "per_token",
+      "eff_bits": 2.5,
+      "overlap": 0.49599,
+      "nmse": 0.10827,
+      "note": "rot + 2 sub-groups, 2.5b"
+    },
+    {
+      "name": "pt/had+nf2 fixed",
+      "axis": "per_token",
+      "eff_bits": 2.25,
+      "overlap": 0.49112,
+      "nmse": 0.11032,
+      "note": "rot + Gaussian NF, 1 side"
+    },
+    {
+      "name": "pt/nf2 Lloyd",
+      "axis": "per_token",
+      "eff_bits": 2.5,
+      "overlap": 0.4609,
+      "nmse": 0.12496,
+      "note": "\u5df2\u77e5\u8f83\u597d per-token"
+    },
+    {
+      "name": "pt/2sub nf fixed",
+      "axis": "per_token",
+      "eff_bits": 2.5,
+      "overlap": 0.38254,
+      "nmse": 0.1985,
+      "note": "2 head_dim sub-groups, 2.5b"
+    },
+    {
+      "name": "pt/nf2 fixed(std)",
+      "axis": "per_token",
+      "eff_bits": 2.25,
+      "overlap": 0.36587,
+      "nmse": 0.21329,
+      "note": "Gaussian NF, 1 side"
+    },
+    {
+      "name": "pt/had+uni2",
+      "axis": "per_token",
+      "eff_bits": 2.5,
+      "overlap": 0.36266,
+      "nmse": 0.19397,
+      "note": "QuaRot rot + uniform2"
+    },
+    {
+      "name": "pt/tern",
+      "axis": "per_token",
+      "eff_bits": 2.085,
+      "overlap": 0.31192,
+      "nmse": 0.31917,
+      "note": ""
+    },
+    {
+      "name": "pt/uni2 min-max",
+      "axis": "per_token",
+      "eff_bits": 2.5,
+      "overlap": 0.25899,
+      "nmse": 0.33933,
+      "note": "QuaRot \u65e0\u65cb\u8f6c"
+    },
+    {
+      "name": "pt/sign",
+      "axis": "per_token",
+      "eff_bits": 1.5,
+      "overlap": 0.2132,
+      "nmse": 0.46321,
+      "note": "\u5d29\u6e83\u57fa\u7ebf"
+    },
+    {
+      "name": "pt/had+sign",
+      "axis": "per_token",
+      "eff_bits": 1.5,
+      "overlap": 0.16994,
+      "nmse": 0.3435,
+      "note": "QuaRot rot + 1-bit"
+    }
+  ],
+  "champion": {
+    "name": "pt/outlier1+nf2 Lloyd",
+    "axis": "per_token",
+    "eff_bits": 2.4688,
+    "overlap": 0.55591,
+    "nmse": 0.08242,
+    "note": "keep top-1 chan fp16 + rest per-tok Lloyd"
+  }
+}
