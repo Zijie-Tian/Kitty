@@ -227,6 +227,16 @@ def build_registry():
     reg.append(make_method("pt/outlier3-int8+Lloyd", "per_token", 2.0, 1,
                            lambda x, G: outlier_keep_pertoken(lambda g: cb_lloyd(g, 4), 3, outlier_bits=8)(x, G),
                            "keep top-3 chan int8 + rest per-tok Lloyd", bits_override=(61 * 2 + 3 * 8 + 16) / 64))
+    # ---- iter 5: sweep smooth + (k outliers @ b bits) within 2.5 budget ---- #
+    reg.append(make_method("pt/smooth+outlier2-int8+Lloyd", "per_token", 2.0, 1,
+                           lambda x, G: smooth_then(outlier_keep_pertoken(lambda g: cb_lloyd(g, 4), 2, outlier_bits=8))(x, G),
+                           "smooth + top-2 int8 + Lloyd", bits_override=(62 * 2 + 2 * 8 + 16) / 64))
+    reg.append(make_method("pt/smooth+outlier3-6b+Lloyd", "per_token", 2.0, 1,
+                           lambda x, G: smooth_then(outlier_keep_pertoken(lambda g: cb_lloyd(g, 4), 3, outlier_bits=6))(x, G),
+                           "smooth + top-3 @6bit + Lloyd", bits_override=(61 * 2 + 3 * 6 + 16) / 64))
+    reg.append(make_method("pt/smooth+outlier4-4b+Lloyd", "per_token", 2.0, 1,
+                           lambda x, G: smooth_then(outlier_keep_pertoken(lambda g: cb_lloyd(g, 4), 4, outlier_bits=4))(x, G),
+                           "smooth + top-4 @4bit + Lloyd", bits_override=(60 * 2 + 4 * 4 + 16) / 64))
     return reg
 
 
