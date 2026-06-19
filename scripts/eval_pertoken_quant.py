@@ -91,9 +91,10 @@ def quant_per_token_sub(xHDT, cb, n_sub):
     rec = cb(x.reshape(H, T, n_sub, D // n_sub))
     return rec.reshape(H, T, D).transpose(1, 2)
 
-def outlier_keep_pertoken(cb, k):
-    """keep top-k energy channels (fixed per head) fp16; per-token quantize the rest
-    with the scale computed over ONLY the non-outlier channels (homogeneous group)."""
+def outlier_keep_pertoken(cb, k, outlier_bits=16):
+    """keep top-k energy channels (fixed per head) at `outlier_bits` (16=fp16, else
+    per-channel uniform); per-token quantize the rest with the scale over ONLY the
+    non-outlier channels (homogeneous group)."""
     def fn(xreg, G):
         H, D, T = xreg.shape
         keep = torch.zeros(H, D, dtype=torch.bool, device=xreg.device)
@@ -102,7 +103,16 @@ def outlier_keep_pertoken(cb, k):
         for h in range(H):
             nb = ~keep[h]
             out[h:h+1, nb, :] = quant_per_token(xreg[h:h+1, nb, :], cb)
+            if outlier_bits < 16:                       # per-channel uniform on kept chans
+                out[h:h+1, keep[h], :] = cb_uni(xreg[h:h+1, keep[h], :], 2 ** outlier_bits)
         return out
+    return fn
+
+def smooth_then(fn_region, alpha=0.5):
+    """QServe channel smooth (K/lam) wrapped around any region method, fold lam back."""
+    def fn(xreg, G):
+        lam = smooth_lambda(xreg, alpha)
+        return fn_region(xreg / lam, G) * lam
     return fn
 
 def quant_per_channel(xHDT, cb, G):
@@ -206,6 +216,17 @@ def build_registry():
     reg.append(make_method("pt/outlier1+nf2 Lloyd", "per_token", 2.0, 1,
                            lambda x, G: outlier_keep_pertoken(lambda g: cb_lloyd(g, 4), 1)(x, G),
                            "keep top-1 chan fp16 + rest per-tok Lloyd", bits_override=(63 * 2 + 16 + 16) / 64))
+    # ---- iter 4: stronger outlier isolation + smooth combos ---------------- #
+    # keep top-2 outlier chans @ int8 (cheaper than fp16) + per-tok Lloyd on 62
+    reg.append(make_method("pt/outlier2-int8+Lloyd", "per_token", 2.0, 1,
+                           lambda x, G: outlier_keep_pertoken(lambda g: cb_lloyd(g, 4), 2, outlier_bits=8)(x, G),
+                           "keep top-2 chan int8 + rest per-tok Lloyd", bits_override=(62 * 2 + 2 * 8 + 16) / 64))
+    reg.append(make_method("pt/smooth+outlier1+Lloyd", "per_token", 2.0, 1,
+                           lambda x, G: smooth_then(outlier_keep_pertoken(lambda g: cb_lloyd(g, 4), 1))(x, G),
+                           "smooth then keep top-1 + Lloyd", bits_override=(63 * 2 + 16 + 16) / 64))
+    reg.append(make_method("pt/outlier3-int8+Lloyd", "per_token", 2.0, 1,
+                           lambda x, G: outlier_keep_pertoken(lambda g: cb_lloyd(g, 4), 3, outlier_bits=8)(x, G),
+                           "keep top-3 chan int8 + rest per-tok Lloyd", bits_override=(61 * 2 + 3 * 8 + 16) / 64))
     return reg
 
 
