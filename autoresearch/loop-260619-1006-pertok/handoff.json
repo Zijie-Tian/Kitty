@@ -1,0 +1,18 @@
+{
+  "version": "2.1.0", "source": "loop", "timestamp": "2026-06-19T10:45:22", "status": "COMPLETE",
+  "results_tsv": "autoresearch/loop-260619-1006-pertok/results.tsv",
+  "findings": [
+    "per-token K overlap 0.461->0.717 (+0.256, 72% of per-token->per-channel gap) at <=2.5 bit",
+    "winner = SmoothAttention + isolate top-8 peak-amax channels @4bit per-channel + per-token Lloyd 2-bit on the other 56",
+    "three orthogonal levers (Hadamard rot / smooth / outlier isolation); outlier isolation is the strongest, interpolates per-token<->per-channel, optimum k~8",
+    "isolate by PEAK magnitude (amax) not variance (sigma2 selection 0.527 << amax 0.717)",
+    "LongBench 25-sample: champion 50.67 ~ fp16 50.34, beats per-token baseline 42.14 by +8.5; mfqa_en +14.7",
+    "implemented in kitty_simulate._quant_k_pertoken (pertoken_outlier_k/bits) + runner env PERTOKEN_OUTLIER_K/BITS (working tree, uncommitted)"
+  ],
+  "config": {
+    "goal": "reduce per-token K-cache quant error / maximize top-32 attention overlap",
+    "scope": "scripts/eval_pertoken_quant.py, src/kitty_sim/kitty_simulate.py, src/kitty_sim/longbench/runner.py",
+    "metric": "top-32 attention overlap (per-token, <=2.5 eff bits)", "direction": "higher_is_better",
+    "verify": "CUDA_VISIBLE_DEVICES=1 PYTHONPATH=src python scripts/eval_pertoken_quant.py --cache probe_out/kq_cache_llama32-1b.pt --bit-ceiling 2.5"
+  }
+}

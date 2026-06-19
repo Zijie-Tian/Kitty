@@ -34,3 +34,23 @@ per-token's flaw = one shared scale per 64 heterogeneous channels. Three orthogo
 ## To validate on LongBench (next phase)
 Top-2 for real-score check: (1) smooth+outlier8@4b+Lloyd champion, (2) smooth+per-token-nf2 (no outlier, existing path),
 vs fp16 ceiling and per-token-nf2 baseline. Needs outlier isolation added to kitty_simulate._quant_k_pertoken.
+
+## LongBench validation (25 samples, multifieldqa_en + hotpotqa, 32k)
+| config | mfqa_en | hotpotqa | avg |
+| --- | ---: | ---: | ---: |
+| fp16 (ceiling) | 57.74 | 42.94 | 50.34 |
+| per-token nf2 (baseline) | 41.33 | 42.95 | 42.14 |
+| smooth + per-token nf2 | 44.59 | 39.35 | 41.97 |
+| **CHAMPION smooth+outlier8@4b+Lloyd** | **56.0** | **45.35** | **50.67** |
+
+Champion +8.5 over per-token baseline, **matches fp16** (50.67 vs 50.34) on these K-fidelity-sensitive
+retrieval tasks. multifieldqa_en +14.7 (41.3->56.0). smooth alone ≈ baseline -> outlier isolation is the lever.
+Proxy (overlap 0.461->0.717) -> LongBench (+8.5) correlation confirmed. fp16 full-21 mean = 27.59 (doc-matched).
+Full 21-dataset runs (baseline + champion) running in background: run_full_longbench.sh -> longbench_out/.
+
+## How to run the champion on LongBench
+smooth ckpt = /home/zijie/models/Llama-3.2-1B-Instruct-smooth (scripts/calibrate_smooth_qk.py).
+QLUT_BIN_CODEBOOKS=nf2 PERTOKEN_OUTLIER_K=8 PERTOKEN_OUTLIER_BITS=4 \
+LLAMA32_MODEL_PATH=<smooth ckpt> LLAMA32_MODEL_SLUG=llama32-1b-instruct-smooth \
+MAX_MODEL_LEN=32768 LLAMA32_MAX_GEN=256 bash scripts/run_exp.sh llama32 --gpu 1 --variant qlutattn_pertoken
+# -> tag qlutattn_pertoken_nb1_v4_cb<h>_iso8b4. Code: kitty_simulate._quant_k_pertoken (outlier isolation, working-tree).
