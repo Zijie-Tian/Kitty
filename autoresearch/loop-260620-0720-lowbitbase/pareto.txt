@@ -29,3 +29,11 @@ sigma2-mix base (best per bit):
   2.896b  ov 0.6595  pt/smooth+out16@4b+mix[s,t,nf2]
   2.896b  ov 0.6520  pt/smooth+out16@4b+mix[ss,t,nf2]
   3.047b  ov 0.6577  pt/smooth+out16@4b+mix[s,s,t,nf2]
+
+=== LongBench smoke validation (25 samples, multifieldqa_en+hotpotqa) ===
+champion nf2 base outlier8@4bit : mfqa 56.0  hotpot 45.35  avg 50.67  (2.5/2.75 bit, proxy 0.717)
+nf2 base + outlier8@3bit        : mfqa 55.43 hotpot 45.35  avg 50.39  (2.375 bit, proxy 0.691) <- cheaper, ~same
+tern base   + outlier8@4bit     : mfqa 49.54 hotpot 35.35  avg 42.45  (2.387 bit, proxy 0.605) <- drops to baseline
+sign base   + outlier8@4bit     : mfqa 37.75 hotpot 27.03  avg 32.39  (1.875 bit, proxy 0.509) <- below baseline
+champion full-21 mean = 26.48 (final, repobench-p done)
+CONCLUSION: nf2 base is bit-optimal; cheapen OUTLIERS (4->3 bit, 2.375b ~ champion) not the base codebook.
