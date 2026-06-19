@@ -1,0 +1,31 @@
+GLOBAL Pareto frontier (overlap vs eff bits), per-token K, smooth+outlier:
+  1.625b -> ov 0.5051  pt/smooth+out8@4b+sign_sym
+  1.812b -> ov 0.5381  pt/smooth+out12@4b+sign_sym
+  2.000b -> ov 0.5678  pt/smooth+out16@4b+sign_sym
+  2.188b -> ov 0.5969  pt/smooth+out20@4b+sign_sym
+  2.375b -> ov 0.6914  pt/smooth+outlier8-3b+Lloyd
+  2.438b -> ov 0.7064  pt/smooth+outlier12-3b+Lloyd
+  2.500b -> ov 0.7168  pt/smooth+outlier8-4b+Lloyd
+  2.875b -> ov 0.7417  pt/smooth+out12@4b+nf2
+  3.000b -> ov 0.7594  pt/smooth+out16@4b+nf2
+  3.125b -> ov 0.7752  pt/smooth+out20@4b+nf2
+
+base-codebook @ k=8 outliers@4bit (the user's question):
+  sign_sym  base: 1.625b  ov 0.5051
+  sign      base: 1.875b  ov 0.5086
+  tern      base: 2.387b  ov 0.6050
+  nf2       base: 2.750b  ov 0.7168
+
+sigma2-mix base (best per bit):
+  2.312b  ov 0.5923  pt/smooth+out8@4b+mix[s,nf2]
+  2.312b  ov 0.5853  pt/smooth+out8@4b+mix[ss,nf2]
+  2.417b  ov 0.5817  pt/smooth+out8@4b+mix[s,s,nf2]
+  2.587b  ov 0.6048  pt/smooth+out8@4b+mix[s,t,nf2]
+  2.587b  ov 0.5956  pt/smooth+out8@4b+mix[ss,t,nf2]
+  2.625b  ov 0.6478  pt/smooth+out16@4b+mix[s,nf2]
+  2.625b  ov 0.6420  pt/smooth+out16@4b+mix[ss,nf2]
+  2.722b  ov 0.6004  pt/smooth+out8@4b+mix[s,s,t,nf2]
+  2.750b  ov 0.6398  pt/smooth+out16@4b+mix[s,s,nf2]
+  2.896b  ov 0.6595  pt/smooth+out16@4b+mix[s,t,nf2]
+  2.896b  ov 0.6520  pt/smooth+out16@4b+mix[ss,t,nf2]
+  3.047b  ov 0.6577  pt/smooth+out16@4b+mix[s,s,t,nf2]

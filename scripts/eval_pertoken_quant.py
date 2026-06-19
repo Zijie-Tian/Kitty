@@ -78,6 +78,10 @@ def cb_nf_fixed(xg, L):                # normalize by per-group std, snap to fix
     a = (z.unsqueeze(-1) - lev).abs().argmin(-1)
     return lev[a] * s
 
+def cb_sign_sym(xg):                   # symmetric 1-bit around 0: NO mean stored (1 side = scale)
+    s = xg.abs().mean(-1, keepdim=True)
+    return torch.sign(xg) * s
+
 # ----------------------------- axis drivers --------------------------------- #
 def quant_per_token(xHDT, cb):
     """group along head_dim: per (head, token) one group of D channels."""
@@ -116,6 +120,45 @@ def smooth_then(fn_region, alpha=0.5):
         lam = smooth_lambda(xreg, alpha)
         return fn_region(xreg / lam, G) * lam
     return fn
+
+
+_CW = {"sign_sym": 1.0, "sign": 1.0, "tern": float(np.log2(3)), "nf2": 2.0}
+_CBFN = {"sign_sym": cb_sign_sym, "sign": cb_sign, "tern": cb_tern, "nf2": lambda g: cb_lloyd(g, 4)}
+
+def mixed_base_pertoken(k, policy, outlier_bits=4):
+    """Champion + sigma^2-MIXED base on the non-outlier channels: keep top-k amax
+    channels per head @outlier_bits per-channel; bin the remaining channels by
+    per-channel residual sigma^2 into len(policy) equal bins (low sigma^2 -> policy[0]);
+    each bin's channels are per-token quantized with its codebook + own per-token scale.
+    policy: list of codebook NAMES (low->high sigma^2). Mirrors qlutattn-k1v4 but per-token."""
+    nbins = len(policy)
+    fns = [_CBFN[p] for p in policy]
+    def fn(xreg, G):
+        H, D, T = xreg.shape
+        keep_ids = xreg.abs().amax(2).topk(k, dim=1).indices
+        out = xreg.clone()
+        for h in range(H):
+            keep = torch.zeros(D, dtype=torch.bool, device=xreg.device); keep[keep_ids[h]] = True
+            nb_idx = (~keep).nonzero().squeeze(1)                 # non-outlier channel ids
+            sig2 = xreg[h][nb_idx].var(dim=1)                     # per-channel residual variance
+            order = sig2.argsort(); ranks = torch.empty_like(order); ranks[order] = torch.arange(len(order), device=xreg.device)
+            binid = (ranks.float() * nbins / len(order)).floor().long().clamp(max=nbins - 1)
+            for b in range(nbins):
+                ch = nb_idx[(binid == b).nonzero().squeeze(1)]
+                if ch.numel() == 0:
+                    continue
+                sub = xreg[h][ch].transpose(0, 1)[None]           # [1,T,nch] per-token group
+                out[h][ch] = fns[b](sub)[0].transpose(0, 1)
+            if outlier_bits < 16:                                 # outliers per-channel uniform @bits
+                out[h][keep] = cb_uni(xreg[h][keep][None], 2 ** outlier_bits)[0]
+        return out
+    return fn
+
+def mixed_base_bits(k, policy):
+    """eff bits: each sigma^2 bin = equal share of (64-k) channels, 1 fp16 scale/bin/token; outliers k@4."""
+    nb = 64 - k; nbins = len(policy)
+    cw = sum((nb / nbins) * _CW[p] for p in policy)
+    return (cw + 16 * nbins + k * 4) / 64
 
 def quant_per_channel(xHDT, cb, G):
     """group along token axis: per (head, channel) groups of G tokens."""
@@ -251,6 +294,40 @@ def build_registry():
                            lambda x, G: smooth_then(outlier_keep_pertoken(
                                lambda g: cb_lloyd(g, 4), 8, outlier_bits=4, by="var"))(x, G),
                            "k=8 selected by sigma^2 (vs amax champion)", bits_override=(56 * 2 + 8 * 4 + 16) / 64))
+    # ---- iter 8: LOWER-BIT BASE — replace nf2(2b) on the non-outlier channels --- #
+    # with sign_sym(1b,1side) / sign(submean 1b,2side) / tern(1.58b,2side) / nf2(2b,2side).
+    # honest accounting: per-token base group = (64-k) channels, +side fp16; outliers k@4bit.
+    #   eff = ((64-k)*cw_base + 16*side_base + k*4) / 64
+    BASES = {  # name -> (codebook_fn, codeword_bits, fp16_side_per_token_group)
+        "sign_sym": (cb_sign_sym, 1.0, 1),
+        "sign":     (cb_sign, 1.0, 2),
+        "tern":     (cb_tern, math.log2(3), 2),
+        "nf2":      (lambda g: cb_lloyd(g, 4), 2.0, 2),
+    }
+    for bname, (cbfn, cw, side) in BASES.items():
+        for k in (8, 12, 16, 20):
+            nb = 64 - k
+            bo = (nb * cw + 16 * side + k * 4) / 64
+            reg.append(make_method(
+                f"pt/smooth+out{k}@4b+{bname}", "per_token", cw, side,
+                (lambda fn, kk: lambda x, G: smooth_then(
+                    outlier_keep_pertoken(fn, kk, outlier_bits=4))(x, G))(cbfn, k),
+                f"{bname}-base on {nb}ch + top-{k}@4bit", bits_override=bo))
+    # ---- iter 9: sigma^2-MIXED base on non-outlier channels (qlutattn-k1v4 per-token) -- #
+    MIX = {
+        "mix[s,nf2]":      ["sign", "nf2"],
+        "mix[s,s,nf2]":    ["sign", "sign", "nf2"],
+        "mix[s,t,nf2]":    ["sign", "tern", "nf2"],
+        "mix[s,s,t,nf2]":  ["sign", "sign", "tern", "nf2"],
+        "mix[ss,nf2]":     ["sign_sym", "nf2"],
+        "mix[ss,t,nf2]":   ["sign_sym", "tern", "nf2"],
+    }
+    for mname, pol in MIX.items():
+        for k in (8, 16):
+            reg.append(make_method(
+                f"pt/smooth+out{k}@4b+{mname}", "per_token", 1.5, 2,
+                (lambda pp, kk: lambda x, G: smooth_then(mixed_base_pertoken(kk, pp))(x, G))(pol, k),
+                f"sigma2-mix {pol} on {64-k}ch + top-{k}@4bit", bits_override=mixed_base_bits(k, pol)))
     return reg
 
 
