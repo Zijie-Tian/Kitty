@@ -84,6 +84,27 @@ def quant_per_token(xHDT, cb):
     x = xHDT.transpose(1, 2)           # [H,T,D]
     return cb(x).transpose(1, 2)       # back to [H,D,T]
 
+def quant_per_token_sub(xHDT, cb, n_sub):
+    """split head_dim into n_sub contiguous sub-groups, each its own per-token scale."""
+    x = xHDT.transpose(1, 2)           # [H,T,D]
+    H, T, D = x.shape
+    rec = cb(x.reshape(H, T, n_sub, D // n_sub))
+    return rec.reshape(H, T, D).transpose(1, 2)
+
+def outlier_keep_pertoken(cb, k):
+    """keep top-k energy channels (fixed per head) fp16; per-token quantize the rest
+    with the scale computed over ONLY the non-outlier channels (homogeneous group)."""
+    def fn(xreg, G):
+        H, D, T = xreg.shape
+        keep = torch.zeros(H, D, dtype=torch.bool, device=xreg.device)
+        keep.scatter_(1, xreg.abs().amax(dim=2).topk(k, dim=1).indices, True)
+        out = xreg.clone()
+        for h in range(H):
+            nb = ~keep[h]
+            out[h:h+1, nb, :] = quant_per_token(xreg[h:h+1, nb, :], cb)
+        return out
+    return fn
+
 def quant_per_channel(xHDT, cb, G):
     """group along token axis: per (head, channel) groups of G tokens."""
     H, D, T = xHDT.shape; ng = T // G
@@ -109,8 +130,9 @@ def smooth_lambda(xHDT, alpha=0.5):     # QServe per-channel: lam=absmax(K_chan)
 # A method: dict(name, axis, bits, fn) where fn(x_region_or_full)->x_rec_full.
 # All operate on the quant region only; sink/recent kept fp16 by the runner.
 
-def make_method(name, axis, cw_bits, n_side, recon, note=""):
-    return dict(name=name, axis=axis, cw_bits=cw_bits, n_side=n_side, recon=recon, note=note)
+def make_method(name, axis, cw_bits, n_side, recon, note="", bits_override=None):
+    return dict(name=name, axis=axis, cw_bits=cw_bits, n_side=n_side, recon=recon,
+                note=note, bits_override=bits_override)
 
 
 def had_pertoken(cb):
@@ -171,6 +193,19 @@ def build_registry():
                            lambda x, G: smooth_pertoken(lambda g: cb_lloyd(g, 4), then_hadamard=True)(x, G), "smooth then rot + Lloyd"))
     reg.append(make_method("pt/smooth+had+nf2 fixed", "per_token", 2.0, 1,
                            lambda x, G: smooth_pertoken(lambda g: cb_nf_fixed(g, 4), then_hadamard=True)(x, G), "smooth+rot+NF 2.25b"))
+    # ---- iter 3: finer scale (sub-group) + outlier-channel isolation ------- #
+    reg.append(make_method("pt/2sub nf fixed", "per_token", 2.0, 2,
+                           lambda x, G: quant_per_token_sub(x, lambda g: cb_nf_fixed(g, 4), 2), "2 head_dim sub-groups, 2.5b"))
+    reg.append(make_method("pt/had+2sub nf fixed", "per_token", 2.0, 2,
+                           lambda x, G: rotate_D(quant_per_token_sub(rotate_D(x, hadamard_R(x.shape[1], x.device)),
+                                                                     lambda g: cb_nf_fixed(g, 4), 2),
+                                                 hadamard_R(x.shape[1], x.device)), "rot + 2 sub-groups, 2.5b"))
+    reg.append(make_method("pt/outlier1+nf2 fixed", "per_token", 2.0, 1,
+                           lambda x, G: outlier_keep_pertoken(lambda g: cb_nf_fixed(g, 4), 1)(x, G),
+                           "keep top-1 chan fp16 + rest per-tok NF", bits_override=(63 * 2 + 16 + 16) / 64))
+    reg.append(make_method("pt/outlier1+nf2 Lloyd", "per_token", 2.0, 1,
+                           lambda x, G: outlier_keep_pertoken(lambda g: cb_lloyd(g, 4), 1)(x, G),
+                           "keep top-1 chan fp16 + rest per-tok Lloyd", bits_override=(63 * 2 + 16 + 16) / 64))
     return reg
 
 
@@ -195,6 +230,8 @@ def main():
     Qs = [art["q_real"][li].to(dev).float() for li in range(nl)]   # [H,Q,D]
 
     def eff_bits(m):
+        if m["bits_override"] is not None:
+            return m["bits_override"]
         group = D if m["axis"] == "per_token" else G
         return m["cw_bits"] + 16.0 * m["n_side"] / group
 
