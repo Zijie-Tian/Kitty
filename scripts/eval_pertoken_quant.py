@@ -237,6 +237,13 @@ def build_registry():
     reg.append(make_method("pt/smooth+outlier4-4b+Lloyd", "per_token", 2.0, 1,
                            lambda x, G: smooth_then(outlier_keep_pertoken(lambda g: cb_lloyd(g, 4), 4, outlier_bits=4))(x, G),
                            "smooth + top-4 @4bit + Lloyd", bits_override=(60 * 2 + 4 * 4 + 16) / 64))
+    # ---- iter 6: push #isolated channels to saturation within 2.5b --------- #
+    for k, ob in [(8, 3), (8, 4), (12, 3), (16, 2)]:
+        bo = ((64 - k) * 2 + k * ob + 16) / 64
+        reg.append(make_method(f"pt/smooth+outlier{k}-{ob}b+Lloyd", "per_token", 2.0, 1,
+                               (lambda kk, obb: lambda x, G: smooth_then(
+                                   outlier_keep_pertoken(lambda g: cb_lloyd(g, 4), kk, outlier_bits=obb))(x, G))(k, ob),
+                               f"smooth + top-{k} @{ob}bit + Lloyd", bits_override=bo))
     return reg
 
 
