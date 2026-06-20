@@ -64,6 +64,16 @@ class VariantConfig:
     k_codebook: str = "kivi"
     bin_codebooks: tuple[str, ...] | None = None
     n_bins: int = 6
+    # per_token dense-and-sparse outlier isolation (the autoresearch per-token
+    # champion): keep top-k peak-|magnitude| channels per head at outlier_bits,
+    # per-token quantize the rest. 0 = off. Pair with a smoothed checkpoint.
+    pertoken_outlier_k: int = 0
+    pertoken_outlier_bits: int = 4
+    # qlutattn-k125v4-pt: per-CHANNEL mean removal (free for attention) + per-token
+    # pure binary on the residual. The confirmed per-token sign recipe.
+    pertoken_pc_submean: bool = False
+    # qlutattn-k1.68v4-pt: per-channel submean + sigma^2-binned mixed codebook (per-token).
+    pertoken_mixed: bool = False
 
     @property
     def tag(self) -> str:
@@ -72,7 +82,9 @@ class VariantConfig:
         ratio = str(self.promote_ratio).replace(".", "p")
         if self.k_codebook == "qlut":
             h = hashlib.sha256(repr(self.bin_codebooks).encode()).hexdigest()[:6]
-            return f"{self.name}_nb{self.n_bins}_v{self.vbits}_cb{h}"
+            iso = (f"_iso{self.pertoken_outlier_k}b{self.pertoken_outlier_bits}"
+                   if self.k_quant_mode == "per_token" and self.pertoken_outlier_k > 0 else "")
+            return f"{self.name}_nb{self.n_bins}_v{self.vbits}_cb{h}{iso}"
         if self.shadowkv:
             return f"{self.name}_sb{self.sparse_budget}_r{self.rank}_c{self.chunk_size}"
         suffix = ""
@@ -205,6 +217,48 @@ def build_variant(args: Any) -> VariantConfig:
             name="qlutattn_k184v4", use_kitty=True, k_codebook="qlut",
             bin_codebooks=("tern",) * 6, n_bins=6, vbits=4, promote_ratio=0.0,
             channel_selection=0, sink_length=32, buffer_length=128, group_size=128)
+    if variant in ("qlutattn_k125v4", "qlutattn-k125v4"):
+        # Uniform-sign K (all channels sign) + V 4-bit, ~1.25 bit K: cheapest
+        # member of the qlutattn-k<bits>v4 family (sign 1.25 < sigma^2-mix 1.68
+        # < tern 1.84). Pure-sign codebook isolated as a named variant so its
+        # method slug is qlutattn-k125v4 (no manual LLAMA32_MODEL_SLUG needed).
+        return VariantConfig(
+            name="qlutattn_k125v4", use_kitty=True, k_codebook="qlut",
+            bin_codebooks=("sign",) * 6, n_bins=6, vbits=4, promote_ratio=0.0,
+            channel_selection=0, sink_length=32, buffer_length=128, group_size=128)
+    if variant in ("qlutattn_k185v4_pt", "qlutattn-k185v4-pt"):
+        # PER-TOKEN tern (k184v4's per-token form) with per-CHANNEL mean removal:
+        # per-channel center (free for attention) then pure ternary on the residual.
+        # ~1.84 bit K (tern 1.585 + per-token mag 0.25; per-channel mu free), V 4-bit.
+        return VariantConfig(
+            name="qlutattn_k185v4_pt", use_kitty=True, k_codebook="qlut",
+            bin_codebooks=("tern",), n_bins=1, vbits=4, promote_ratio=0.0,
+            channel_selection=0, k_quant_mode="per_token", pertoken_pc_submean=True)
+    if variant in ("qlutattn_k168v4_pt", "qlutattn-k168v4-pt", "qlutattn-k1.68v4-pt"):
+        # PER-TOKEN sigma^2-binned MIXED codebook (k1v4's per-token form) with
+        # per-CHANNEL mean removal. Channels binned by residual sigma^2; per-bin
+        # codebook from QLUT_BIN_CODEBOOKS (default the k1v4 winner
+        # [sign,sign,sign,tern,nf2,nf2]). Per-channel center is free for attention.
+        pol = os.environ.get("QLUT_BIN_CODEBOOKS", "sign,sign,sign,tern,nf2,nf2")
+        bins = tuple(c.strip() for c in pol.split(","))
+        return VariantConfig(
+            name="qlutattn_k168v4_pt", use_kitty=True, k_codebook="qlut",
+            bin_codebooks=bins, n_bins=len(bins), vbits=4, promote_ratio=0.0,
+            channel_selection=0, k_quant_mode="per_token", pertoken_mixed=True)
+    if variant in ("qlutattn_k125v4_pt", "qlutattn-k125v4-pt"):
+        # PER-TOKEN version of qlutattn-k125v4: subtract a per-CHANNEL mean (free
+        # for attention -- q.mu cancels in softmax) then PURE per-token binary
+        # (sign) on the residual. ~1.25 bit K (1-bit + per-token mag; per-channel
+        # mu is amortized/free), V per-token 4-bit. This is the confirmed
+        # per-token sign recipe: per-channel center fixes the broken per-token
+        # submean (+0.26 overlap vs the naive per-token sign). QLUT_BIN_CODEBOOKS
+        # picks sign (default) or tern.
+        cb = os.environ.get("QLUT_BIN_CODEBOOKS", "sign")
+        return VariantConfig(
+            name="qlutattn_k125v4_pt", use_kitty=True, k_codebook="qlut",
+            bin_codebooks=(cb,), n_bins=1, vbits=4, promote_ratio=0.0,
+            channel_selection=0, k_quant_mode="per_token",
+            pertoken_pc_submean=True)
     if variant in ("qlutattn_pertoken", "qlut_pertoken"):
         # qlutattn-k1v4 turned per-token: a SINGLE submean codebook applied along
         # head_dim per token (sigma^2 binning has no per-channel axis in per-token
@@ -213,10 +267,15 @@ def build_variant(args: Any) -> VariantConfig:
         # (scripts/calibrate_smooth_qk.py) to flatten per-channel K outliers that
         # the shared per-token scale would otherwise smear.
         cb = os.environ.get("QLUT_BIN_CODEBOOKS", "nf2")
+        # PERTOKEN_OUTLIER_K>0 enables dense-and-sparse isolation (champion: 8 @4bit
+        # + smoothed ckpt). PERTOKEN_OUTLIER_BITS = per-channel precision of the kept.
+        ok = int(os.environ.get("PERTOKEN_OUTLIER_K", "0"))
+        obits = int(os.environ.get("PERTOKEN_OUTLIER_BITS", "4"))
         return VariantConfig(
             name="qlutattn_pertoken", use_kitty=True, k_codebook="qlut",
             bin_codebooks=(cb,), n_bins=1, vbits=4, promote_ratio=0.0,
-            channel_selection=0, k_quant_mode="per_token")
+            channel_selection=0, k_quant_mode="per_token",
+            pertoken_outlier_k=ok, pertoken_outlier_bits=obits)
     if variant in ("kivi", "kivi_star"):
         # KIVI-style uniform quant (NO promote, NO channel-select): K per-channel
         # + V per-token. kbits/vbits are free via --kbits/--vbits (default 2/2 =
@@ -267,6 +326,10 @@ def _cache_factory(config: VariantConfig):
         k_codebook=config.k_codebook,
         bin_codebooks=(list(config.bin_codebooks) if config.bin_codebooks else None),
         n_bins=config.n_bins,
+        pertoken_outlier_k=config.pertoken_outlier_k,
+        pertoken_outlier_bits=config.pertoken_outlier_bits,
+        pertoken_pc_submean=config.pertoken_pc_submean,
+        pertoken_mixed=config.pertoken_mixed,
     )
     return get_kvcache_kitty(ns)
 
@@ -347,6 +410,10 @@ def method_layout_slug(variant: VariantConfig | str) -> str:
         "shadowkv": "shadowkv",
         "qlutattn_k1v4": "qlutattn-k1v4",
         "qlutattn_k184v4": "qlutattn-k184v4",
+        "qlutattn_k125v4": "qlutattn-k125v4",
+        "qlutattn_k125v4_pt": "qlutattn-k125v4-pt",
+        "qlutattn_k185v4_pt": "qlutattn-k185v4-pt",
+        "qlutattn_k168v4_pt": "qlutattn-k168v4-pt",
     }.get(name, _layout_slug(name))
 
 

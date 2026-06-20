@@ -30,6 +30,15 @@ def build_parser() -> argparse.ArgumentParser:
             "qlutattn-k1v4",
             "qlutattn_k184v4",
             "qlutattn-k184v4",
+            "qlutattn_k125v4",
+            "qlutattn-k125v4",
+            "qlutattn_k125v4_pt",
+            "qlutattn-k125v4-pt",
+            "qlutattn_k185v4_pt",
+            "qlutattn-k185v4-pt",
+            "qlutattn_k168v4_pt",
+            "qlutattn-k168v4-pt",
+            "qlutattn-k1.68v4-pt",
         ],
     )
     # ShadowKV sim controls (variant=shadowkv only).
