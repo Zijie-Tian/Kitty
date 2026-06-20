@@ -8,8 +8,9 @@ These tests pin the behaviour added for cross-head K-channel boost allocation:
   * Allocation is per batch sample (independent across B).
   * fake_quant_groupwise_lastdim consumes a non-uniform mask correctly.
   * KittyKVCacheConfig accepts channel_selection=3 (and still rejects 2 / -1).
-  * build_variant wires kitty_k1v4_xhead (channel_selection=3, otherwise
-    identical to kitty_k1v4, including --promote-ratio-config support).
+
+channel_selection=3 has no built-in variant anymore (kitty_k1v4_xhead was
+removed); it stays reachable via --variant custom --channel_selection 3.
 
 Run with: python -m unittest tests.test_cross_head_promote_mask -v
 """
@@ -23,7 +24,6 @@ from types import SimpleNamespace
 import torch
 
 from kitty_sim.kitty_simulate import KittyKVCache, KittyKVCacheConfig
-from kitty_sim.longbench.runner import build_variant, method_layout_slug
 from kitty_sim.utils_quant import build_promote_mask, fake_quant_groupwise_lastdim
 
 
@@ -194,41 +194,6 @@ class CrossHeadPerLayerPrTests(unittest.TestCase):
                     self.assertEqual(total, nh * int(D * want_ratio + 1e-6), f"layer {layer}")
         finally:
             kitty_simulate.build_promote_mask = real
-
-
-class BuildVariantXheadTests(unittest.TestCase):
-    def _write(self, payload):
-        fd, path = tempfile.mkstemp(suffix=".json")
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle)
-        self.addCleanup(os.remove, path)
-        return path
-
-    def test_xhead_differs_from_k1v4_only_in_channel_selection(self):
-        base = build_variant(SimpleNamespace(variant="kitty_k1v4", promote_ratio_config=None))
-        xhead = build_variant(SimpleNamespace(variant="kitty_k1v4_xhead", promote_ratio_config=None))
-        self.assertEqual(xhead.name, "kitty_k1v4_xhead")
-        self.assertEqual(xhead.channel_selection, 3)
-        self.assertEqual(base.channel_selection, 1)
-        for field in ("kbits", "vbits", "promote_bit", "promote_ratio",
-                      "sink_length", "buffer_length", "group_size", "use_kitty"):
-            self.assertEqual(getattr(xhead, field), getattr(base, field), field)
-
-    def test_xhead_accepts_promote_ratio_config(self):
-        path = self._write({"default": 0.5})
-        v = build_variant(SimpleNamespace(variant="kitty_k1v4_xhead", promote_ratio_config=path))
-        self.assertEqual(v.promote_ratio, 0.5)
-        self.assertEqual(v.channel_selection, 3)
-        self.assertIsNone(v.promote_ratio_per_layer)
-
-    def test_xhead_layout_slug(self):
-        self.assertEqual(method_layout_slug("kitty_k1v4_xhead"), "kitty-k1v4-xhead")
-
-    def test_tag_distinguishes_selection_strategy(self):
-        base = build_variant(SimpleNamespace(variant="kitty_k1v4", promote_ratio_config=None))
-        xhead = build_variant(SimpleNamespace(variant="kitty_k1v4_xhead", promote_ratio_config=None))
-        self.assertIn("_sel1_", base.tag)
-        self.assertIn("_sel3_", xhead.tag)
 
 
 if __name__ == "__main__":

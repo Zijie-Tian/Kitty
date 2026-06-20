@@ -14,8 +14,7 @@ throughput class). The KV-cache *algorithm* is copied verbatim:
   (+ RoPE at the selected absolute positions), gather their values, and attend
   over the compact ``[local | outlier | selected | generated]`` buffer.
 
-Only the *engine* and the *RoPE op* differ from upstream, mirroring how Kitty
-already adapted QUEST into ``kitty_sim.sim_quest``:
+Only the *engine* and the *RoPE op* differ from upstream:
 - engine: ShadowKV's hand-written transformer + flash-attn/vLLM/CUTLASS kernels
   -> a stock HuggingFace model whose attention ``forward`` is method-patched and
   driven by HF ``generate`` (this module);
@@ -23,7 +22,7 @@ already adapted QUEST into ``kitty_sim.sim_quest``:
   identical pure-torch ``_rope_at_positions`` here, using the model's own rotary
   ``inv_freq`` so Llama-3.1 rope scaling stays exact.
 
-Like ``sim_quest``, this is an ACCURACY + relative-timing proxy: it does NOT
+This is an ACCURACY + relative-timing proxy: it does NOT
 save KV memory (the full value cache and the low-rank key factors stay resident
 on the GPU) and it is NOT a kernel-speed proof.
 

@@ -1,13 +1,12 @@
 # src/kitty/models/llama/modeling_llama.py
 #
-# Real Kitty + QUEST kernel path for the Llama architecture (e.g. Llama-3.2-1B).
+# Real Triton Kitty dense kernel path for the Llama architecture (e.g. Llama-3.2-1B).
 #
-# The real Kitty Triton kernels and the QUEST query-aware page selection are
-# architecture-agnostic at the attention-compute level: they operate on the
-# projected, RoPE-applied Q/K/V tensors and the KittyCache paged store. The only
-# model-specific piece is the attention forward, which must drive the KittyCache
-# protocol (update -> prefill dense / decode sparse kernel -> quantize) instead
-# of the stock HF cache protocol.
+# The real Kitty Triton kernels are architecture-agnostic at the
+# attention-compute level: they operate on the projected, RoPE-applied Q/K/V
+# tensors and the KittyCache paged store. The only model-specific piece is the
+# attention forward, which must drive the KittyCache protocol (update -> prefill
+# dense / decode dense kernel -> quantize) instead of the stock HF cache protocol.
 #
 # Rather than fork ~600 lines of Hugging Face's Llama modeling (and risk drifting
 # from the installed transformers version), we reuse the stock, already-validated
@@ -31,7 +30,7 @@ from transformers.models.llama.modeling_llama import (
     eager_attention_forward,
 )
 
-# The real Triton Kitty decode kernel + QUEST sparse selection.
+# The real Triton Kitty dense decode kernel.
 from kitty.kvcache.kernels.kitty_attention import kitty_attention_forward
 
 
@@ -66,7 +65,7 @@ def _llama_kitty_attention_forward(
     # (singular) on some versions/call sites, while model/generate APIs use
     # `past_key_values` (plural). Accept both so the KittyCache is never lost
     # (otherwise a singular-keyword call site silently passes None and decode would
-    # be mislabelled). Mirrors the sim hook fix in kitty_sim/sim_quest.py.
+    # be mislabelled).
     kv_cache = past_key_value if past_key_value is not None else past_key_values
     assert kv_cache is not None, (
         "LlamaForCausalLM_Kitty requires a KittyCache passed via past_key_values; "
@@ -93,7 +92,7 @@ def _llama_kitty_attention_forward(
             **kwargs,
         )
         kv_cache.quantize_prefill(self.layer_idx)
-    else:  # Decode: real Triton Kitty kernel + QUEST query-aware page selection.
+    else:  # Decode: real Triton Kitty dense kernel.
         attn_output, attn_weights = kitty_attention_forward(
             self,
             query_states,
@@ -126,7 +125,7 @@ def convert_llama_attention_to_kitty(model: torch.nn.Module) -> int:
 
 
 class LlamaForCausalLM_Kitty(LlamaForCausalLM):
-    """Stock Llama for causal LM with the Kitty + QUEST attention kernel wired in.
+    """Stock Llama for causal LM with the Kitty dense attention kernel wired in.
 
     Use exactly like the stock class, but pass a KittyCache via
     `past_key_values` to `generate()` / `forward()`:
@@ -135,8 +134,7 @@ class LlamaForCausalLM_Kitty(LlamaForCausalLM):
         from kitty.kvcache import get_kvcache_kitty
         model = LlamaForCausalLM_Kitty.from_pretrained(path, attn_implementation="sdpa")
         cache = get_kvcache_kitty(model.config, 1, ctx_len + max_gen,
-                                  page_size=16, quest_enabled=True,
-                                  quest_token_budget=2048, quest_skip_layers=0)
+                                  page_size=16)
         model.generate(**inputs, past_key_values=cache, disable_compile=True)
     """
 

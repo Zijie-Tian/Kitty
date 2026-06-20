@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Typed (per-channel) post-RoPE K-cache codebooks for the autoresearch study.
+QLUT-Attn k1v4 (per-channel) post-RoPE K-cache codebooks (formerly "typed").
 
 Core idea under test: spend quant bits in proportion to a channel's residual
 energy sigma^2. Channels are binned by per-layer sigma^2 quantile (bin 0 = lowest
@@ -102,7 +102,7 @@ def sigma2_bins(sig2, n_bins):
     return binid.reshape(sig2.shape)
 
 
-def apply_typed(x_full, bin_codebooks, binid, sink, recent, G):
+def apply_qlut(x_full, bin_codebooks, binid, sink, recent, G):
     """Reconstruct quant region: channels in bin b use codebook bin_codebooks[b];
     sink + recent kept fp16. bin_codebooks: list[str] len n_bins. Returns [H,D,T]."""
     H, D, T = x_full.shape
@@ -136,8 +136,8 @@ def compute_sigma_bins(key_region, group_size, n_bins):
     return sigma2_bins(sig2, n_bins)
 
 
-def fake_quant_typed_buffer(key_slice, bin_ids, bin_codebooks, group_size):
-    """key_slice:[B,nh,D,T] post-RoPE -> per-channel typed-codebook reconstruction.
+def fake_quant_qlut_buffer(key_slice, bin_ids, bin_codebooks, group_size):
+    """key_slice:[B,nh,D,T] post-RoPE -> per-channel qlut-codebook reconstruction.
     bin_ids:[nh,D] long (channel -> bin); bin_codebooks: list[str] (bin -> codebook)."""
     B = key_slice.shape[0]
     out = key_slice.clone()

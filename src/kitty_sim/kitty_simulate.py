@@ -38,11 +38,16 @@ class KittyKVCacheConfig(CacheConfig):
         promote_bit: int = 4,
         promote_ratio_per_layer: Optional[dict] = None,  # {layer_idx: ratio} overriding promote_ratio per layer; None = scalar for every layer
         channel_selection: int = 1,               # -1: Unspecified, 0: Random, 1: Magnitude-based, 3: Cross-head Magnitude (layer-global budget)
+        k_quant_mode: str = "per_channel",        # "per_channel": KIVI-style token-axis groups (+promote/qlut codebook); "per_token": K quantized like V along head_dim (uniform, no promote)
         VCache_BitDecoding: bool = False,         # The behavior of Value Cache, set to True means BitDecoding, otherwise KIVI Style Value Cache
         PostQuant: bool = True,                   # Post Quantization is always enabled
-        k_codebook: str = "kivi",                 # "kivi" = existing min-max groupwise K quant; "typed" = per-channel sigma^2-binned codebooks
-        bin_codebooks: Optional[list] = None,     # typed only: list[str] mapping sigma^2-bin -> codebook (meanonly/sign/tern/uni2/nf2/uni3)
-        n_bins: int = 6,                          # typed only: number of per-layer sigma^2 quantile bins
+        k_codebook: str = "kivi",                 # "kivi" = existing min-max groupwise K quant; "qlut" = per-channel sigma^2-binned codebooks (qlutattn-k1v4)
+        bin_codebooks: Optional[list] = None,     # qlut only: list[str] mapping sigma^2-bin -> codebook (meanonly/sign/tern/uni2/nf2/uni3)
+        n_bins: int = 6,                          # qlut only: number of per-layer sigma^2 quantile bins
+        pertoken_outlier_k: int = 0,              # per_token only: keep top-k peak-|magnitude| channels (per head, fixed) out of the shared per-token scale (dense-and-sparse). 0 = off.
+        pertoken_outlier_bits: int = 4,           # per_token only: precision of the kept outlier channels (per-channel along token; >=16 = fp16)
+        pertoken_pc_submean: bool = False,        # per_token only: subtract a per-CHANNEL mean (cached at prefill, free for attention) then pure binary/ternary on the residual (qlutattn-k125v4-pt). NOT the per-token submean.
+        pertoken_mixed: bool = False,             # per_token only: per-channel submean + sigma^2-binned MIXED codebook (qlutattn-k1.68v4-pt); bin_codebooks = per-bin policy (low sigma^2 -> bin 0).
     ):
         super().__init__("kitty_kv")
         self.sink_length = sink_length
@@ -60,11 +65,16 @@ class KittyKVCacheConfig(CacheConfig):
             else None
         )
         self.channel_selection = channel_selection
+        self.k_quant_mode = k_quant_mode
         self.VCache_BitDecoding = VCache_BitDecoding
         self.PostQuant = PostQuant
         self.k_codebook = k_codebook
         self.bin_codebooks = list(bin_codebooks) if bin_codebooks is not None else None
         self.n_bins = n_bins
+        self.pertoken_outlier_k = pertoken_outlier_k
+        self.pertoken_outlier_bits = pertoken_outlier_bits
+        self.pertoken_pc_submean = pertoken_pc_submean
+        self.pertoken_mixed = pertoken_mixed
         #
         self.validate()
 
@@ -74,12 +84,20 @@ class KittyKVCacheConfig(CacheConfig):
             "Some of the keys in `cache_config` are defined incorrectly. `{key}` should be {correct_value}` "
             "but found {found_value}"
         )
-        if self.k_codebook not in ("kivi", "typed"):
+        if self.k_codebook not in ("kivi", "qlut"):
             raise ValueError(
-                incorrect_arg_msg.format(key="k_codebook", correct_value="'kivi' or 'typed'",
+                incorrect_arg_msg.format(key="k_codebook", correct_value="'kivi' or 'qlut'",
                                          found_value=self.k_codebook))
-        if self.k_codebook == "typed" and not self.bin_codebooks:
-            raise ValueError("k_codebook='typed' requires a non-empty bin_codebooks list")
+        if self.k_codebook == "qlut" and not self.bin_codebooks:
+            raise ValueError("k_codebook='qlut' requires a non-empty bin_codebooks list")
+        if self.k_quant_mode not in ("per_channel", "per_token"):
+            raise ValueError(
+                incorrect_arg_msg.format(key="k_quant_mode", correct_value="'per_channel' or 'per_token'",
+                                         found_value=self.k_quant_mode))
+        if self.k_quant_mode == "per_token" and (self.promote_ratio != 0.0 or self.promote_ratio_per_layer is not None):
+            raise ValueError(
+                "k_quant_mode='per_token' requires promote_ratio=0.0 and no per-layer override "
+                "(per-token K has no channel axis at quantization time)")
         if self.channel_selection not in [0, 1, 3]:
             raise ValueError(
                 incorrect_arg_msg.format(
@@ -215,13 +233,26 @@ class KittyKVCache(DynamicCache):
         self.VCache_BitDecoding = cache_config.VCache_BitDecoding
         self.PostQuant = cache_config.PostQuant
         self.cache_implementation = cache_config.cache_implementation
-        # Typed (sigma^2-binned) K codebook support. k_bin_ids[layer_idx] = [nh,D]
+        # QLUT (sigma^2-binned) K codebook support. k_bin_ids[layer_idx] = [nh,D]
         # per-channel bin id, computed once (from the prompt quant region at prefill)
         # then reused for every buffer flush + decode. None for the default 'kivi' path.
+        self.k_quant_mode = cache_config.k_quant_mode
         self.k_codebook = cache_config.k_codebook
         self.bin_codebooks = cache_config.bin_codebooks
         self.n_bins = cache_config.n_bins
         self.k_bin_ids: dict[int, torch.Tensor] = {}
+        # per_token dense-and-sparse: per-layer fixed outlier channel ids [nh,k]
+        self.pertoken_outlier_k = getattr(cache_config, "pertoken_outlier_k", 0)
+        self.pertoken_outlier_bits = getattr(cache_config, "pertoken_outlier_bits", 4)
+        self.k_outlier_ids: dict[int, torch.Tensor] = {}
+        # k125v4-pt: per-channel mean (cached at prefill, reused at decode) for the
+        # per-channel-center + per-token pure-binary path. Free for attention.
+        self.pertoken_pc_submean = getattr(cache_config, "pertoken_pc_submean", False)
+        self.k_pc_mean: dict[int, torch.Tensor] = {}
+        # k1.68v4-pt: per-channel submean + sigma^2-binned mixed codebook. k_mix_bins
+        # caches the per-layer per-channel sigma^2-bin id [nh,D] (computed once at prefill).
+        self.pertoken_mixed = getattr(cache_config, "pertoken_mixed", False)
+        self.k_mix_bins: dict[int, torch.Tensor] = {}
         #
         #self.query_cache: list[torch.Tensor] = []
         #self.query_score: list[torch.Tensor] = []
@@ -235,19 +266,139 @@ class KittyKVCache(DynamicCache):
     def _ensure_k_bins(self, layer_idx, key_region_t):
         """Cache per-channel sigma^2-bins for a layer from a [B,nh,D,Tq] region.
         Called once with the full prompt quant region at prefill; no-op if set."""
-        if self.k_codebook != "typed" or layer_idx in self.k_bin_ids:
+        if self.k_codebook != "qlut" or layer_idx in self.k_bin_ids:
             return
-        from .typed_quant import compute_sigma_bins
+        from .qlut_quant import compute_sigma_bins
         self.k_bin_ids[layer_idx] = compute_sigma_bins(key_region_t, self.group_size, self.n_bins)
 
+    @staticmethod
+    def _pure_pt_codebook(sub, cb):
+        """Per-token PURE codebook over `sub` [...,nch] (last axis = a sigma^2-bin's
+        channels of one token). sign/tern are pure (NO submean -- the residual is
+        already per-channel centered); nf2/uni2/etc. go through apply_codebook (Lloyd)."""
+        if cb == "sign":
+            mag = sub.abs().mean(-1, keepdim=True)
+            return torch.sign(sub) * mag
+        if cb == "tern":
+            mag = sub.abs().mean(-1, keepdim=True)
+            mask = sub.abs() > 0.5 * mag
+            m2 = (sub.abs() * mask).sum(-1, keepdim=True) / mask.sum(-1, keepdim=True).clamp(min=1)
+            return torch.sign(sub) * m2 * mask
+        from .qlut_quant import apply_codebook
+        return apply_codebook(sub, sub.shape[-1], cb)
+
+    def _quant_k_pertoken(self, ks, layer_idx=0):
+        """Per-token K quant of a [B,nh,T,D] slice: one quantizer per token per
+        head along head_dim (like the KIVI-style V cache). k_codebook='qlut'
+        applies a SINGLE submean codebook along head_dim -- sigma^2 binning has no
+        per-channel axis in per-token mode, so bin_codebooks[0] is used for every
+        token (mu = per-token mean over head_dim channels); 'kivi' uses uniform
+        min-max. Pair with a SmoothAttention checkpoint to flatten per-channel
+        outliers that per-token sharing would otherwise smear into one scale.
+
+        pertoken_outlier_k>0 adds dense-and-sparse isolation (the autoresearch
+        per-token champion): the top-k PEAK-|magnitude| channels per head (fixed,
+        found once at prefill -- they dominate the shared per-token scale) are
+        pulled out and quantized per-channel at pertoken_outlier_bits, while the
+        remaining channels get the per-token codebook with a scale computed over
+        ONLY them. k=8 @4bit + Lloyd (+ smoothed ckpt) is the winner."""
+        if self.k_codebook != "qlut":
+            return fake_quant_groupwise_lastdim(ks, self.group_size, self.kbits)
+        from .qlut_quant import apply_codebook
+        cb = self.bin_codebooks[0]
+        B, nh, T, D = ks.shape
+        # k1.68v4-pt: per-channel submean + sigma^2-binned MIXED codebook. Channels are
+        # binned once (at prefill) by per-channel residual sigma^2 into len(bin_codebooks)
+        # quantile bins; each bin's channels get its codebook, per-token, on the
+        # per-channel-centered residual. Mirrors qlutattn-k1v4 but per-token.
+        if self.pertoken_mixed:
+            from .qlut_quant import sigma2_bins
+            policy = self.bin_codebooks
+            nbins = len(policy)
+            if layer_idx not in self.k_pc_mean and T >= D:
+                x0 = ks[0].float()                                          # [nh,T,D]
+                mu0 = x0.mean(dim=1)                                        # [nh,D] per-channel mean
+                self.k_pc_mean[layer_idx] = mu0
+                sig2 = (x0 - mu0[:, None, :]).pow(2).mean(dim=1)           # [nh,D] residual var over tokens
+                self.k_mix_bins[layer_idx] = sigma2_bins(sig2, nbins)      # [nh,D] sigma^2 quantile bins
+            mu = self.k_pc_mean.get(layer_idx)
+            binid = self.k_mix_bins.get(layer_idx)
+            if mu is None:                                                  # short-prompt fallback: single codebook
+                out = ks.clone()
+                for b in range(B):
+                    out[b] = apply_codebook(ks[b].float(), D, policy[0]).to(ks.dtype)
+                return out
+            muB = mu[None, :, None, :]
+            r = ks.float() - muB
+            out = torch.empty_like(r)
+            for h in range(nh):
+                oh = torch.empty_like(r[:, h])                             # [B,T,D]
+                for bi in range(nbins):
+                    mask = (binid[h] == bi)
+                    if not mask.any():
+                        continue
+                    oh[:, :, mask] = self._pure_pt_codebook(r[:, h][:, :, mask], policy[bi])
+                out[:, h] = oh
+            return (muB + out).to(ks.dtype)
+        # k125v4-pt: subtract a per-CHANNEL mean (cached once at prefill, reused at
+        # decode -- free for attention since q.mu is a per-query constant that cancels
+        # in softmax), then PURE binary/ternary on the residual (NO second per-token
+        # submean). This is the confirmed per-token sign recipe (per-channel center).
+        if self.pertoken_pc_submean:
+            if layer_idx not in self.k_pc_mean and T >= D:
+                self.k_pc_mean[layer_idx] = ks[0].float().mean(dim=1)      # [nh,D] per-channel mean over tokens
+            mu = self.k_pc_mean.get(layer_idx)
+            muB = (mu[None, :, None, :] if mu is not None
+                   else ks.float().mean(dim=3, keepdim=True))              # short-prompt fallback
+            r = ks.float() - muB
+            mag = r.abs().mean(dim=3, keepdim=True)                        # [B,nh,T,1] per-token scale
+            if cb == "tern":
+                mask = r.abs() > 0.5 * mag
+                mag2 = (r.abs() * mask).sum(3, keepdim=True) / mask.sum(3, keepdim=True).clamp(min=1)
+                q = torch.sign(r) * mag2 * mask
+            else:                                                          # "sign": pure 1-bit binary
+                q = torch.sign(r) * mag
+            return (muB + q).to(ks.dtype)
+        ok, obits = self.pertoken_outlier_k, self.pertoken_outlier_bits
+        if ok <= 0:
+            out = ks.clone()
+            for b in range(B):
+                out[b] = apply_codebook(ks[b].float(), D, cb).to(ks.dtype)
+            return out
+        # fix the outlier channels once from a long-enough slice (prefill region);
+        # reuse for every buffer flush + decode step.
+        if layer_idx not in self.k_outlier_ids and T >= D:
+            amax = ks[0].abs().amax(dim=1)                      # [nh,D] peak |K| per channel
+            self.k_outlier_ids[layer_idx] = amax.topk(ok, dim=1).indices  # [nh,k]
+        ids = self.k_outlier_ids.get(layer_idx)
+        out = ks.clone()
+        for b in range(B):
+            x = ks[b].float()                                   # [nh,T,D]
+            ob = x.clone()
+            for h in range(nh):
+                if ids is None:                                 # bins not set yet (region < D); plain per-token
+                    ob[h] = apply_codebook(x[h:h + 1], D, cb)[0]
+                    continue
+                keep = torch.zeros(D, dtype=torch.bool, device=x.device)
+                keep[ids[h]] = True
+                nb = ~keep
+                sub = x[h:h + 1][:, :, nb]                       # [1,T,D-k] non-outlier
+                ob[h][:, nb] = apply_codebook(sub, int(nb.sum().item()), cb)[0]
+                if obits < 16 and T > 1:                         # outliers: per-channel uniform @obits
+                    kept = x[h][:, keep].transpose(0, 1)[None, None]         # [1,1,k,T]
+                    ob[h][:, keep] = fake_quant_groupwise_lastdim(
+                        kept, min(self.group_size, T), obits)[0, 0].transpose(0, 1)  # [T,k]
+            out[b] = ob.to(ks.dtype)
+        return out
+
     def _quant_k_buffer(self, key_slice_t, layer_idx):
-        """Quantize a [B,nh,D,buffer] post-RoPE K buffer. 'typed' uses the layer's
+        """Quantize a [B,nh,D,buffer] post-RoPE K buffer. 'qlut' uses the layer's
         sigma^2-bins (lazily binned from this buffer if prefill never set them);
         default 'kivi' uses the existing min-max groupwise + promote path."""
-        if self.k_codebook == "typed":
-            from .typed_quant import fake_quant_typed_buffer
+        if self.k_codebook == "qlut":
+            from .qlut_quant import fake_quant_qlut_buffer
             self._ensure_k_bins(layer_idx, key_slice_t)
-            return fake_quant_typed_buffer(
+            return fake_quant_qlut_buffer(
                 key_slice_t, self.k_bin_ids[layer_idx], self.bin_codebooks, self.group_size)
         promote_mask = build_promote_mask(key_slice_t, self._layer_pr(layer_idx), self.channel_selection)
         return fake_quant_groupwise_lastdim(
@@ -337,15 +488,27 @@ class KittyKVCache(DynamicCache):
                 num_token_to_buffer = num_tokens % self.buffer_length
                 num_token_to_quantize = num_tokens - num_token_to_buffer
                 end_idx = start_idx + num_token_to_quantize
-                # Quantize Key Cache. Typed path bins channels by sigma^2 once over
-                # the full prompt quant region [sink, end_idx) before flushing buffers.
-                self._ensure_k_bins(
-                    layer_idx,
-                    current_key_cache[:, :, start_idx:end_idx, :].transpose(2, 3).contiguous())
-                for idx in range(start_idx, end_idx, self.buffer_length):
-                    key_slice = current_key_cache[:, :, idx:idx+self.buffer_length, :].transpose(2, 3).contiguous()
-                    key_slice = self._quant_k_buffer(key_slice, layer_idx).transpose(2, 3).contiguous()
-                    current_key_cache[:, :, idx:idx+self.buffer_length, :] = key_slice
+                # Quantize Key Cache.
+                if self.k_quant_mode == "per_token":
+                    # Per-token K mirrors the KIVI-style V cache: keep the most
+                    # recent buffer_length tokens fp16, quantize the rest with
+                    # groups along head_dim (no transpose, no promote). k_codebook
+                    # 'qlut' uses a single submean codebook here; 'kivi' uniform.
+                    k_end_idx = start_idx + (num_tokens - self.buffer_length)
+                    if k_end_idx > start_idx:
+                        ks = current_key_cache[:, :, start_idx:k_end_idx, :]
+                        ks = self._quant_k_pertoken(ks, layer_idx)
+                        current_key_cache[:, :, start_idx:k_end_idx, :] = ks
+                else:
+                    # QLUT/KIVI per-channel path: bin channels by sigma^2 once over
+                    # the full prompt quant region [sink, end_idx) before flushing buffers.
+                    self._ensure_k_bins(
+                        layer_idx,
+                        current_key_cache[:, :, start_idx:end_idx, :].transpose(2, 3).contiguous())
+                    for idx in range(start_idx, end_idx, self.buffer_length):
+                        key_slice = current_key_cache[:, :, idx:idx+self.buffer_length, :].transpose(2, 3).contiguous()
+                        key_slice = self._quant_k_buffer(key_slice, layer_idx).transpose(2, 3).contiguous()
+                        current_key_cache[:, :, idx:idx+self.buffer_length, :] = key_slice
                 # Quantize Value Cache
                 if not self.VCache_BitDecoding:
                     num_token_to_quantize = num_tokens - self.buffer_length   # KIVI Style Value Cache
@@ -368,7 +531,14 @@ class KittyKVCache(DynamicCache):
 
             # quantize
             num_tokens_kv_to_quantize = current_cache_length - self.sink_length - self.buffer_length
-            if num_tokens_kv_to_quantize > 0 and (num_tokens_kv_to_quantize % self.buffer_length == 1):  # need to quantize
+            if self.k_quant_mode == "per_token":
+                # Per-token K follows the KIVI-style V schedule: quantize the
+                # single token sliding out of the recent fp16 window each step.
+                if num_tokens_kv_to_quantize > 0:
+                    ks = current_key_cache[:, :, -self.buffer_length-1:-self.buffer_length, :]
+                    ks = self._quant_k_pertoken(ks, layer_idx)
+                    current_key_cache[:, :, -self.buffer_length-1:-self.buffer_length, :] = ks
+            elif num_tokens_kv_to_quantize > 0 and (num_tokens_kv_to_quantize % self.buffer_length == 1):  # need to quantize
                 # Quantize Key Cache
                 key_slice = current_key_cache[:, :, -self.buffer_length-1:-1, :].transpose(2, 3).contiguous()
                 key_slice = self._quant_k_buffer(key_slice, layer_idx).transpose(2, 3).contiguous()
@@ -407,11 +577,16 @@ def get_kvcache_kitty(args: argparse.Namespace) -> KittyKVCache:
         promote_bit         = args.promote_bit,
         promote_ratio_per_layer = getattr(args, "promote_ratio_per_layer", None),
         channel_selection   = args.channel_selection,
+        k_quant_mode        = getattr(args, "k_quant_mode", "per_channel"),
         VCache_BitDecoding  = False,  # Using KIVI Style V Cache
         PostQuant           = True,  # Post Quantization is always enabled for Kitty KV Cache
         k_codebook          = getattr(args, "k_codebook", "kivi"),
         bin_codebooks       = getattr(args, "bin_codebooks", None),
         n_bins              = getattr(args, "n_bins", 6),
+        pertoken_outlier_k  = getattr(args, "pertoken_outlier_k", 0),
+        pertoken_outlier_bits = getattr(args, "pertoken_outlier_bits", 4),
+        pertoken_pc_submean = getattr(args, "pertoken_pc_submean", False),
+        pertoken_mixed      = getattr(args, "pertoken_mixed", False),
     )
     #
     return KittyKVCache(cache_config=cache_config)

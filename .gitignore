@@ -24,3 +24,6 @@ logs/longbench
 /logs/longbench_gpu1
 /quest_check_logs
 /configs/
+# offline reorder / SmoothAttention 标定产物（大 checkpoint，可再生，不跟踪）
+/reorder
+/calib

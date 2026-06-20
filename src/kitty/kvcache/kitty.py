@@ -8,7 +8,6 @@
 # Author: Haojun Xia (xhjustc@gmail.com)
 
 from typing import Optional, Any
-from dataclasses import dataclass
 import argparse
 import math
 
@@ -19,32 +18,6 @@ from transformers.configuration_utils import PretrainedConfig
 #
 from .kernels.kitty_quant_pack import quantize_pack_k, quantize_pack_v
 from .utils_kv_per_layer import KVCache_Layer
-
-
-@dataclass(frozen=True)
-class QuestConfig:
-    """Runtime controls for query-aware QUEST selection over Kitty pages.
-
-    The first implementation uses a correctness-first PyTorch sparse path for
-    page16. It selects logical quantized middle pages and consumes Kitty's
-    quantized K/V cache for the selected support.
-    """
-
-    enabled: bool = False
-    topk_pages: int | None = None
-    token_budget: int | None = None
-    skip_layers: int = 0
-    force_sparse_for_equivalence: bool = False
-    use_python_debug: bool = False
-
-    def __post_init__(self) -> None:
-        for name, value in (("topk_pages", self.topk_pages), ("token_budget", self.token_budget), ("skip_layers", self.skip_layers)):
-            if value is None:
-                continue
-            if not isinstance(value, int):
-                raise TypeError(f"{name} must be an int or None; got {type(value).__name__}.")
-            if value < 0:
-                raise ValueError(f"{name} must be non-negative; got {value}.")
 
 
 class KittyCache(Cache):
@@ -60,12 +33,6 @@ class KittyCache(Cache):
         max_length: int,
         page_size: int = 128,
         promote_ratio: float = 0.125,
-        quest_config: QuestConfig | None = None,
-        quest_enabled: bool = False,
-        quest_topk_pages: int | None = None,
-        quest_token_budget: int | None = None,
-        quest_skip_layers: int = 0,
-        force_sparse_for_equivalence: bool = False,
     ) -> None:
         try:
             # transformers>=4.57 requires explicit layer storage at Cache init time.
@@ -83,22 +50,9 @@ class KittyCache(Cache):
         ######################## Kitty Specific Configurations ########################
         if not math.isfinite(promote_ratio) or not 0 <= promote_ratio <= 1:
             raise ValueError(f"promote_ratio must be finite and in [0, 1]; got {promote_ratio}.")
-        self.page_size = page_size              # PAGE_SIZE=128 by default; page_size=16 for QUEST-aligned experiments.
+        self.page_size = page_size              # PAGE_SIZE=128 by default; page_size=16 for page16 experiments.
         self.promote_ratio = promote_ratio      # 0.125 for paper Kitty; 0.25 for Kitty-Pro.
         self.d_boosted = int(self.head_dim * promote_ratio + 1e-6)
-        if quest_config is None and quest_enabled and quest_topk_pages is None and quest_token_budget is None:
-            # User-facing QUEST+Kitty routes default to a reduced 2048-token budget
-            # so they cannot silently become dense full-budget runs. Explicit
-            # QuestConfig(enabled=True) remains available for internal full-budget
-            # equivalence/debug paths.
-            quest_token_budget = 2048
-        self.quest_config = quest_config or QuestConfig(
-            enabled=quest_enabled,
-            topk_pages=quest_topk_pages,
-            token_budget=quest_token_budget,
-            skip_layers=quest_skip_layers,
-            force_sparse_for_equivalence=force_sparse_for_equivalence,
-        )
         self.sink_length = 32                   # SINK_LENGTH=32
         self.low_bit = 2                        # LOW_BIT=2
         self.high_bit = 4                       # HIGH_BIT=4
@@ -117,7 +71,6 @@ class KittyCache(Cache):
                 S = self.sink_length
             )
             layer.layer_idx = layer_idx
-            layer.quest_config = self.quest_config
             self.kv_cache.append(layer)
 
     def update(
@@ -334,13 +287,7 @@ def get_kvcache_kitty(
         max_batch_size: int,
         max_length: int,
         page_size: int = 128,
-        promote_ratio: float = 0.125,
-        quest_config: QuestConfig | None = None,
-        quest_enabled: bool = False,
-        quest_topk_pages: int | None = None,
-        quest_token_budget: int | None = None,
-        quest_skip_layers: int = 0,
-        force_sparse_for_equivalence: bool = False,) -> KittyCache:
+        promote_ratio: float = 0.125,) -> KittyCache:
     """
     Get the KittyCache object.
     Returns:
@@ -353,10 +300,4 @@ def get_kvcache_kitty(
         max_length=max_length,
         page_size=page_size,
         promote_ratio=promote_ratio,
-        quest_config=quest_config,
-        quest_enabled=quest_enabled,
-        quest_topk_pages=quest_topk_pages,
-        quest_token_budget=quest_token_budget,
-        quest_skip_layers=quest_skip_layers,
-        force_sparse_for_equivalence=force_sparse_for_equivalence,
     )

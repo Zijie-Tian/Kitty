@@ -1,6 +1,6 @@
 # src/kitty/models/phi3/modeling_phi3.py
 #
-# Real Kitty + QUEST kernel path for the Phi-3 / Phi-4-mini architecture.
+# Real Triton Kitty dense kernel path for the Phi-3 / Phi-4-mini architecture.
 #
 # Mirrors kitty/models/llama (LlamaForCausalLM_Kitty): reuse the stock,
 # already-validated `Phi3ForCausalLM` for everything (embeddings, partial RoPE +
@@ -30,7 +30,7 @@ from transformers.models.phi3.modeling_phi3 import (
     eager_attention_forward,
 )
 
-# The real Triton Kitty decode kernel + QUEST sparse selection.
+# The real Triton Kitty dense decode kernel.
 from kitty.kvcache.kernels.kitty_attention import kitty_attention_forward
 
 
@@ -92,7 +92,7 @@ def _phi3_kitty_attention_forward(
             **kwargs,
         )
         kv_cache.quantize_prefill(self.layer_idx)
-    else:  # Decode: real Triton Kitty kernel + QUEST query-aware page selection.
+    else:  # Decode: real Triton Kitty dense kernel.
         attn_output, attn_weights = kitty_attention_forward(
             self,
             query_states,
@@ -125,7 +125,7 @@ def convert_phi3_attention_to_kitty(model: torch.nn.Module) -> int:
 
 
 class Phi3ForCausalLM_Kitty(Phi3ForCausalLM):
-    """Stock Phi-3 / Phi-4-mini causal LM with the Kitty + QUEST kernel wired in.
+    """Stock Phi-3 / Phi-4-mini causal LM with the Kitty dense kernel wired in.
 
     Use exactly like the stock class, but pass a KittyCache via `past_key_values`
     to `generate()` / `forward()`:
@@ -134,8 +134,7 @@ class Phi3ForCausalLM_Kitty(Phi3ForCausalLM):
         from kitty.kvcache import get_kvcache_kitty
         model = Phi3ForCausalLM_Kitty.from_pretrained(path, attn_implementation="sdpa")
         cache = get_kvcache_kitty(model.config, 1, ctx_len + max_gen,
-                                  page_size=16, quest_enabled=True,
-                                  quest_token_budget=2048, quest_skip_layers=0)
+                                  page_size=16)
         model.generate(**inputs, past_key_values=cache, disable_compile=True)
     """
 

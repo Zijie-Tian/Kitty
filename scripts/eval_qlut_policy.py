@@ -2,17 +2,17 @@
 # -*- coding: utf-8 -*-
 """
 Autoresearch verify harness: given a sigma^2-binned codebook policy
-(configs/typed_policy.json), load the cached post-RoPE K/Q
+(configs/qlut_policy.json), load the cached post-RoPE K/Q
 (probe_out/kq_cache_<tag>.pt), apply per-bin codebooks, and report:
   - eff_bits : average KV bits/element under the policy (THE metric, lower better)
   - overlap  : top-32 attended-token overlap vs fp16 K, real last-N queries (THE guard)
-Writes probe_out/typed_policy_eval.json.
+Writes probe_out/qlut_policy_eval.json.
 
 Policy JSON: {"group_size":128, "bin_codebooks":["meanonly","sign",...]}  (len=n_bins)
 
 Usage:
-  CUDA_VISIBLE_DEVICES=0 python scripts/eval_typed_policy.py \
-      --cache probe_out/kq_cache_llama32-1b.pt --policy configs/typed_policy.json
+  CUDA_VISIBLE_DEVICES=0 python scripts/eval_qlut_policy.py \
+      --cache probe_out/kq_cache_llama32-1b.pt --policy configs/qlut_policy.json
 """
 import argparse
 import json
@@ -22,7 +22,7 @@ import sys
 import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
-from kitty_sim.typed_quant import (apply_typed, channel_sigma2, codebook_bits,
+from kitty_sim.qlut_quant import (apply_qlut, channel_sigma2, codebook_bits,
                                    effective_bits, sigma2_bins)
 
 
@@ -30,8 +30,8 @@ from kitty_sim.typed_quant import (apply_typed, channel_sigma2, codebook_bits,
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--cache", default="probe_out/kq_cache_llama32-1b.pt")
-    ap.add_argument("--policy", default="configs/typed_policy.json")
-    ap.add_argument("--out", default="probe_out/typed_policy_eval.json")
+    ap.add_argument("--policy", default="configs/qlut_policy.json")
+    ap.add_argument("--out", default="probe_out/qlut_policy_eval.json")
     args = ap.parse_args()
 
     dev = "cuda:0" if torch.cuda.is_available() else "cpu"
@@ -53,7 +53,7 @@ def main():
         binid = sigma2_bins(sig2, n_bins)
         bits_sum += effective_bits(bin_codebooks, binid, G)
         bin_counts += torch.bincount(binid.reshape(-1).cpu(), minlength=n_bins).float()
-        xr = apply_typed(x, bin_codebooks, binid, sink, recent, G)
+        xr = apply_qlut(x, bin_codebooks, binid, sink, recent, G)
         s_true = torch.einsum("hqd,hdt->hqt", q, x)
         s_rec = torch.einsum("hqd,hdt->hqt", q, xr)
         t1 = torch.zeros_like(s_true, dtype=torch.bool).scatter(

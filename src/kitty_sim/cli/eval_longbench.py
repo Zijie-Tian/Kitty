@@ -21,33 +21,25 @@ def build_parser() -> argparse.ArgumentParser:
         choices=[
             "fp16",
             "kitty",
-            "quest_kitty_page16_kernel",
-            "quest_kitty_page16_sim",
             "shadowkv",
-            "kitty_pro",
-            "kitty_k1v4",
-            "kitty_k1v4_xhead",
-            "kivi_2",
-            "kivi_star_2",
+            "qlutattn_pertoken",
+            "kivi",
+            "kivi_star",
             "custom",
-            "typed",
-            "typed_winner",
-            "tern_uniform",
-            "tern_k",
+            "qlutattn_k1v4",
+            "qlutattn-k1v4",
+            "qlutattn_k184v4",
+            "qlutattn-k184v4",
+            "qlutattn_k125v4",
+            "qlutattn-k125v4",
+            "qlutattn_k125v4_pt",
+            "qlutattn-k125v4-pt",
+            "qlutattn_k185v4_pt",
+            "qlutattn-k185v4-pt",
+            "qlutattn_k168v4_pt",
+            "qlutattn-k168v4-pt",
+            "qlutattn-k1.68v4-pt",
         ],
-    )
-    # Real QUEST+Kitty kernel controls (variant=quest_kitty_page16_kernel only).
-    parser.add_argument(
-        "--quest-token-budget",
-        type=int,
-        default=None,
-        help="QUEST token budget for the real kernel (page16: 2048 -> 128 pages). Defaults to 2048.",
-    )
-    parser.add_argument(
-        "--quest-skip-layers",
-        type=int,
-        default=0,
-        help="Number of leading decode layers to run dense instead of QUEST sparse (default 0).",
     )
     # ShadowKV sim controls (variant=shadowkv only).
     parser.add_argument(
