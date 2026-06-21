@@ -238,6 +238,8 @@ datasets across GPUs, use a single target, e.g. `run_exp.sh llama32 --gpus 0,1,2
 | `qlutattn_k125v4_pt` | `qlutattn-k125v4-pt` | **Per-token sign with per-CHANNEL mean removal** (the fixed submean): subtract a per-channel μ (cached at prefill, free for attention — `q·μ` cancels in softmax), then pure 1-bit binary on the residual. ~1.25 bit K, V per-token 4-bit. Per-token form of `qlutattn-k125v4`; fixes the broken per-TOKEN submean (full LongBench 10.99→**21.68**). `QLUT_BIN_CODEBOOKS=tern` switches codebook. |
 | `qlutattn_k185v4_pt` | `qlutattn-k185v4-pt` | Per-token **tern** + per-channel mean removal. ~1.84 bit K, V 4-bit. Per-token form of `qlutattn-k184v4`. |
 | `qlutattn_k168v4_pt` | `qlutattn-k168v4-pt` | Per-token K with an **OFFLINE per-channel sign/tern codebook**. Each post-RoPE K channel is fixed offline to sign (1.25b, low σ²) or tern (1.85b, high σ²) by `scripts/calibrate_k168v4_pt.py` on wikitext (default ~28% sign → nominal **1.68b**); the mask is given via `QLUT_CB_MASK` and used unchanged — **no online σ² binning, no nf2**. Per-channel mean still self-calibrated at prefill (free for attention). V per-token 4-bit. Corrected impl: the old online-σ²+nf2 path was ~3b, scored 1B-full **14.39** and collapsed summarization (gov_report 0.64); offline sign/tern restores it (smoke gov_report→14.5). |
+| `qlutattn_rotated_k125v4_pt` | `qlutattn-rotated-k125v4-pt` | **Rotated** per-token sign (k125 + Hadamard): per-channel mean, FWHT-rotate residual → isotropic, per-token sign, de-rotate (FWHT self-inverse). ~1.25 bit K, V 4-bit. Rotation hidden inside K quant (free for attention). 1B full **22.14** (vs sign 21.39). See the rotated-k*v4-pt section for the no-offline-fold / cost rationale. |
+| `qlutattn_rotated_k185v4_pt` | `qlutattn-rotated-k185v4-pt` | **Rotated** per-token tern (k185 + Hadamard). ~1.84 bit K. 1B full **24.21** (vs tern 22.54) — approaches per-channel k1v4 24.88 using only sign/tern. |
 | `fp16` | `fp16` | Full-precision baseline — no Kitty cache, HF dense fp16 KV. |
 | `kivi` | `kivi-k{kbits}v{vbits}` | KIVI-style uniform quant (no promote, no channel-select, no sink). K/V bit-width is set via `KBITS`/`VBITS` (default 2/2 = the old `kivi_2`); the slug encodes the bits so each combo gets its own dir (e.g. `kivi-k2v4`). |
 | `kivi_star` | `kivi-star-k{kbits}v{vbits}` | Same as `kivi` but `sink_length=32` (the old `kivi_star_2`). |
@@ -539,6 +541,82 @@ uses `QLUT_BIN_CODEBOOKS`. `qlutattn_k125v4_pt` / `qlutattn_k185v4_pt` take a si
 `QLUT_BIN_CODEBOOKS` name (default `sign` / `tern`). The legacy online-σ²+nf2 mixed
 path is still reachable via `--variant custom` with `pertoken_mixed`, but is
 superseded (14.39 on 1B).
+
+## qlutattn-rotated-k*v4-pt (Hadamard-rotated per-token K)
+
+`qlutattn_rotated_k125v4_pt` (rotated sign) and `qlutattn_rotated_k185v4_pt` (rotated
+tern) add a **normalized Hadamard rotation** to the per-token K quant. On the
+`pertoken_pc_submean` path: subtract the per-channel mean, **FWHT-rotate the residual**
+into an isotropic basis, per-token sign/tern quantize, then **de-rotate** (FWHT is
+self-inverse). Rotation spreads the post-RoPE K channel outliers (the KIVI finding) so a
+single per-token scale fits every channel.
+
+**de-rotate trick (why attention is untouched).** The stored key is
+`k_hat = μ + H·quant(H·(k−μ))`, kept in the ORIGINAL post-RoPE basis. Then
+`q·k_hat = q·μ + (Hq)·quant(...)` — `q·μ` is a per-query constant (cancels in softmax) and
+`(Hq)·quant(...)` is exactly the rotated-basis dot. So the rotation lives entirely inside
+`_quant_k_pertoken` (`_fwht_lastdim` = a vectorized self-inverse FWHT; `pertoken_rotate`
+flag); the attention/query path and `q` are NOT modified. Fake-quant accuracy proxy (no
+real KV-memory saving), like the rest of qlutattn.
+
+**Results (Llama-3.2-1B, full LongBench 21 datasets, 32k).** Rotation lifts the whole
+sign/tern line; tern benefits more than sign:
+
+| variant | K bit | no-rotation | rotated | Δ |
+| --- | ---: | ---: | ---: | ---: |
+| k125 (sign) | 1.25 | 21.39 | **22.14** | +0.75 |
+| k185 (tern) | 1.85 | 22.54 | **24.21** | +1.67 |
+
+rotated-tern @1.85b (24.21) approaches per-channel k1v4 (24.88) and sign/nf2 @1.875b
+(25.03) using only sign/tern (no nf2 per-token Lloyd). nf2 still wins the high-bit end
+(rotation does NOT beat sign/nf2). sign's real gain is modest vs the synthetic oracle
+(14→47% attn recovery) because real post-RoPE outliers are milder than the synthetic 12×
+and 1-bit is intrinsically limited.
+
+**Engineering notes (deciding facts for productionizing — kept on purpose).**
+- The rotation MATRIX is offline / zero-calibration (a fixed Hadamard needs no data).
+  "online" here means *applying* the FWHT at runtime, not calibrating it.
+- The rotation **cannot be folded into the weights** in the general case. We rotate the
+  **post-RoPE** K, and RoPE is a position-dependent runtime op sitting between `W_k` and the
+  attention dot — nothing after RoPE absorbs into a static weight. Folding a dense Hadamard
+  *pre-RoPE* makes the score `qᵀHᵀR_Δ H k`, which equals the true `qᵀR_Δ k` only if H commutes
+  with RoPE; a dense Hadamard does NOT, so pre-RoPE folding **breaks attention** (not "loses a
+  little accuracy"). Only a RoPE-commuting grouped-head rotation (RotateKV) folds, but it
+  decorrelates within-head weakly and flattens pre-RoPE (not the harmful post-RoPE) outliers,
+  so it cannot match 24.21. Hence "offline-fold + plain existing method + same accuracy" is
+  **impossible for the K cache** (QuaRot/KVLinC concur: K needs an online Hadamard; only V,
+  which has no RoPE, folds fully).
+- **Cost split.** Only the per-channel mean μ is truly prefill-only (computed once, cached,
+  reused at decode). The rotation is applied to every token's value, so it runs at BOTH
+  prefill (whole region) AND decode (one token/step; real deployment also rotates the one
+  query/step). But the decode increment is tiny: one `O(d·log d)` FWHT per token (d=64),
+  <0.1% of a decode step's attention+MLP and fusible into the attention kernel — decode
+  throughput is effectively unaffected, though NOT literally zero. Verdict: keep it online
+  (current behavior); there is no offline-fold variant that preserves the accuracy.
+
+No checkpoint/calibration needed — run directly:
+
+```bash
+# smoke (2 samples/dataset)
+cd /home/zijie/Code/Kitty
+LLAMA32_MODEL_PATH=/home/zijie/models/Llama-3.2-1B-Instruct \
+MAX_MODEL_LEN=32768 LLAMA32_MAX_GEN=256 DATASETS_CSV=multifieldqa_en,gov_report \
+bash scripts/run_exp.sh llama32 --gpu 0 --variant qlutattn_rotated_k125v4_pt --max-samples 2
+# swap --variant for qlutattn_rotated_k185v4_pt (rotated tern)
+```
+
+```bash
+# full (all 21 datasets, 32k)
+cd /home/zijie/Code/Kitty
+LLAMA32_MODEL_PATH=/home/zijie/models/Llama-3.2-1B-Instruct \
+MAX_MODEL_LEN=32768 LLAMA32_MAX_GEN=256 \
+bash scripts/run_exp.sh llama32 --gpus 0,0,0,1,1,1,2,2,2 --variant qlutattn_rotated_k125v4_pt
+# -> longbench_out/llama32-1b-instruct_qlutattn-rotated-k125v4-pt/{pred,logs}
+```
+
+Invariants/oracle: `scripts/verify_rotated_oracle.py` (0-GPU) checks orthogonality /
+self-inverse / FWHT==matmul(H) all <1e-6 and reproduces the synthetic trend (sign
+14→47%, tern 25→67% attn recovery).
 
 ## qlutattn-k1v4 per-token exploration (reorder + SmoothAttention)
 
