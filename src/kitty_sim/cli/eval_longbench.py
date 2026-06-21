@@ -45,6 +45,10 @@ def build_parser() -> argparse.ArgumentParser:
             "qlutattn-rotated-k125v4-pt",
             "qlutattn_rotated_k185v4_pt",
             "qlutattn-rotated-k185v4-pt",
+            "qlutattn_rotated_st_pt",
+            "qlutattn-rotated-st-pt",
+            "qlutattn_rotated_snf_pt",
+            "qlutattn-rotated-snf-pt",
         ],
     )
     # ShadowKV sim controls (variant=shadowkv only).

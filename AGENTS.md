@@ -618,6 +618,46 @@ Invariants/oracle: `scripts/verify_rotated_oracle.py` (0-GPU) checks orthogonali
 self-inverse / FWHT==matmul(H) all <1e-6 and reproduces the synthetic trend (sign
 14→47%, tern 25→67% attn recovery).
 
+### Rotated σ²-mix variants: `qlutattn_rotated_st_pt` / `qlutattn_rotated_snf_pt`
+
+Two MIX variants combine the online Hadamard with an offline codebook mask (k168/k188 +
+rotation): `qlutattn_rotated_st_pt` (sign/tern) and `qlutattn_rotated_snf_pt` (sign/nf2).
+The offline mask sets each channel's codebook; the **fraction of cheap (sign) channels
+controls the effective K bit/value**. At runtime the per-channel-centered residual is
+Hadamard-rotated ONLINE, per-bin quantized, then de-rotated (rotation never touches the
+offline step). They reuse the `pertoken_offline` path with `pertoken_rotate=True`; the mask
+carries its own codebooks.
+
+**Key fact — rotation turns the mask into a pure ratio.** After the Hadamard the basis is
+isotropic, so the per-channel σ² heterogeneity the mask sorted by is gone: WHICH channels
+get sign vs tern/nf2 no longer matters, only HOW MANY (the ratio). Therefore:
+- the offline calibration does NOT need to know about rotation (rotation is online-only);
+- reuse the plain `calibrate_k168v4_pt.py` (original-basis σ², **no `--rotate` needed**);
+- `--sign-frac` is the single knob → the K bit/value: `bit = f·1.25 + (1−f)·1.85` (sign/tern)
+  or `f·1.25 + (1−f)·2.5` (sign/nf2).
+
+**Flow — offline ratio (→bit), then online rotation:**
+```bash
+# 1) offline: pick ratio f -> bit, generate the mask (NO rotation here; ~1min/card)
+CUDA_VISIBLE_DEVICES=0 PYTHONPATH=src python scripts/calibrate_k168v4_pt.py \
+  --model /home/zijie/models/Llama-3.2-1B-Instruct \
+  --calib-data /home/zijie/data/wikitext/wikitext-2-raw-v1/train-00000-of-00001.parquet \
+  --codebooks sign,nf2 --sign-frac 0.5 \
+  --output /home/zijie/models/Llama-3.2-1B-Instruct.rot_snf_f50.pt
+# sign,tern for the st variant; sweep --sign-frac in {1.0,0.75,0.5,0.25,0.0} for the bit axis
+```
+```bash
+# 2) online: QLUT_CB_MASK points at that mask; the FWHT rotation is applied at runtime
+QLUT_CB_MASK=/home/zijie/models/Llama-3.2-1B-Instruct.rot_snf_f50.pt \
+LLAMA32_MODEL_PATH=/home/zijie/models/Llama-3.2-1B-Instruct LLAMA32_MODEL_SLUG=llama32-1b-rot-snf-f50 \
+MAX_MODEL_LEN=32768 LLAMA32_MAX_GEN=256 \
+bash scripts/run_exp.sh llama32 --gpus 0,0,0,1,1,1,2,2,2 --variant qlutattn_rotated_snf_pt
+# -> longbench_out/llama32-1b-rot-snf-f50_qlutattn-rotated-snf-pt/{pred,logs}
+```
+Set `LLAMA32_MODEL_SLUG` per ratio so a sweep's dirs don't collide. The mix endpoints
+(f=1.0 pure sign, f=0.0 pure tern/nf2) coincide with the single-codebook rotated variants
+(`qlutattn_rotated_k125v4_pt` / `_k185v4_pt`).
+
 ## qlutattn-k1v4 per-token exploration (reorder + SmoothAttention)
 
 Research probes pushing qlutattn-k1v4's K quant from **per-channel** to

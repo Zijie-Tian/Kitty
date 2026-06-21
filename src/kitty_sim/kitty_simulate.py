@@ -430,19 +430,24 @@ class KittyKVCache(DynamicCache):
             muB = (mu[None, :, None, :] if mu is not None
                    else ks.float().mean(dim=3, keepdim=True))              # short-prompt fallback
             r = ks.float() - muB
+            if self.pertoken_rotate:                                       # rotate into isotropic basis (mask is sigma^2-calibrated in THIS basis)
+                r = self._fwht_lastdim(r)
             cb_id = self.k_cb_mask.get(layer_idx)
-            if cb_id is None:                                              # layer absent from mask: single codebook
+            if cb_id is None:                                             # layer absent from mask: single codebook
                 full = torch.ones(nh, D, dtype=torch.bool, device=ks.device)
-                return (muB + self._pt_codebook_masked(r, full, self.bin_codebooks[0])).to(ks.dtype)
-            if cb_id.device != ks.device:
-                cb_id = cb_id.to(ks.device)
-                self.k_cb_mask[layer_idx] = cb_id
-            out = torch.zeros_like(r)
-            for ci, cbk in enumerate(self.bin_codebooks):                 # e.g. ["sign","tern"]
-                m = (cb_id == ci)                                         # [nh,D]
-                if not m.any():
-                    continue
-                out = out + self._pt_codebook_masked(r, m, cbk)
+                out = self._pt_codebook_masked(r, full, self.bin_codebooks[0])
+            else:
+                if cb_id.device != ks.device:
+                    cb_id = cb_id.to(ks.device)
+                    self.k_cb_mask[layer_idx] = cb_id
+                out = torch.zeros_like(r)
+                for ci, cbk in enumerate(self.bin_codebooks):             # e.g. ["sign","tern"] / ["sign","nf2"]
+                    m = (cb_id == ci)                                     # [nh,D]
+                    if not m.any():
+                        continue
+                    out = out + self._pt_codebook_masked(r, m, cbk)
+            if self.pertoken_rotate:                                       # de-rotate (FWHT self-inverse) back to original basis
+                out = self._fwht_lastdim(out)
             return (muB + out).to(ks.dtype)
         # k1.68v4-pt: per-channel submean + sigma^2-binned MIXED codebook. Channels are
         # binned once (at prefill) by per-channel residual sigma^2 into len(bin_codebooks)

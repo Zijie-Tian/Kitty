@@ -308,6 +308,37 @@ def build_variant(args: Any) -> VariantConfig:
             bin_codebooks=(cb,), n_bins=1, vbits=4, promote_ratio=0.0,
             channel_selection=0, k_quant_mode="per_token",
             pertoken_pc_submean=True, pertoken_rotate=True)
+    if variant in ("qlutattn_rotated_st_pt", "qlutattn-rotated-st-pt"):
+        # ROTATED sign/tern offline-MIX (k168v4-pt + online Hadamard). The offline
+        # mask (calibrate_k168v4_pt.py --codebooks sign,tern --sign-frac <f>) sets the
+        # sign:tern ratio -> the effective K bit/value; online FWHT rotates the residual
+        # so the mix is quantized in an isotropic basis (rotation is online, not baked
+        # into the mask). mask carries its codebooks (override bin_codebooks at load).
+        mask = os.environ.get("QLUT_CB_MASK", "")
+        if not mask or not os.path.exists(mask):
+            raise FileNotFoundError(
+                "qlutattn_rotated_st_pt requires QLUT_CB_MASK=/path/to/mask.pt (generate via "
+                "scripts/calibrate_k168v4_pt.py --codebooks sign,tern --sign-frac <f>). "
+                f"Got QLUT_CB_MASK='{mask}'")
+        return VariantConfig(
+            name="qlutattn_rotated_st_pt", use_kitty=True, k_codebook="qlut",
+            bin_codebooks=("sign", "tern"), n_bins=2, vbits=4, promote_ratio=0.0,
+            channel_selection=0, k_quant_mode="per_token",
+            pertoken_cb_mask=mask, pertoken_rotate=True)
+    if variant in ("qlutattn_rotated_snf_pt", "qlutattn-rotated-snf-pt"):
+        # ROTATED sign/nf2 offline-MIX (k188v4-pt + online Hadamard). sign-frac (in the
+        # mask) sets the bit/value; online FWHT rotates the residual before per-bin quant.
+        mask = os.environ.get("QLUT_CB_MASK", "")
+        if not mask or not os.path.exists(mask):
+            raise FileNotFoundError(
+                "qlutattn_rotated_snf_pt requires QLUT_CB_MASK=/path/to/mask.pt (generate via "
+                "scripts/calibrate_k168v4_pt.py --codebooks sign,nf2 --sign-frac <f>). "
+                f"Got QLUT_CB_MASK='{mask}'")
+        return VariantConfig(
+            name="qlutattn_rotated_snf_pt", use_kitty=True, k_codebook="qlut",
+            bin_codebooks=("sign", "nf2"), n_bins=2, vbits=4, promote_ratio=0.0,
+            channel_selection=0, k_quant_mode="per_token",
+            pertoken_cb_mask=mask, pertoken_rotate=True)
     if variant in ("qlutattn_pertoken", "qlut_pertoken"):
         # qlutattn-k1v4 turned per-token: a SINGLE submean codebook applied along
         # head_dim per token (sigma^2 binning has no per-channel axis in per-token
@@ -468,6 +499,8 @@ def method_layout_slug(variant: VariantConfig | str) -> str:
         "qlutattn_k188v4_pt": "qlutattn-k188v4-pt",
         "qlutattn_rotated_k125v4_pt": "qlutattn-rotated-k125v4-pt",
         "qlutattn_rotated_k185v4_pt": "qlutattn-rotated-k185v4-pt",
+        "qlutattn_rotated_st_pt": "qlutattn-rotated-st-pt",
+        "qlutattn_rotated_snf_pt": "qlutattn-rotated-snf-pt",
     }.get(name, _layout_slug(name))
 
 
