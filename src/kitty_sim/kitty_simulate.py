@@ -49,6 +49,7 @@ class KittyKVCacheConfig(CacheConfig):
         pertoken_pc_submean: bool = False,        # per_token only: subtract a per-CHANNEL mean (cached at prefill, free for attention) then pure binary/ternary on the residual (qlutattn-k125v4-pt). NOT the per-token submean.
         pertoken_mixed: bool = False,             # per_token only: per-channel submean + sigma^2-binned MIXED codebook (ONLINE sigma^2, legacy k1.68v4-pt path); bin_codebooks = per-bin policy (low sigma^2 -> bin 0).
         pertoken_cb_mask: Optional[str] = None,   # per_token only: path to an OFFLINE per-(layer,head,channel) codebook mask (the corrected k168v4-pt). When set, each channel uses bin_codebooks[mask[c]] FIXED (offline sigma^2 calibration -> sign/tern), no online sigma^2 binning, no nf2.
+        pertoken_rotate: bool = False,            # per_token only: Hadamard-rotate (FWHT) the per-channel-centered residual before per-token quant, de-rotate after (FWHT self-inverse). Spreads K outliers -> isotropic -> per-token sign/tern fits one scale. Free for attention (orthogonal; q.mu cancels). qlutattn-rotated-k*v4-pt.
     ):
         super().__init__("kitty_kv")
         self.sink_length = sink_length
@@ -77,6 +78,7 @@ class KittyKVCacheConfig(CacheConfig):
         self.pertoken_pc_submean = pertoken_pc_submean
         self.pertoken_mixed = pertoken_mixed
         self.pertoken_cb_mask = pertoken_cb_mask
+        self.pertoken_rotate = pertoken_rotate
         #
         self.validate()
 
@@ -257,6 +259,7 @@ class KittyKVCache(DynamicCache):
         self.k_mix_bins: dict[int, torch.Tensor] = {}
         # k168v4-pt (corrected): OFFLINE per-(layer,head,channel) codebook mask (sign/tern),
         # loaded once and used unchanged -- NOT recomputed per prompt. k_cb_mask[layer]=[nh,D].
+        self.pertoken_rotate = getattr(cache_config, "pertoken_rotate", False)
         self.pertoken_cb_mask_path = getattr(cache_config, "pertoken_cb_mask", None)
         self.pertoken_offline = bool(self.pertoken_cb_mask_path)
         self.k_cb_mask: dict[int, torch.Tensor] = {}
@@ -372,6 +375,29 @@ class KittyKVCache(DynamicCache):
             return r * mb
         raise ValueError(cb)
 
+    @staticmethod
+    def _fwht_lastdim(x):
+        """Normalized fast Walsh-Hadamard transform along the last axis (head_dim,
+        a power of 2: 64 on Llama-3.2-1B, 128 on 3B). SELF-INVERSE so de-rotation
+        is the same call: fwht(fwht(x)) == x. O(d log d), vectorized (no dense
+        d x d matmul). Used by qlutattn-rotated-*: rotate the per-channel-centered
+        residual into an isotropic basis before per-token quant, then de-rotate
+        the dequantized result so the stored key is in the original basis and the
+        rest of attention (q . k_hat) is unchanged -- equivalent to rotating q."""
+        n = x.shape[-1]
+        if n & (n - 1) != 0:
+            raise ValueError(f"FWHT needs head_dim a power of 2, got {n}")
+        lead = x.shape[:-1]
+        y = x
+        h = 1
+        while h < n:
+            y = y.reshape(*lead, n // (2 * h), 2, h)
+            a0 = y[..., 0, :]
+            a1 = y[..., 1, :]
+            y = torch.stack((a0 + a1, a0 - a1), dim=-2).reshape(*lead, n)
+            h *= 2
+        return y / (n ** 0.5)
+
     def _quant_k_pertoken(self, ks, layer_idx=0):
         """Per-token K quant of a [B,nh,T,D] slice: one quantizer per token per
         head along head_dim (like the KIVI-style V cache). k_codebook='qlut'
@@ -476,6 +502,8 @@ class KittyKVCache(DynamicCache):
             muB = (mu[None, :, None, :] if mu is not None
                    else ks.float().mean(dim=3, keepdim=True))              # short-prompt fallback
             r = ks.float() - muB
+            if self.pertoken_rotate:                                       # Hadamard-rotate residual into isotropic basis
+                r = self._fwht_lastdim(r)
             mag = r.abs().mean(dim=3, keepdim=True)                        # [B,nh,T,1] per-token scale
             if cb == "tern":
                 mask = r.abs() > 0.5 * mag
@@ -483,6 +511,8 @@ class KittyKVCache(DynamicCache):
                 q = torch.sign(r) * mag2 * mask
             else:                                                          # "sign": pure 1-bit binary
                 q = torch.sign(r) * mag
+            if self.pertoken_rotate:                                       # de-rotate (FWHT self-inverse) back to original basis
+                q = self._fwht_lastdim(q)
             return (muB + q).to(ks.dtype)
         ok, obits = self.pertoken_outlier_k, self.pertoken_outlier_bits
         if ok <= 0:
@@ -713,6 +743,7 @@ def get_kvcache_kitty(args: argparse.Namespace) -> KittyKVCache:
         pertoken_pc_submean = getattr(args, "pertoken_pc_submean", False),
         pertoken_mixed      = getattr(args, "pertoken_mixed", False),
         pertoken_cb_mask    = getattr(args, "pertoken_cb_mask", None),
+        pertoken_rotate     = getattr(args, "pertoken_rotate", False),
     )
     #
     return KittyKVCache(cache_config=cache_config)

@@ -76,6 +76,8 @@ class VariantConfig:
     pertoken_mixed: bool = False
     # qlutattn-k168v4-pt (corrected): path to an OFFLINE per-channel sign/tern codebook mask.
     pertoken_cb_mask: Optional[str] = None
+    # qlutattn-rotated-k*v4-pt: Hadamard-rotate the per-channel-centered residual before per-token quant.
+    pertoken_rotate: bool = False
 
     @property
     def tag(self) -> str:
@@ -285,6 +287,27 @@ def build_variant(args: Any) -> VariantConfig:
             bin_codebooks=(cb,), n_bins=1, vbits=4, promote_ratio=0.0,
             channel_selection=0, k_quant_mode="per_token",
             pertoken_pc_submean=True)
+    if variant in ("qlutattn_rotated_k125v4_pt", "qlutattn-rotated-k125v4-pt"):
+        # ROTATED per-token sign (k125v4-pt + Hadamard). Per-channel mean removal,
+        # then FWHT-rotate the residual into an isotropic basis so one per-token
+        # scale fits all channels (spreads post-RoPE K outliers), pure 1-bit sign,
+        # then de-rotate (FWHT self-inverse). ~1.25 bit K, V 4-bit. Rotation is
+        # free for attention (orthogonal). QLUT_BIN_CODEBOOKS picks sign/tern.
+        cb = os.environ.get("QLUT_BIN_CODEBOOKS", "sign")
+        return VariantConfig(
+            name="qlutattn_rotated_k125v4_pt", use_kitty=True, k_codebook="qlut",
+            bin_codebooks=(cb,), n_bins=1, vbits=4, promote_ratio=0.0,
+            channel_selection=0, k_quant_mode="per_token",
+            pertoken_pc_submean=True, pertoken_rotate=True)
+    if variant in ("qlutattn_rotated_k185v4_pt", "qlutattn-rotated-k185v4-pt"):
+        # ROTATED per-token tern (k185v4-pt + Hadamard): ternary codebook on the
+        # rotated per-channel-centered residual. ~1.84 bit K, V 4-bit.
+        cb = os.environ.get("QLUT_BIN_CODEBOOKS", "tern")
+        return VariantConfig(
+            name="qlutattn_rotated_k185v4_pt", use_kitty=True, k_codebook="qlut",
+            bin_codebooks=(cb,), n_bins=1, vbits=4, promote_ratio=0.0,
+            channel_selection=0, k_quant_mode="per_token",
+            pertoken_pc_submean=True, pertoken_rotate=True)
     if variant in ("qlutattn_pertoken", "qlut_pertoken"):
         # qlutattn-k1v4 turned per-token: a SINGLE submean codebook applied along
         # head_dim per token (sigma^2 binning has no per-channel axis in per-token
@@ -357,6 +380,7 @@ def _cache_factory(config: VariantConfig):
         pertoken_pc_submean=config.pertoken_pc_submean,
         pertoken_mixed=config.pertoken_mixed,
         pertoken_cb_mask=config.pertoken_cb_mask,
+        pertoken_rotate=config.pertoken_rotate,
     )
     return get_kvcache_kitty(ns)
 
@@ -442,6 +466,8 @@ def method_layout_slug(variant: VariantConfig | str) -> str:
         "qlutattn_k185v4_pt": "qlutattn-k185v4-pt",
         "qlutattn_k168v4_pt": "qlutattn-k168v4-pt",
         "qlutattn_k188v4_pt": "qlutattn-k188v4-pt",
+        "qlutattn_rotated_k125v4_pt": "qlutattn-rotated-k125v4-pt",
+        "qlutattn_rotated_k185v4_pt": "qlutattn-rotated-k185v4-pt",
     }.get(name, _layout_slug(name))
 
 
