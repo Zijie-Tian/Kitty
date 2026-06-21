@@ -318,6 +318,9 @@ class KittyKVCache(DynamicCache):
         neg = (~mb).expand_as(r)
         lo = r.masked_fill(neg, float("inf")).amin(-1, keepdim=True)
         hi = r.masked_fill(neg, float("-inf")).amax(-1, keepdim=True)
+        empty = lo > hi                                                # all-False row: a head with NO channel in this bin
+        lo = torch.where(empty, torch.zeros_like(lo), lo)             # avoid +inf/-inf -> NaN levels (this head is masked out anyway)
+        hi = torch.where(empty, torch.zeros_like(hi), hi)
         ar = torch.arange(L, device=r.device, dtype=r.dtype)
         lev = lo + (hi - lo) * (ar + 0.5) / L                          # [B,nh,T,L]
         mbf = mb.to(r.dtype).unsqueeze(-1)                             # [1,nh,1,D,1]
@@ -357,6 +360,9 @@ class KittyKVCache(DynamicCache):
             neg = (~mb).expand_as(r)
             mn = r.masked_fill(neg, float("inf")).amin(-1, keepdim=True)
             mx = r.masked_fill(neg, float("-inf")).amax(-1, keepdim=True)
+            empty = mn > mx                                           # all-False row guard (no channel in this bin)
+            mn = torch.where(empty, torch.zeros_like(mn), mn)
+            mx = torch.where(empty, torch.zeros_like(mx), mx)
             scale = (mx - mn).clamp(min=1e-6) / (L - 1)
             q = ((r - mn) / scale).round().clamp(0, L - 1)
             return (q * scale + mn) * mb
