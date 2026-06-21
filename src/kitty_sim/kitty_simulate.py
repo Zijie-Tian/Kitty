@@ -47,7 +47,8 @@ class KittyKVCacheConfig(CacheConfig):
         pertoken_outlier_k: int = 0,              # per_token only: keep top-k peak-|magnitude| channels (per head, fixed) out of the shared per-token scale (dense-and-sparse). 0 = off.
         pertoken_outlier_bits: int = 4,           # per_token only: precision of the kept outlier channels (per-channel along token; >=16 = fp16)
         pertoken_pc_submean: bool = False,        # per_token only: subtract a per-CHANNEL mean (cached at prefill, free for attention) then pure binary/ternary on the residual (qlutattn-k125v4-pt). NOT the per-token submean.
-        pertoken_mixed: bool = False,             # per_token only: per-channel submean + sigma^2-binned MIXED codebook (qlutattn-k1.68v4-pt); bin_codebooks = per-bin policy (low sigma^2 -> bin 0).
+        pertoken_mixed: bool = False,             # per_token only: per-channel submean + sigma^2-binned MIXED codebook (ONLINE sigma^2, legacy k1.68v4-pt path); bin_codebooks = per-bin policy (low sigma^2 -> bin 0).
+        pertoken_cb_mask: Optional[str] = None,   # per_token only: path to an OFFLINE per-(layer,head,channel) codebook mask (the corrected k168v4-pt). When set, each channel uses bin_codebooks[mask[c]] FIXED (offline sigma^2 calibration -> sign/tern), no online sigma^2 binning, no nf2.
     ):
         super().__init__("kitty_kv")
         self.sink_length = sink_length
@@ -75,6 +76,7 @@ class KittyKVCacheConfig(CacheConfig):
         self.pertoken_outlier_bits = pertoken_outlier_bits
         self.pertoken_pc_submean = pertoken_pc_submean
         self.pertoken_mixed = pertoken_mixed
+        self.pertoken_cb_mask = pertoken_cb_mask
         #
         self.validate()
 
@@ -253,6 +255,22 @@ class KittyKVCache(DynamicCache):
         # caches the per-layer per-channel sigma^2-bin id [nh,D] (computed once at prefill).
         self.pertoken_mixed = getattr(cache_config, "pertoken_mixed", False)
         self.k_mix_bins: dict[int, torch.Tensor] = {}
+        # k168v4-pt (corrected): OFFLINE per-(layer,head,channel) codebook mask (sign/tern),
+        # loaded once and used unchanged -- NOT recomputed per prompt. k_cb_mask[layer]=[nh,D].
+        self.pertoken_cb_mask_path = getattr(cache_config, "pertoken_cb_mask", None)
+        self.pertoken_offline = bool(self.pertoken_cb_mask_path)
+        self.k_cb_mask: dict[int, torch.Tensor] = {}
+        if self.pertoken_offline:
+            _blob = torch.load(self.pertoken_cb_mask_path, map_location="cpu", weights_only=False)
+            _m = _blob["codebook_mask"]                        # [nl, n_kv, D] uint8 (0=low,1=high)
+            for _li in range(_m.shape[0]):
+                self.k_cb_mask[_li] = _m[_li].long()           # [n_kv, D]
+            _cbs = _blob.get("codebooks")
+            if _cbs:                                           # mask file defines the codebooks (sign/tern, sign/nf2, ...)
+                self.bin_codebooks = list(_cbs)
+            print(f"[qlutattn-offline] loaded codebook mask {tuple(_m.shape)} from "
+                  f"{self.pertoken_cb_mask_path} codebooks={self.bin_codebooks} "
+                  f"nominal~{_blob.get('nominal_bits')}")
         #
         #self.query_cache: list[torch.Tensor] = []
         #self.query_score: list[torch.Tensor] = []
@@ -287,6 +305,67 @@ class KittyKVCache(DynamicCache):
         from .qlut_quant import apply_codebook
         return apply_codebook(sub, sub.shape[-1], cb)
 
+    @staticmethod
+    def _masked_lloyd_lastdim(r, mb, L=4, iters=10):
+        """Vectorized masked Lloyd-Max along head_dim, matching qlut_quant._lloyd
+        but only over channels where mb is True (per [B,nh,T] row). Lets every head
+        run its per-bin nf2 quantizer in one shot (no per-head Python loop).
+        r:[B,nh,T,D] float, mb:[1,nh,1,D] bool -> reconstruction [B,nh,T,D] (caller
+        zeros the non-bin channels via *mb). Non-bin channels never affect the
+        levels (one-hot is masked), so this is numerically identical to extracting
+        the bin's channels and calling _lloyd on them."""
+        import torch.nn.functional as F
+        neg = (~mb).expand_as(r)
+        lo = r.masked_fill(neg, float("inf")).amin(-1, keepdim=True)
+        hi = r.masked_fill(neg, float("-inf")).amax(-1, keepdim=True)
+        ar = torch.arange(L, device=r.device, dtype=r.dtype)
+        lev = lo + (hi - lo) * (ar + 0.5) / L                          # [B,nh,T,L]
+        mbf = mb.to(r.dtype).unsqueeze(-1)                             # [1,nh,1,D,1]
+        for _ in range(iters):
+            d = (r.unsqueeze(-1) - lev.unsqueeze(-2)).abs()           # [B,nh,T,D,L]
+            a = d.argmin(-1)                                          # [B,nh,T,D]
+            oh = F.one_hot(a, L).to(r.dtype) * mbf                    # mask non-bin channels
+            cnt = oh.sum(-2)                                          # [B,nh,T,L]
+            summ = (oh * r.unsqueeze(-1)).sum(-2)
+            lev = torch.where(cnt > 0, summ / cnt.clamp(min=1), lev)
+        a = (r.unsqueeze(-1) - lev.unsqueeze(-2)).abs().argmin(-1)    # [B,nh,T,D]
+        return torch.gather(lev, -1, a)                              # [B,nh,T,D]
+
+    @staticmethod
+    def _pt_codebook_masked(r, m, cb):
+        """Per-token codebook on r:[B,nh,T,D] over the channels flagged by m:[nh,D],
+        VECTORIZED across heads (replaces the per-head Python loop in the decode
+        path). Returns a reconstruction that is ZERO outside the bin's channels so
+        callers can sum across bins. Numerically matches per-bin
+        _pure_pt_codebook(extracted-channels): the masked reductions use exactly the
+        bin's channels, head by head."""
+        mb = m[None, :, None, :]                                      # [1,nh,1,D] bool
+        cnt = m.sum(-1).clamp(min=1)[None, :, None, None].to(r.dtype)  # [1,nh,1,1]
+        if cb == "sign":
+            mag = (r.abs() * mb).sum(-1, keepdim=True) / cnt          # [B,nh,T,1] masked mean
+            return torch.sign(r) * mag * mb
+        if cb == "tern":
+            mag = (r.abs() * mb).sum(-1, keepdim=True) / cnt
+            tmask = (r.abs() > 0.5 * mag) & mb
+            denom = tmask.sum(-1, keepdim=True).clamp(min=1).to(r.dtype)
+            mag2 = (r.abs() * tmask).sum(-1, keepdim=True) / denom
+            return torch.sign(r) * mag2 * tmask
+        if cb == "meanonly":
+            return ((r * mb).sum(-1, keepdim=True) / cnt) * mb
+        if cb in ("uni2", "uni3"):
+            L = 4 if cb == "uni2" else 8
+            neg = (~mb).expand_as(r)
+            mn = r.masked_fill(neg, float("inf")).amin(-1, keepdim=True)
+            mx = r.masked_fill(neg, float("-inf")).amax(-1, keepdim=True)
+            scale = (mx - mn).clamp(min=1e-6) / (L - 1)
+            q = ((r - mn) / scale).round().clamp(0, L - 1)
+            return (q * scale + mn) * mb
+        if cb == "nf2":
+            return KittyKVCache._masked_lloyd_lastdim(r, mb, L=4, iters=10) * mb
+        if cb == "fp16":
+            return r * mb
+        raise ValueError(cb)
+
     def _quant_k_pertoken(self, ks, layer_idx=0):
         """Per-token K quant of a [B,nh,T,D] slice: one quantizer per token per
         head along head_dim (like the KIVI-style V cache). k_codebook='qlut'
@@ -307,6 +386,32 @@ class KittyKVCache(DynamicCache):
         from .qlut_quant import apply_codebook
         cb = self.bin_codebooks[0]
         B, nh, T, D = ks.shape
+        # k168v4-pt (corrected): OFFLINE sign/tern per-channel codebook. The channel->
+        # codebook assignment is fixed by offline sigma^2 calibration (self.k_cb_mask),
+        # NOT recomputed per prompt; the per-channel MEAN is still self-calibrated at
+        # prefill (free for attention). Per-token 2-codebook quant on the residual,
+        # vectorized across heads (reuses _pt_codebook_masked). No nf2, no online bins.
+        if self.pertoken_offline:
+            if layer_idx not in self.k_pc_mean and T >= D:
+                self.k_pc_mean[layer_idx] = ks[0].float().mean(dim=1)      # [nh,D] per-channel mean
+            mu = self.k_pc_mean.get(layer_idx)
+            muB = (mu[None, :, None, :] if mu is not None
+                   else ks.float().mean(dim=3, keepdim=True))              # short-prompt fallback
+            r = ks.float() - muB
+            cb_id = self.k_cb_mask.get(layer_idx)
+            if cb_id is None:                                              # layer absent from mask: single codebook
+                full = torch.ones(nh, D, dtype=torch.bool, device=ks.device)
+                return (muB + self._pt_codebook_masked(r, full, self.bin_codebooks[0])).to(ks.dtype)
+            if cb_id.device != ks.device:
+                cb_id = cb_id.to(ks.device)
+                self.k_cb_mask[layer_idx] = cb_id
+            out = torch.zeros_like(r)
+            for ci, cbk in enumerate(self.bin_codebooks):                 # e.g. ["sign","tern"]
+                m = (cb_id == ci)                                         # [nh,D]
+                if not m.any():
+                    continue
+                out = out + self._pt_codebook_masked(r, m, cbk)
+            return (muB + out).to(ks.dtype)
         # k1.68v4-pt: per-channel submean + sigma^2-binned MIXED codebook. Channels are
         # binned once (at prefill) by per-channel residual sigma^2 into len(bin_codebooks)
         # quantile bins; each bin's channels get its codebook, per-token, on the
@@ -330,6 +435,20 @@ class KittyKVCache(DynamicCache):
                 return out
             muB = mu[None, :, None, :]
             r = ks.float() - muB
+            # Decode (T==1) is ~99% of the per-token cost: the per-head x per-bin
+            # Python loop fires ~750 tiny kernel launches per step. Vectorize across
+            # heads with per-bin masks (numerically identical to the per-head extract).
+            if T == 1:
+                out = torch.zeros_like(r)
+                for bi in range(nbins):
+                    m = (binid == bi)                                     # [nh,D]
+                    if not m.any():
+                        continue
+                    out = out + self._pt_codebook_masked(r, m, policy[bi])
+                return (muB + out).to(ks.dtype)
+            # Prefill: one big call. Keep the per-head extract loop -- it is already
+            # GPU-efficient on the large tensor and far lighter on memory than a
+            # full-head_dim masked Lloyd over ~32k tokens.
             out = torch.empty_like(r)
             for h in range(nh):
                 oh = torch.empty_like(r[:, h])                             # [B,T,D]
@@ -587,6 +706,7 @@ def get_kvcache_kitty(args: argparse.Namespace) -> KittyKVCache:
         pertoken_outlier_bits = getattr(args, "pertoken_outlier_bits", 4),
         pertoken_pc_submean = getattr(args, "pertoken_pc_submean", False),
         pertoken_mixed      = getattr(args, "pertoken_mixed", False),
+        pertoken_cb_mask    = getattr(args, "pertoken_cb_mask", None),
     )
     #
     return KittyKVCache(cache_config=cache_config)

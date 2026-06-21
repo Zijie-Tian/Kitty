@@ -233,7 +233,11 @@ datasets across GPUs, use a single target, e.g. `run_exp.sh llama32 --gpus 0,1,2
 | `kitty` | `kitty-k{kbits}b{promote_bit}v{vbits}-pr{ratio}` | Kitty machinery (magnitude channel-select + sink=32) with tunable K base (`KBITS`), boost bit (`PROMOTE_BIT`), boost fraction (`PROMOTE_RATIO`, or `--promote-ratio-config` for per-layer), V (`VBITS`). Defaults = paper Kitty (k2/b4/v2/pr0.125 → `kitty-k2b4v2-pr0p125`). Subsumes the removed `kitty_pro` (`PROMOTE_RATIO=0.25`) and `kitty_k1v4` (`KBITS=1 PROMOTE_BIT=2 VBITS=4 PROMOTE_RATIO=0.25`). |
 | `qlutattn_k1v4` | `qlutattn-k1v4` | σ²-binned mixed-codebook K quant (sim fake-quant). Per-layer channels are binned by residual σ²; low-σ² bins use cheap codebooks (sign), high-σ² bins use richer ones (nf2). Winner `["sign","sign","sign","tern","nf2","nf2"]` ≈ K **1.68 bit**, V per-token 4-bit. See `docs/qlutattn_k1v4.md`. |
 | `qlutattn_k184v4` | `qlutattn-k184v4` | Uniform-tern K (all channels tern) + V per-token 4-bit, K ≈ 1.84 bit — the iso-tern baseline `qlutattn-k1v4` is compared against. |
+| `qlutattn_k125v4` | `qlutattn-k125v4` | Uniform-sign K (all channels sign) + V per-token 4-bit, K ≈ 1.25 bit — cheapest member of the qlutattn-k<bits>v4 family; the pure-sign 1-bit codebook isolated for ablation against σ²-mix (1.68) and tern (1.84). |
 | `qlutattn_pertoken` | `qlutattn-pertoken` | Per-token K quant (head_dim-axis grouping), single codebook (`QLUT_BIN_CODEBOOKS`, default `nf2`), V per-token 4-bit. |
+| `qlutattn_k125v4_pt` | `qlutattn-k125v4-pt` | **Per-token sign with per-CHANNEL mean removal** (the fixed submean): subtract a per-channel μ (cached at prefill, free for attention — `q·μ` cancels in softmax), then pure 1-bit binary on the residual. ~1.25 bit K, V per-token 4-bit. Per-token form of `qlutattn-k125v4`; fixes the broken per-TOKEN submean (full LongBench 10.99→**21.68**). `QLUT_BIN_CODEBOOKS=tern` switches codebook. |
+| `qlutattn_k185v4_pt` | `qlutattn-k185v4-pt` | Per-token **tern** + per-channel mean removal. ~1.84 bit K, V 4-bit. Per-token form of `qlutattn-k184v4`. |
+| `qlutattn_k168v4_pt` | `qlutattn-k168v4-pt` | Per-token K with an **OFFLINE per-channel sign/tern codebook**. Each post-RoPE K channel is fixed offline to sign (1.25b, low σ²) or tern (1.85b, high σ²) by `scripts/calibrate_k168v4_pt.py` on wikitext (default ~28% sign → nominal **1.68b**); the mask is given via `QLUT_CB_MASK` and used unchanged — **no online σ² binning, no nf2**. Per-channel mean still self-calibrated at prefill (free for attention). V per-token 4-bit. Corrected impl: the old online-σ²+nf2 path was ~3b, scored 1B-full **14.39** and collapsed summarization (gov_report 0.64); offline sign/tern restores it (smoke gov_report→14.5). |
 | `fp16` | `fp16` | Full-precision baseline — no Kitty cache, HF dense fp16 KV. |
 | `kivi` | `kivi-k{kbits}v{vbits}` | KIVI-style uniform quant (no promote, no channel-select, no sink). K/V bit-width is set via `KBITS`/`VBITS` (default 2/2 = the old `kivi_2`); the slug encodes the bits so each combo gets its own dir (e.g. `kivi-k2v4`). |
 | `kivi_star` | `kivi-star-k{kbits}v{vbits}` | Same as `kivi` but `sink_length=32` (the old `kivi_star_2`). |
@@ -453,6 +457,88 @@ that still writes to the full layout:
 `RUN_MODE=full bash scripts/run_exp.sh llama32 --gpu 1 --max-samples 2`).
 Local model paths come from `.env` (`KITTY_*_PATH`) or per-target `*_MODEL_PATH`
 overrides; never hardcode host paths in tracked files.
+
+## qlutattn* per-token variants with per-channel submean (the submean fix)
+
+The naive per-token submean codebook subtracts the wrong mean: `apply_codebook`
+for `sign`/`tern` removes a **per-token** mean (averaging across the head_dim
+channels of one token), which doesn't center any individual channel and leaves
+the per-channel DC heterogeneity that makes per-token sign collapse. The fix is
+to subtract a **per-channel** mean `μ_d` instead (each channel's mean over
+tokens). This is **free for attention**: `q·(K−μ) = q·K − q·μ`, and `q·μ` is a
+per-query constant identical for every key, so it cancels in softmax / top-k.
+
+Implemented in `kitty_simulate.KittyKVCache._quant_k_pertoken` via flags on
+`KittyKVCacheConfig`: `pertoken_pc_submean` (per-channel center + per-token PURE
+binary/ternary on the residual — no second per-token submean) and
+`pertoken_cb_mask` (per-channel center + an **OFFLINE per-channel sign/tern codebook
+mask** — each channel fixed to sign or tern by its wikitext σ², loaded once and used
+unchanged; this is the corrected k168v4-pt). A legacy `pertoken_mixed` flag (ONLINE
+σ²-binned mixed codebook incl. nf2) still exists but is **superseded** — it cost ~3b
+and scored only 14.39 on 1B. The per-channel `μ_d` is computed once at prefill
+(`k_pc_mean`) and reused at decode; the codebook mask is offline. All keep V
+per-token 4-bit and need **no** smoothed checkpoint (the per-channel center is
+self-calibrated from the prompt). Decode is **vectorized across heads**
+(`_pt_codebook_masked` / `_masked_lloyd_lastdim`): per-step 41→7.66ms, end-to-end lcc
+333→29 s/it, numerically identical to the per-head loop (max diff 2.4e-7).
+
+| variant | codebook on residual | eff. K bit | offline calib | per-channel form |
+| --- | --- | ---: | --- | --- |
+| `qlutattn_k125v4_pt` | pure sign (1-bit) | ~1.25 | no (single codebook) | `qlutattn-k125v4` |
+| `qlutattn_k185v4_pt` | pure tern | ~1.84 | no (single codebook) | `qlutattn-k184v4` |
+| `qlutattn_k168v4_pt` | **offline** sign/tern per channel | ~1.68 (nominal) | **yes** (`QLUT_CB_MASK`) | `qlutattn-k1v4` |
+
+Impact (Llama-3.2-1B, full LongBench 21 datasets, 32k): fixing the submean
+dimension lifts per-token sign from **10.99** (per-token submean bug) to
+**21.68** (`qlutattn-k125v4-pt`, ~1.25 bit) — within 2.1 of the 2.5-bit
+`qlutattn_pertoken` nf2 baseline (23.82); fp16 is 27.59. For **k168v4-pt** the
+first (ONLINE σ²+nf2) impl was wrong — it binned per-channel σ² into 6 bins incl.
+nf2, paid ~3b of per-token side-info, scored only **14.39**, and collapsed
+summarization (gov_report 0.64 / multi_news 0.34 / vcsum 0.15). The corrected impl
+— **OFFLINE** σ²-ranked sign/tern (no nf2, ~1.68b) — restores summarization (smoke
+5-sample: gov_report 0.64→**14.5** / multi_news 0.34→**14.7** / vcsum 0.15→**10.6**);
+full 21-dataset mean pending.
+
+Offline calibration (k168v4-pt only; ~1min/card; ranks post-RoPE K residual σ²
+per layer over wikitext, low σ²→sign / high σ²→tern, `--target-bits` sets the mix):
+
+```bash
+CUDA_VISIBLE_DEVICES=0 PYTHONPATH=src python scripts/calibrate_k168v4_pt.py \
+  --model /home/zijie/models/Llama-3.2-1B-Instruct \
+  --calib-data /home/zijie/data/wikitext/wikitext-2-raw-v1/train-00000-of-00001.parquet \
+  --target-bits 1.68 \
+  --output /home/zijie/models/Llama-3.2-1B-Instruct.k168v4pt_cbmask.pt
+# -> mask [n_layers, n_kv, head_dim] uint8 (0=sign, 1=tern); prints realized sign frac + nominal bits
+```
+
+```bash
+# smoke (2 samples/dataset, long-context datasets exercise the K path)
+cd /home/zijie/Code/Kitty
+LLAMA32_MODEL_PATH=/home/zijie/models/Llama-3.2-1B-Instruct \
+MAX_MODEL_LEN=32768 LLAMA32_MAX_GEN=256 DATASETS_CSV=multifieldqa_en,hotpotqa \
+bash scripts/run_exp.sh llama32 --gpu 1 --variant qlutattn_k125v4_pt --max-samples 2
+# -> longbench_out/smoke/llama32-1b-instruct_qlutattn-k125v4-pt/{pred,logs}
+# k185v4_pt (tern): same. k168v4_pt (offline sign/tern): prepend
+#   QLUT_CB_MASK=/home/zijie/models/Llama-3.2-1B-Instruct.k168v4pt_cbmask.pt
+```
+
+```bash
+# full (all 21 datasets, 32k). 1B runs 3 workers/24GB card -> 18 on 6 cards.
+cd /home/zijie/Code/Kitty
+LLAMA32_MODEL_PATH=/home/zijie/models/Llama-3.2-1B-Instruct \
+MAX_MODEL_LEN=32768 LLAMA32_MAX_GEN=256 \
+bash scripts/run_exp.sh llama32 --gpus 0,0,0,1,1,1,2,2,2,3,3,3,4,4,4,5,5,5 --variant qlutattn_k125v4_pt
+# -> longbench_out/llama32-1b-instruct_qlutattn-k125v4-pt/{pred,logs}
+# k168v4_pt: prepend QLUT_CB_MASK=.../...k168v4pt_cbmask.pt (run calibrate_k168v4_pt.py first).
+# All three are fully vectorized across heads (no nf2 -> no per-head Lloyd loop).
+```
+
+Notes: `qlutattn_k168v4_pt` also accepts the alias `qlutattn-k1.68v4-pt`. It needs an
+OFFLINE mask via `QLUT_CB_MASK` (from `scripts/calibrate_k168v4_pt.py`) and no longer
+uses `QLUT_BIN_CODEBOOKS`. `qlutattn_k125v4_pt` / `qlutattn_k185v4_pt` take a single
+`QLUT_BIN_CODEBOOKS` name (default `sign` / `tern`). The legacy online-σ²+nf2 mixed
+path is still reachable via `--variant custom` with `pertoken_mixed`, but is
+superseded (14.39 on 1B).
 
 ## qlutattn-k1v4 per-token exploration (reorder + SmoothAttention)
 

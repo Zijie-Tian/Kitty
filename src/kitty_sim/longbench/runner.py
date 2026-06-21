@@ -11,7 +11,7 @@ import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Optional
 
 import torch
 from tqdm import tqdm
@@ -72,8 +72,10 @@ class VariantConfig:
     # qlutattn-k125v4-pt: per-CHANNEL mean removal (free for attention) + per-token
     # pure binary on the residual. The confirmed per-token sign recipe.
     pertoken_pc_submean: bool = False
-    # qlutattn-k1.68v4-pt: per-channel submean + sigma^2-binned mixed codebook (per-token).
+    # qlutattn-k1.68v4-pt (legacy ONLINE sigma^2 path): per-channel submean + sigma^2-binned mixed codebook (per-token).
     pertoken_mixed: bool = False
+    # qlutattn-k168v4-pt (corrected): path to an OFFLINE per-channel sign/tern codebook mask.
+    pertoken_cb_mask: Optional[str] = None
 
     @property
     def tag(self) -> str:
@@ -235,16 +237,40 @@ def build_variant(args: Any) -> VariantConfig:
             bin_codebooks=("tern",), n_bins=1, vbits=4, promote_ratio=0.0,
             channel_selection=0, k_quant_mode="per_token", pertoken_pc_submean=True)
     if variant in ("qlutattn_k168v4_pt", "qlutattn-k168v4-pt", "qlutattn-k1.68v4-pt"):
-        # PER-TOKEN sigma^2-binned MIXED codebook (k1v4's per-token form) with
-        # per-CHANNEL mean removal. Channels binned by residual sigma^2; per-bin
-        # codebook from QLUT_BIN_CODEBOOKS (default the k1v4 winner
-        # [sign,sign,sign,tern,nf2,nf2]). Per-channel center is free for attention.
-        pol = os.environ.get("QLUT_BIN_CODEBOOKS", "sign,sign,sign,tern,nf2,nf2")
-        bins = tuple(c.strip() for c in pol.split(","))
+        # CORRECTED k168v4-pt: per-token K with an OFFLINE per-channel sign/tern codebook.
+        # Each post-RoPE K channel is assigned sign(1.25b, low sigma^2) or tern(1.85b, high
+        # sigma^2) ONCE offline (scripts/calibrate_k168v4_pt.py on wikitext); the mask is
+        # loaded and used unchanged -- no online sigma^2 binning, no nf2. The per-channel
+        # MEAN is still self-calibrated at prefill (free for attention). Mask path comes
+        # from QLUT_CB_MASK. (The old ONLINE sigma^2+nf2 path is still reachable via
+        # --variant custom with pertoken_mixed; it scored only 14.39 on 1B.)
+        mask = os.environ.get("QLUT_CB_MASK", "")
+        if not mask or not os.path.exists(mask):
+            raise FileNotFoundError(
+                "qlutattn_k168v4_pt requires an OFFLINE codebook mask: set "
+                "QLUT_CB_MASK=/path/to/mask.pt (generate via scripts/calibrate_k168v4_pt.py). "
+                f"Got QLUT_CB_MASK='{mask}'")
         return VariantConfig(
             name="qlutattn_k168v4_pt", use_kitty=True, k_codebook="qlut",
-            bin_codebooks=bins, n_bins=len(bins), vbits=4, promote_ratio=0.0,
-            channel_selection=0, k_quant_mode="per_token", pertoken_mixed=True)
+            bin_codebooks=("sign", "tern"), n_bins=2, vbits=4, promote_ratio=0.0,
+            channel_selection=0, k_quant_mode="per_token", pertoken_cb_mask=mask)
+    if variant in ("qlutattn_k188v4_pt", "qlutattn-k188v4-pt"):
+        # NEW sibling of k168v4-pt: per-token K with an OFFLINE per-channel sign/nf2 codebook.
+        # Each post-RoPE K channel is assigned sign(1.25b, low σ²) or nf2(2.5b, high σ²) once
+        # offline (scripts/calibrate_k168v4_pt.py --codebooks sign,nf2; default ~50/50 ->
+        # nominal ~1.88b). Mask via QLUT_CB_MASK (its codebooks override bin_codebooks at load).
+        # Same machinery as k168v4-pt but the rich codebook is nf2 (Lloyd) instead of tern.
+        mask = os.environ.get("QLUT_CB_MASK", "")
+        if not mask or not os.path.exists(mask):
+            raise FileNotFoundError(
+                "qlutattn_k188v4_pt requires an OFFLINE codebook mask: set "
+                "QLUT_CB_MASK=/path/to/mask.pt (generate via "
+                "scripts/calibrate_k168v4_pt.py --codebooks sign,nf2). "
+                f"Got QLUT_CB_MASK='{mask}'")
+        return VariantConfig(
+            name="qlutattn_k188v4_pt", use_kitty=True, k_codebook="qlut",
+            bin_codebooks=("sign", "nf2"), n_bins=2, vbits=4, promote_ratio=0.0,
+            channel_selection=0, k_quant_mode="per_token", pertoken_cb_mask=mask)
     if variant in ("qlutattn_k125v4_pt", "qlutattn-k125v4-pt"):
         # PER-TOKEN version of qlutattn-k125v4: subtract a per-CHANNEL mean (free
         # for attention -- q.mu cancels in softmax) then PURE per-token binary
@@ -330,6 +356,7 @@ def _cache_factory(config: VariantConfig):
         pertoken_outlier_bits=config.pertoken_outlier_bits,
         pertoken_pc_submean=config.pertoken_pc_submean,
         pertoken_mixed=config.pertoken_mixed,
+        pertoken_cb_mask=config.pertoken_cb_mask,
     )
     return get_kvcache_kitty(ns)
 
@@ -414,6 +441,7 @@ def method_layout_slug(variant: VariantConfig | str) -> str:
         "qlutattn_k125v4_pt": "qlutattn-k125v4-pt",
         "qlutattn_k185v4_pt": "qlutattn-k185v4-pt",
         "qlutattn_k168v4_pt": "qlutattn-k168v4-pt",
+        "qlutattn_k188v4_pt": "qlutattn-k188v4-pt",
     }.get(name, _layout_slug(name))
 
 
