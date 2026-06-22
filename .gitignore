@@ -28,3 +28,4 @@ logs/longbench
 /reorder
 /calib
 autoresearch/pareto-sign-ternnf2
+autoresearch/pareto-rotated
