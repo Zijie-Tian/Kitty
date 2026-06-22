@@ -85,6 +85,22 @@ bash .claude/skills/lutdecoding-acc-bench/scripts/run_lutdecoding_bench.sh full
 只重跑某几个方法:把方法名接在 mode 后(名字 = 上表第 1 列小写,KIVI* 用 `kivi_star`),
 例如只补 QLUTATTN:`... run_lutdecoding_bench.sh full qlutattn`。
 
+**自动跳过已完成的方法(测前先查,缺了才补)**:full 模式下 driver 在跑每个方法**之前**
+先用 `scripts/check_method_complete.py` 检查该方法的 21 个数据集是否都已完整——判据是每个
+`<dataset>.manifest.json` 的 `status==ok`(`written_samples>=expected_samples` 且无失败,
+与 `runner.py` 自身判据一致)。**完整 → 整方法跳过**(连模型都不加载);**缺失/不完整 →
+才调 `run_exp.sh`**,而它再按数据集级 resume 只补没跑完的那几个数据集。所以中断后重跑
+同一条命令会从断点继续、已完成的方法秒跳。强制全部重跑:`FORCE_RERUN=1`。期望数据集
+列表默认取仓库权威的 `LONG_BENCH_DATASETS`(21);设 `DATASETS_CSV=` 子集时按子集判定。
+**smoke 模式不跳过**(`run_exp.sh` 每次清空 smoke 目录)。
+
+手动单查某方法是否完整:
+```bash
+PYTHONPATH=src python .claude/skills/lutdecoding-acc-bench/scripts/check_method_complete.py \
+  --pred-dir longbench_out/llama32-1b-instruct_qlutattn-k188v4-pt/pred
+# 退出码 0=完整(可跳过) / 2=不完整(需补测);并打印缺哪些数据集
+```
+
 ## ★ QLUTATTN 离线标定详解(50% 混合度)
 
 这是本基准里唯一需要**离线标定**的方法,务必先做(driver 会自动做;手动跑见下)。

@@ -116,19 +116,35 @@ if want qlutattn; then
   fi
 fi
 
-# ---- methods: name | run_exp variant | extra inline env ---------------------#
+# ---- methods: name | run_exp variant | output method-slug | extra inline env -#
 ALL_METHODS=(
-  "fp16|fp16|"
-  "shadowkv|shadowkv|"
-  "kitty|kitty|"
-  "kivi_star|kivi_star|KBITS=2 VBITS=2"
-  "kivi|kivi|KBITS=2 VBITS=2"
-  "qlutattn|qlutattn_k188v4_pt|QLUT_CB_MASK=$MASK"
+  "fp16|fp16|fp16|"
+  "shadowkv|shadowkv|shadowkv|"
+  "kitty|kitty|kitty-k2b4v2-pr0p125|"
+  "kivi_star|kivi_star|kivi-star-k2v2|KBITS=2 VBITS=2"
+  "kivi|kivi|kivi-k2v2|KBITS=2 VBITS=2"
+  "qlutattn|qlutattn_k188v4_pt|qlutattn-k188v4-pt|QLUT_CB_MASK=$MASK"
 )
 
+[ "$MODE" = full ] && BASE_DIR="$REPO/longbench_out" || BASE_DIR="$REPO/longbench_out/smoke"
 for spec in "${ALL_METHODS[@]}"; do
-  IFS='|' read -r name variant extra <<<"$spec"
+  IFS='|' read -r name variant slug extra <<<"$spec"
   want "$name" || continue
+  pred_dir="$BASE_DIR/${MODEL_SLUG}_${slug}/pred"
+  # Per-method completeness SKIP: only (re)run a method that is missing/incomplete.
+  # run_exp.sh already resumes at the DATASET level; this method-level check avoids
+  # even loading the model + rescanning for a method whose datasets are all done.
+  # Smoke is never skipped (run_exp.sh wipes the smoke dir each launch).
+  # FORCE_RERUN=1 bypasses the skip and reruns everything.
+  if [ "$MODE" = full ] && [ "${FORCE_RERUN:-0}" != 1 ]; then
+    echo "[check] $name: $pred_dir"
+    if PYTHONPATH=src python "$SCRIPT_DIR/check_method_complete.py" \
+         --pred-dir "$pred_dir" ${DATASETS_CSV:+--datasets "$DATASETS_CSV"}; then
+      echo "[skip] $name already complete -- skipping (FORCE_RERUN=1 to override)"
+      continue
+    fi
+    echo "[run]  $name incomplete -> running (run_exp.sh fills in only the missing datasets)"
+  fi
   echo "=============================================================="
   echo "[bench] >>> $name  (variant=$variant)  $(date '+%F %T')"
   echo "=============================================================="
