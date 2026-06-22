@@ -15,7 +15,9 @@ build/
 .env.*
 !.env.example
 /.omx
-/.claude
+# Ignore local .claude state, but DO track project skills (git-maintained).
+/.claude/*
+!/.claude/skills/
 /longbench_out
 # KV-cache 能量探针产物（图/JSON/PT），可再生，不跟踪
 /probe_out
