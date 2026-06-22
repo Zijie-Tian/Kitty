@@ -238,6 +238,7 @@ datasets across GPUs, use a single target, e.g. `run_exp.sh llama32 --gpus 0,1,2
 | `qlutattn_k125v4_pt` | `qlutattn-k125v4-pt` | **Per-token sign with per-CHANNEL mean removal** (the fixed submean): subtract a per-channel μ (cached at prefill, free for attention — `q·μ` cancels in softmax), then pure 1-bit binary on the residual. ~1.25 bit K, V per-token 4-bit. Per-token form of `qlutattn-k125v4`; fixes the broken per-TOKEN submean (full LongBench 10.99→**21.68**). `QLUT_BIN_CODEBOOKS=tern` switches codebook. |
 | `qlutattn_k185v4_pt` | `qlutattn-k185v4-pt` | Per-token **tern** + per-channel mean removal. ~1.84 bit K, V 4-bit. Per-token form of `qlutattn-k184v4`. |
 | `qlutattn_k168v4_pt` | `qlutattn-k168v4-pt` | Per-token K with an **OFFLINE per-channel sign/tern codebook**. Each post-RoPE K channel is fixed offline to sign (1.25b, low σ²) or tern (1.85b, high σ²) by `scripts/calibrate_k168v4_pt.py` on wikitext (default ~28% sign → nominal **1.68b**); the mask is given via `QLUT_CB_MASK` and used unchanged — **no online σ² binning, no nf2**. Per-channel mean still self-calibrated at prefill (free for attention). V per-token 4-bit. Corrected impl: the old online-σ²+nf2 path was ~3b, scored 1B-full **14.39** and collapsed summarization (gov_report 0.64); offline sign/tern restores it (smoke gov_report→14.5). |
+| `qlutattn_k188v4_pt` ⭐ | `qlutattn-k188v4-pt` | **默认推荐优化算法.** k168v4-pt 的姊妹方法,rich 码本由 tern 换成 **nf2(per-token Lloyd)**:离线 per-channel **sign/nf2** 掩码(`scripts/calibrate_k168v4_pt.py --codebooks sign,nf2 --sign-frac <f>`),sign 占比 `f` = 实际 K bit 旋钮(`f·1.25+(1−f)·2.5`)。per-channel 均值 prefill 自标定;V 4-bit;**无旋转、纯 per-token**。1B 上 Pareto 实用最优:**f=0.5(1.875b)=25.03 > per-channel k1v4 24.88**,降到 f=0(纯 nf2,2.5b)=25.65。详见下方「默认推荐优化算法」段。 |
 | `qlutattn_rotated_k125v4_pt` | `qlutattn-rotated-k125v4-pt` | **Rotated** per-token sign (k125 + Hadamard): per-channel mean, FWHT-rotate residual → isotropic, per-token sign, de-rotate (FWHT self-inverse). ~1.25 bit K, V 4-bit. Rotation hidden inside K quant (free for attention). 1B full **22.14** (vs sign 21.39). See the rotated-k*v4-pt section for the no-offline-fold / cost rationale. |
 | `qlutattn_rotated_k185v4_pt` | `qlutattn-rotated-k185v4-pt` | **Rotated** per-token tern (k185 + Hadamard). ~1.84 bit K. 1B full **24.21** (vs tern 22.54) — approaches per-channel k1v4 24.88 using only sign/tern. |
 | `fp16` | `fp16` | Full-precision baseline — no Kitty cache, HF dense fp16 KV. |
@@ -541,6 +542,97 @@ uses `QLUT_BIN_CODEBOOKS`. `qlutattn_k125v4_pt` / `qlutattn_k185v4_pt` take a si
 `QLUT_BIN_CODEBOOKS` name (default `sign` / `tern`). The legacy online-σ²+nf2 mixed
 path is still reachable via `--variant custom` with `pertoken_mixed`, but is
 superseded (14.39 on 1B).
+
+## ⭐ 默认推荐优化算法: `qlutattn_k188v4_pt`(per-token sign/nf2 σ²-mix,非旋转)
+
+经过 sign/tern vs sign/nf2 的**全量 Pareto 扫描**(Llama-3.2-1B,21 数据集,32k,
+横轴 = K-cache 实际 bit/value 按比例算,纵轴 = LongBench 平均分),**非旋转的
+per-token sign/nf2 σ²-混合码本 `qlutattn_k188v4_pt` 是当前默认推荐的优化算法**:
+它在「K-cache 实际 bit/value」与「LongBench 平均分」之间给出最优的实用折中,且
+decode 友好(纯 per-token、无在线 Hadamard、无 per-channel)。
+
+**它是什么.** `qlutattn_k168v4_pt` 的姊妹方法,把 "rich" 码本从 tern 换成
+**nf2(per-token Lloyd,自适应)**,其余完全一致:post-RoPE K 先减 **per-channel
+均值 μ**(prefill 自标定、对 attention 免费,`q·μ` 在 softmax 抵消),再按**离线 σ²
+标定的 per-channel 码本掩码**把每个通道固定为 sign(1.25b,低 σ²)或 nf2(2.5b,高
+σ²),V 走 per-token 4-bit。掩码自带 codebooks,运行时覆盖 `bin_codebooks`。
+
+**bit 旋钮.** 混合比例(sign 通道占比 `f`)是 K bit/value 的**唯一旋钮**:
+`bit = f·1.25 + (1−f)·2.5`,在离线标定时由 `--sign-frac` 设定。方法名里的 "188" 只是
+`f=0.5`(1.875b)默认点的命名,**没有意义,实际 bit 必须按比例算**。
+
+### 为什么是非旋转(而不是 rotated sign/nf2)
+
+同一条 sign/nf2 混合线,非旋转 vs Hadamard 旋转的全量对比(21 集均分):
+
+| K bit/value(按比例) | sign 占比 f | 非旋转 sign/nf2 | rotated sign/nf2 |
+| ---: | ---: | ---: | ---: |
+| 1.2500 | 1.00 (=纯 sign) | 21.39 | 22.14 |
+| 1.5625 | 0.75 | **24.07** | 23.44 |
+| 1.8750 | 0.50 | **25.03** | 24.19 |
+| 2.1875 | 0.25 | **25.42** | 25.16 |
+| 2.5000 | 0.00 (=纯 nf2) | 25.65 | **26.04** |
+
+基线:fp16 **27.59** / per-channel `qlutattn-k1v4` **24.88** / per-channel KIVI-2 24.24。
+
+- **实用中段(1.56–2.19b)非旋转全面胜过 rotated**:旋转把基底各向同性化,反而破坏了
+  σ²-mix「低 σ²→sign / 高 σ²→nf2」的分工(nf2 本就自适应、不需要旋转)。
+- **1.875b(f=0.5)的 25.03 是首个超过 per-channel k1v4(24.88)的 per-token 方法**,
+  且 decode 更友好(无 per-channel)。
+- 仅在纯 nf2 的 2.5b 极端角,旋转才反超(+0.39 → 26.04),那是高 bit 角、不是甜点;为
+  保持 decode 简单(无在线 Hadamard)默认选非旋转。需要那 0.39 时再用
+  `qlutattn_rotated_snf_pt --sign-frac 0.0`(见下方 rotated 段)。
+
+→ **默认操作点:`f=0.5`(1.875b)的 `qlutattn_k188v4_pt`,全量 25.03,留存 fp16 的
+90.7%**;要更高精度就降 `--sign-frac`(更多 nf2 通道)沿 Pareto 线上移到 2.5b/25.65。
+
+### 测试流程(offline 标定 → smoke → full)
+
+第一步永远是离线 σ² 标定生成 per-channel 码本掩码(`--codebooks sign,nf2`,
+`--sign-frac` 设定实际 bit)。掩码必须先生成,未设 `QLUT_CB_MASK` 会直接报
+`FileNotFoundError`。
+
+```bash
+# 1) 离线标定(~1min/卡):sign,nf2 混合,sign-frac 设定实际 K bit/value
+#    f=0.5 -> 1.875b(默认 k188 点);要扫 Pareto 就遍历 f∈{1.0,0.75,0.5,0.25,0.0}
+cd /home/zijie/Code/Kitty
+CUDA_VISIBLE_DEVICES=0 PYTHONPATH=src python scripts/calibrate_k168v4_pt.py \
+  --model /home/zijie/models/Llama-3.2-1B-Instruct \
+  --calib-data /home/zijie/data/wikitext/wikitext-2-raw-v1/train-00000-of-00001.parquet \
+  --codebooks sign,nf2 --sign-frac 0.5 \
+  --output /home/zijie/models/Llama-3.2-1B-Instruct.k188v4pt_f50.pt
+# -> mask [n_layers, n_kv, head_dim] uint8 (0=sign, 1=nf2);打印实际 sign 占比 + nominal bits
+```
+
+```bash
+# 2) smoke(2 samples/dataset,long-context 数据集确保走到 K 路径)
+cd /home/zijie/Code/Kitty
+QLUT_CB_MASK=/home/zijie/models/Llama-3.2-1B-Instruct.k188v4pt_f50.pt \
+LLAMA32_MODEL_PATH=/home/zijie/models/Llama-3.2-1B-Instruct \
+MAX_MODEL_LEN=32768 LLAMA32_MAX_GEN=256 DATASETS_CSV=multifieldqa_en,hotpotqa \
+bash scripts/run_exp.sh llama32 --gpu 1 --variant qlutattn_k188v4_pt --max-samples 2
+# -> longbench_out/smoke/llama32-1b-instruct_qlutattn-k188v4-pt/{pred,logs}
+```
+
+```bash
+# 3) full(全部 21 数据集,32k;1B 每卡 3 worker -> 6 卡 18)
+cd /home/zijie/Code/Kitty
+QLUT_CB_MASK=/home/zijie/models/Llama-3.2-1B-Instruct.k188v4pt_f50.pt \
+LLAMA32_MODEL_PATH=/home/zijie/models/Llama-3.2-1B-Instruct \
+MAX_MODEL_LEN=32768 LLAMA32_MAX_GEN=256 \
+bash scripts/run_exp.sh llama32 --gpus 0,0,0,1,1,1,2,2,2,3,3,3,4,4,4,5,5,5 --variant qlutattn_k188v4_pt
+# -> longbench_out/llama32-1b-instruct_qlutattn-k188v4-pt/{pred,logs}
+```
+
+扫不同 bit:改 `--sign-frac`(1.0/0.75/0.5/0.25/0.0),给每个掩码与
+`LLAMA32_MODEL_SLUG` 不同后缀(如 `llama32-1b-snf-f25`),避免输出目录碰撞。
+
+注意:
+- `qlutattn_k188v4_pt` 与 `qlutattn_k168v4_pt` 共用 `scripts/calibrate_k168v4_pt.py`
+  与 `QLUT_CB_MASK`,区别只在 `--codebooks`(`sign,nf2` vs `sign,tern`)。
+- nf2 通道走 per-token Lloyd,比纯 sign/tern 略慢,但已向量化(无 per-head 循环),
+  1B 每卡仍可 3 worker;empty-mask 行的 NaN 已修(commit a1433d3)。
+- 这是纯 torch sim fake-quant 路径(精度代理,不省真实 KV 显存),与其余 qlutattn 一致。
 
 ## qlutattn-rotated-k*v4-pt (Hadamard-rotated per-token K)
 
