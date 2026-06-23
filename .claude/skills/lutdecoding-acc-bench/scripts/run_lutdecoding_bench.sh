@@ -59,6 +59,7 @@ GPUS="${GPUS:-0}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-32768}"
 CALIB_DATA="${CALIB_DATA:-}"
 SIGN_FRAC="${SIGN_FRAC:-0.5}"
+MODEL_ID="${MODEL_ID:-}"           # model-id/display label; defaults to MODEL_PATH below
 
 # ---- validate -------------------------------------------------------------- #
 [ -f "$REPO/scripts/run_exp.sh" ] || { echo "[err] REPO=$REPO has no scripts/run_exp.sh -- cd to the Kitty repo or pass REPO=" >&2; exit 1; }
@@ -76,6 +77,11 @@ case "$TARGET" in
 esac
 
 cd "$REPO"
+# id/display label: default to the real model path so run_exp.sh's built-in
+# per-target default id (e.g. Qwen3-8B for `qwen`, Llama-3.2-1B for `llama32`)
+# is NOT shown in logs when running a different model. Loading always uses PATH.
+MODEL_ID="${MODEL_ID:-$MODEL_PATH}"
+export "${PFX}_MODEL_ID=$MODEL_ID"
 export "${PFX}_MODEL_PATH=$MODEL_PATH"
 export "${PFX}_MODEL_SLUG=$MODEL_SLUG"
 export "${PFX}_MAX_GEN=$MAX_GEN"
