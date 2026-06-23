@@ -661,6 +661,10 @@ def generate_dataset(
         )
         try:
             inputs = tokenizer(prompt, truncation=False, return_tensors="pt").to(device)
+            # Some fast tokenizers (e.g. MiniCPM5) emit token_type_ids, which a
+            # Llama-style generate() rejects as an unused model_kwarg. Drop it —
+            # the attention / KV path never consumes it.
+            inputs.pop("token_type_ids", None)
             context_length = inputs.input_ids.shape[-1]
             # GLM-family models ignore an HF Cache object (legacy tuple cache); for
             # them Kitty fake-quant is applied by the SelfAttention patch installed
