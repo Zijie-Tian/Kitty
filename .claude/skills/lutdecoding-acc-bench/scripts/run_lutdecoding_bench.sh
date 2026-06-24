@@ -10,6 +10,8 @@
 #   5. kivi        KIVI-2            KIVI uniform K2V2 (no sink)
 #   6. qlutattn    QLUTATTN          snf-pt: per-token sign/nf2 offline sigma^2-mix,
 #                                    sign-frac=0.5 -> ~1.875 bit K, V per-token 4-bit
+#   7. qlutattn_fast QLUTATTN-fast   per-token PURE sign (qlutattn_k125v4_pt): ~1.25 bit
+#                                    K, V per-token 4-bit. NO calibration, fastest decode.
 #
 # (QUEST was dropped from this codebase in commit 8adb49b and is intentionally
 #  NOT part of this benchmark. If it is restored, add it as a 7th method here.)
@@ -130,6 +132,7 @@ ALL_METHODS=(
   "kivi_star|kivi_star|kivi-star-k2v2|KBITS=2 VBITS=2"
   "kivi|kivi|kivi-k2v2|KBITS=2 VBITS=2"
   "qlutattn|qlutattn_k188v4_pt|qlutattn-k188v4-pt|QLUT_CB_MASK=$MASK"
+  "qlutattn_fast|qlutattn_k125v4_pt|qlutattn-k125v4-pt|"
 )
 
 [ "$MODE" = full ] && BASE_DIR="$REPO/longbench_out" || BASE_DIR="$REPO/longbench_out/smoke"

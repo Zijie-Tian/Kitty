@@ -26,6 +26,7 @@ METHODS = [
     ("KIVI*-2",  "kivi-star-k2v2",       "2.25"),
     ("KIVI-2",   "kivi-k2v2",            "2.25"),
     ("QLUTATTN", "qlutattn-k188v4-pt",   "1.875"),
+    ("QLUTATTN-fast", "qlutattn-k125v4-pt", "1.25"),
 ]
 
 
@@ -72,14 +73,14 @@ def main():
         rows.append((disp, slug, bit, sc, n))
 
     print(f"\n=== lutdecoding-acc-bench [{args.layout}]  {args.model_slug} ===")
-    print(f"{'method':10s} {'bit':>7s} {'avg21':>7s} {'retain%':>8s} {'n':>3s}  slug")
-    print("-" * 64)
+    print(f"{'method':14s} {'bit':>7s} {'avg21':>7s} {'retain%':>8s} {'n':>3s}  slug")
+    print("-" * 68)
     for disp, slug, bit, sc, n in rows:
         if sc is None:
-            print(f"{disp:10s} {bit:>7s} {'--':>7s} {'--':>8s} {n:>3d}  {slug}  (MISSING)")
+            print(f"{disp:14s} {bit:>7s} {'--':>7s} {'--':>8s} {n:>3d}  {slug}  (MISSING)")
             continue
         ret = f"{100 * sc / fp16:.1f}" if fp16 else "--"
-        print(f"{disp:10s} {bit:>7s} {sc:7.2f} {ret:>8s} {n:>3d}  {slug}")
+        print(f"{disp:14s} {bit:>7s} {sc:7.2f} {ret:>8s} {n:>3d}  {slug}")
 
     out = os.path.join(root, f"{args.model_slug}_lutdecoding_bench.tsv")
     with open(out, "w") as f:

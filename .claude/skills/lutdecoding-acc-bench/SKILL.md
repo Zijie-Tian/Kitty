@@ -3,10 +3,10 @@ name: lutdecoding-acc-bench
 description: >-
   对单个模型运行一套标准化的 KV-cache 量化精度对比实验(Kitty 仓库, LongBench 全量
   21 数据集, 32k): fp16 FULL / ShadowKV / Kitty / KIVI*-2 / KIVI-2 / QLUTATTN
-  (per-token sign/nf2 离线 σ²-mix, snf-pt, 50% 混合 ≈1.875bit)。跑完这一组即为一次
+  / QLUTATTN-fast (per-token sign/nf2 离线 σ²-mix snf-pt ≈1.875bit; fast=纯 sign ≈1.25bit)。跑完这一组即为一次
   完整精度实验。当用户要"对某模型做精度实验 / 精度评测 / 精度对比""跑 LongBench
   量化对比""测一个新模型的 KV 压缩精度""benchmark 这几种 KV-cache 方法""复现这套
-  对比"时,务必使用本 skill——它封装了 QLUTATTN 的离线标定流程、6 个方法的精确命令、
+  对比"时,务必使用本 skill——它封装了 QLUTATTN 的离线标定流程、7 个方法的精确命令、
   统一 driver 与结果汇总。即使用户只说"测一下 XX 模型"但上下文是 Kitty 的 KV-cache
   量化研究,也应触发本 skill,而不要自行拼命令。
 ---
@@ -14,13 +14,13 @@ description: >-
 # LUT-Decoding 精度基准 (lutdecoding-acc-bench)
 
 对**一个模型**,在 LongBench 上跑一套固定的 KV-cache 量化精度对比。一次完整实验 =
-下面 6 个方法各跑一遍全量 21 数据集,再汇总成一张「方法 × bit × 平均分 × 留存率」表。
+下面 7 个方法各跑一遍全量 21 数据集,再汇总成一张「方法 × bit × 平均分 × 留存率」表。
 
 除 `fp16`/`kivi*` 外都走 Kitty 的**纯 torch sim fake-quant 路径**:这是**精度代理**
 (accuracy proxy),不省真实 KV 显存/不证明加速。这套实验比较的就是各方法在同一精度
 代理下的 LongBench 得分。
 
-## 这套实验测什么(6 个方法,固定顺序)
+## 这套实验测什么(7 个方法,固定顺序)
 
 | # | 方法 | run_exp.sh variant | 关键参数 | 输出 method-slug | K bit/value |
 | --- | --- | --- | --- | --- | ---: |
@@ -30,6 +30,7 @@ description: >-
 | 4 | **KIVI\*-2** | `kivi_star` | `KBITS=2 VBITS=2` | `kivi-star-k2v2` | 2.25 |
 | 5 | **KIVI-2** | `kivi` | `KBITS=2 VBITS=2` | `kivi-k2v2` | 2.25 |
 | 6 | **QLUTATTN** | `qlutattn_k188v4_pt` | **需先离线标定** + `QLUT_CB_MASK=<mask>` | `qlutattn-k188v4-pt` | ~1.875 |
+| 7 | **QLUTATTN-fast** | `qlutattn_k125v4_pt` | 无需标定(纯 sign) | `qlutattn-k125v4-pt` | ~1.25 |
 
 > QUEST + Kitty 曾是第 7 个方法,但已在 commit `8adb49b`(2026-06-17 重构)从仓库
 > 删除,当前**不在本基准内**。若日后恢复 `quest_kitty_page16_*` variant,在 driver
@@ -40,6 +41,12 @@ wikitext 残差 σ² 离线固定为 sign(低 σ²,1.25b)或 nf2(高 σ²,2.5b);
 `f` 决定实际 K bit(`bit = f·1.25 + (1−f)·2.5`),`f=0.5` → **1.875bit**。per-channel
 均值在 prefill 自标定(对 attention 免费),V 走 per-token 4-bit。详见
 仓库 `CLAUDE.md` 的「默认推荐优化算法」段。
+
+**QLUTATTN-fast = 纯 sign 版**(`qlutattn_k125v4_pt`):post-RoPE K 减 per-channel 均值后走
+per-token **纯 1-bit sign**(无 nf2、无 σ²-mix),~**1.25bit**,V per-token 4-bit。**无需任何
+离线标定**(单一 sign 码本),decode 最快(无 per-token Lloyd)——它是 snf-pt 的「快」对照,
+衡量最低 K bit 下纯 sign 能达到多少精度。driver 里方法名 `qlutattn_fast`(`... full qlutattn_fast`
+单跑),输出 slug `qlutattn-k125v4-pt`。
 
 ## 前置条件
 
@@ -168,6 +175,8 @@ env $COMMON KBITS=2 VBITS=2 bash scripts/run_exp.sh llama32 --gpus $G --variant 
 # 6) QLUTATTN (先跑上面的标定生成掩码)
 env $COMMON QLUT_CB_MASK=/home/zijie/models/Llama-3.2-1B-Instruct.lutbench_snf_f50.pt \
   bash scripts/run_exp.sh llama32 --gpus $G --variant qlutattn_k188v4_pt
+# 7) QLUTATTN-fast (纯 sign,无需标定,decode 最快)
+env $COMMON bash scripts/run_exp.sh llama32 --gpus $G --variant qlutattn_k125v4_pt
 ```
 
 ## 汇总结果
@@ -182,13 +191,14 @@ python .claude/skills/lutdecoding-acc-bench/scripts/collect_lutdecoding_results.
 输出一张表(并写 `longbench_out/<model_slug>_lutdecoding_bench.tsv`):
 
 ```
-method      bit   avg21  retain%   n  slug
-F16 FULL     16   27.59   100.0   21  fp16
-ShadowKV  sparse   ...     ...    21  shadowkv
-Kitty       ~2.5    ...     ...    21  kitty-k2b4v2-pr0p125
-KIVI*-2     2.25    ...     ...    21  kivi-star-k2v2
-KIVI-2      2.25    ...     ...    21  kivi-k2v2
-QLUTATTN   1.875    ...     ...    21  qlutattn-k188v4-pt
+method           bit   avg21  retain%   n  slug
+F16 FULL          16   27.59   100.0   21  fp16
+ShadowKV      sparse   ...     ...    21  shadowkv
+Kitty           ~2.5    ...     ...    21  kitty-k2b4v2-pr0p125
+KIVI*-2         2.25    ...     ...    21  kivi-star-k2v2
+KIVI-2          2.25    ...     ...    21  kivi-k2v2
+QLUTATTN       1.875    ...     ...    21  qlutattn-k188v4-pt
+QLUTATTN-fast   1.25    ...     ...    21  qlutattn-k125v4-pt
 ```
 `MISSING` 行 = 该方法还没跑完(无 result.json)。smoke 用 `--layout smoke`。
 
