@@ -278,6 +278,9 @@ method_slug() {
   if [[ "${_blk}" =~ ^[0-9]+$ && "${_blk}" -gt 1 ]]; then
     base="${base}-blk${_blk}"
   fi
+  if [[ "${SIM_QUEST:-0}" =~ ^(1|true|TRUE|yes|YES|on|ON)$ || "${QUEST_SIM:-0}" =~ ^(1|true|TRUE|yes|YES|on|ON)$ ]]; then
+    base="${base}-quest-sim"
+  fi
   printf '%s\n' "${base}"
 }
 
@@ -497,6 +500,12 @@ run_eval_dataset() {
   fi
   if [[ -n "${SHADOWKV_CHUNK:-}" ]]; then
     cmd+=(--shadowkv-chunk-size "${SHADOWKV_CHUNK}")
+  fi
+  # Pure-torch QUEST overlay for Kitty/QLUTATTN sim variants.
+  if [[ "${SIM_QUEST:-0}" =~ ^(1|true|TRUE|yes|YES|on|ON)$ || "${QUEST_SIM:-0}" =~ ^(1|true|TRUE|yes|YES|on|ON)$ ]]; then
+    cmd+=(--sim-quest)
+    cmd+=(--quest-token-budget "${QUEST_TOKEN_BUDGET:-${QUEST_BUDGET:-2048}}")
+    cmd+=(--quest-skip-layers "${QUEST_SKIP_LAYERS:-0}")
   fi
 
   echo "[start] GPU${gpu} ${model_tag} dataset=${dataset} variant=${variant} max_samples=${MAX_SAMPLES} max_model_len=${MAX_MODEL_LEN}"

@@ -8,7 +8,7 @@ import json
 import os
 import re
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Optional
@@ -82,6 +82,13 @@ class VariantConfig:
     # codebook (Lloyd levels / sign-mag). 1 = per-token (current); >1 = block-shared
     # (side-info amortized block x). Only the offline per-token paths honor it.
     pertoken_block: int = 1
+    # Pure-torch QUEST page-selection overlay for sim/fake-quant variants.
+    # This is intentionally an attention-forward hook, not a cache feature,
+    # because QUEST needs the query and the HF Cache.update() interface does not
+    # receive it. It is an accuracy / smoke proxy, not the real Triton kernel.
+    sim_quest: bool = False
+    quest_token_budget: int | None = None
+    quest_skip_layers: int = 0
 
     @property
     def tag(self) -> str:
@@ -93,7 +100,11 @@ class VariantConfig:
             iso = (f"_iso{self.pertoken_outlier_k}b{self.pertoken_outlier_bits}"
                    if self.k_quant_mode == "per_token" and self.pertoken_outlier_k > 0 else "")
             blk = f"_blk{self.pertoken_block}" if self.pertoken_block > 1 else ""
-            return f"{self.name}_nb{self.n_bins}_v{self.vbits}_cb{h}{iso}{blk}"
+            quest = (
+                f"_qb{self.quest_token_budget}_qsl{self.quest_skip_layers}_questsim"
+                if self.sim_quest else ""
+            )
+            return f"{self.name}_nb{self.n_bins}_v{self.vbits}_cb{h}{iso}{blk}{quest}"
         if self.shadowkv:
             return f"{self.name}_sb{self.sparse_budget}_r{self.rank}_c{self.chunk_size}"
         suffix = ""
@@ -102,11 +113,46 @@ class VariantConfig:
             suffix = f"-prcfg{h}"
         if self.k_quant_mode == "per_token":
             suffix += "_kpt"
-        return (
+        base = (
             f"{self.name}_g{self.group_size}_b{self.buffer_length}_s{self.sink_length}"
             f"_sel{self.channel_selection}_k{self.kbits}_v{self.vbits}"
             f"_pb{self.promote_bit}_pr{ratio}{suffix}"
         )
+        if self.sim_quest:
+            base += f"_qb{self.quest_token_budget}_qsl{self.quest_skip_layers}_questsim"
+        return base
+
+
+def _env_flag(name: str) -> bool:
+    value = os.environ.get(name, "")
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _maybe_enable_sim_quest(variant: VariantConfig, args: Any) -> VariantConfig:
+    requested = bool(getattr(args, "sim_quest", False)) or _env_flag("SIM_QUEST") or _env_flag("QUEST_SIM")
+    if not requested:
+        return variant
+    if not variant.use_kitty:
+        raise ValueError("SIM_QUEST=1 requires a Kitty/QLUTATTN-style KV-cache variant, not fp16.")
+    if variant.shadowkv:
+        raise ValueError("SIM_QUEST=1 cannot be combined with shadowkv.")
+    budget = (
+        getattr(args, "quest_token_budget", None)
+        or os.environ.get("QUEST_TOKEN_BUDGET")
+        or os.environ.get("QUEST_BUDGET")
+        or 2048
+    )
+    skip_layers = (
+        getattr(args, "quest_skip_layers", None)
+        or os.environ.get("QUEST_SKIP_LAYERS")
+        or 0
+    )
+    return replace(
+        variant,
+        sim_quest=True,
+        quest_token_budget=int(budget),
+        quest_skip_layers=int(skip_layers),
+    )
 
 
 def _load_promote_ratio_config(
@@ -516,6 +562,8 @@ def method_layout_slug(variant: VariantConfig | str) -> str:
     # qlutattn-k188v4-pt-blk16) so a PERTOKEN_BLOCK sweep never collides with block=1.
     if isinstance(variant, VariantConfig) and getattr(variant, "pertoken_block", 1) > 1:
         slug = f"{slug}-blk{variant.pertoken_block}"
+    if isinstance(variant, VariantConfig) and getattr(variant, "sim_quest", False):
+        slug = f"{slug}-quest-sim"
     return slug
 
 
@@ -711,11 +759,12 @@ def generate_dataset(
                 }
                 if dataset == "samsum":
                     gen_kwargs["min_length"] = context_length + 1
-                if variant.shadowkv:
-                    # ShadowKV's gather hook has data-dependent shapes, so
+                if variant.shadowkv or variant.sim_quest:
+                    # ShadowKV / sim-QUEST gather hooks have data-dependent shapes, so
                     # torch.compile must stay off.
                     gen_kwargs["disable_compile"] = True
-                    gen_kwargs["temperature"] = None
+                    if variant.shadowkv:
+                        gen_kwargs["temperature"] = None
                 output = model.generate(
                     **inputs,
                     **gen_kwargs,
@@ -732,6 +781,31 @@ def generate_dataset(
                         f"bypassed the KittyKVCache (e.g. a legacy tuple-cache remote modeling), "
                         f"so results would be plain dense fp16 mislabelled as Kitty. Refusing to "
                         f"proceed. See kitty_sim/glm_kitty_patch.py."
+                    )
+                elif variant.sim_quest:
+                    decode_calls = int(kitty_stats.get("decode_calls", 0)) if kitty_stats else 0
+                    prefill_calls = int(kitty_stats.get("prefill_calls", 0)) if kitty_stats else 0
+                    seqlen = kv_cache.get_seq_length() if kv_cache is not None else 0
+                    engaged = (
+                        kv_cache is not None and seqlen > 0
+                        and kitty_stats is not None
+                        and int(kitty_stats.get("installed", 0)) > 0
+                        and prefill_calls > 0
+                        and decode_calls > 0
+                    )
+                    detail = (
+                        f"installed={kitty_stats.get('installed') if kitty_stats else None} "
+                        f"prefill_calls={prefill_calls} decode_calls={decode_calls} "
+                        f"seq_length={seqlen} "
+                        f"last_selected_pages={kitty_stats.get('last_selected_pages') if kitty_stats else None} "
+                        f"last_page_count={kitty_stats.get('last_page_count') if kitty_stats else None}"
+                    )
+                    print(f"[sim-quest] {dataset} first-sample evidence: {detail}")
+                    raise_msg = (
+                        f"SIM_QUEST was requested for variant '{variant.name}' but the pure-torch "
+                        f"QUEST decode hook did not engage ({detail}). Results would be plain "
+                        f"dense attention over the QLUTATTN fake-quant KV cache, not QUEST+QLUTATTN. "
+                        f"Refusing to proceed. See kitty_sim/sim_quest.py."
                     )
                 elif variant.shadowkv:
                     # Pure-torch ShadowKV: prove the decode hook ran (vs the
@@ -840,7 +914,7 @@ def run_longbench(args: Any) -> dict[str, Any]:
             f"(current={os.environ.get('CUDA_VISIBLE_DEVICES')!r})"
         )
 
-    variant = build_variant(args)
+    variant = _maybe_enable_sim_quest(build_variant(args), args)
     model_family = args.model_family or infer_model_family(args.model_tag or args.model, args.model_path or args.model)
     model_tag = args.model_tag or model_basename(args.model, args.model_path)
     output_root = args.output_dir
@@ -933,6 +1007,25 @@ def run_longbench(args: Any) -> dict[str, Any]:
             f"[shadowkv] installed pure-torch ShadowKV sim hook on {kitty_stats['installed']} layers "
             f"(variant={variant.tag}, budget={variant.sparse_budget}, rank={variant.rank}, "
             f"chunk={variant.chunk_size})"
+        )
+    elif variant.sim_quest:
+        if legacy_cache_model:
+            raise RuntimeError("SIM_QUEST=1 is not supported for legacy-cache/GLM-family models.")
+        from kitty_sim.quest_sparse import QuestConfig as _SimQuestConfig
+        from kitty_sim.sim_quest import install_sim_quest
+
+        quest_cfg = _SimQuestConfig(
+            page_size=16,
+            token_budget=variant.quest_token_budget,
+            skip_layers=variant.quest_skip_layers,
+            sink_length=variant.sink_length,
+            recent_length=variant.buffer_length,
+        )
+        kitty_stats = install_sim_quest(model_obj, quest_cfg)
+        print(
+            f"[sim-quest] installed pure-torch QUEST hook on {kitty_stats['installed']} layers "
+            f"(variant={variant.tag}, budget={variant.quest_token_budget}, "
+            f"skip_layers={variant.quest_skip_layers})"
         )
     elif variant.use_kitty and legacy_cache_model:
         kitty_stats = install_glm_kitty_fakequant(

@@ -1,9 +1,11 @@
 import json
+import os
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import sys
+from unittest.mock import patch
 
 import torch
 
@@ -14,8 +16,10 @@ from kitty_sim.cli.eval_longbench import build_parser
 from kitty_sim.longbench.scorer import score_directory
 from kitty_sim.longbench.templates import build_chat, format_longbench_prompt
 from kitty_sim.longbench.runner import (
+    _maybe_enable_sim_quest,
     build_variant,
     default_prediction_dir,
+    method_layout_slug,
     resolve_prediction_dir,
 )
 from kitty_sim.utils_quant import fake_quant_groupwise_lastdim
@@ -72,6 +76,14 @@ class LongBenchTests(unittest.TestCase):
         for v in ("kitty_page16", "quest_proxy_kitty_page16"):
             with self.assertRaises(SystemExit):
                 build_parser().parse_args(["Qwen/Qwen3-8B", "--variant", v])
+
+    def test_sim_quest_env_overlays_qlutattn_without_variant_fork(self):
+        base = build_variant(SimpleNamespace(variant="qlutattn_k125v4_pt"))
+        with patch.dict(os.environ, {"SIM_QUEST": "1", "QUEST_TOKEN_BUDGET": "1024"}, clear=False):
+            variant = _maybe_enable_sim_quest(base, SimpleNamespace())
+        self.assertTrue(variant.sim_quest)
+        self.assertEqual(variant.quest_token_budget, 1024)
+        self.assertEqual(method_layout_slug(variant), "qlutattn-k125v4-pt-quest-sim")
 
     def test_flat_prediction_dir_does_not_append_variant_subdir(self):
         variant = build_variant(SimpleNamespace(variant="kitty"))
