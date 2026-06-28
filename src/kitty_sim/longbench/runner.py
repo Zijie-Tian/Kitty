@@ -78,6 +78,10 @@ class VariantConfig:
     pertoken_cb_mask: Optional[str] = None
     # qlutattn-rotated-k*v4-pt: Hadamard-rotate the per-channel-centered residual before per-token quant.
     pertoken_rotate: bool = False
+    # block-shared per-token codebook: # of consecutive tokens that SHARE one per-token
+    # codebook (Lloyd levels / sign-mag). 1 = per-token (current); >1 = block-shared
+    # (side-info amortized block x). Only the offline per-token paths honor it.
+    pertoken_block: int = 1
 
     @property
     def tag(self) -> str:
@@ -88,7 +92,8 @@ class VariantConfig:
             h = hashlib.sha256(repr(self.bin_codebooks).encode()).hexdigest()[:6]
             iso = (f"_iso{self.pertoken_outlier_k}b{self.pertoken_outlier_bits}"
                    if self.k_quant_mode == "per_token" and self.pertoken_outlier_k > 0 else "")
-            return f"{self.name}_nb{self.n_bins}_v{self.vbits}_cb{h}{iso}"
+            blk = f"_blk{self.pertoken_block}" if self.pertoken_block > 1 else ""
+            return f"{self.name}_nb{self.n_bins}_v{self.vbits}_cb{h}{iso}{blk}"
         if self.shadowkv:
             return f"{self.name}_sb{self.sparse_budget}_r{self.rank}_c{self.chunk_size}"
         suffix = ""
@@ -148,6 +153,8 @@ def _load_promote_ratio_config(
 
 def build_variant(args: Any) -> VariantConfig:
     variant = args.variant.lower()
+    # per-token block-shared codebook size (offline per-token variants only). 1 = per-token.
+    pt_block = int(os.environ.get("PERTOKEN_BLOCK", "1"))
     config_path = getattr(args, "promote_ratio_config", None)
     if config_path and variant != "kitty":
         raise ValueError(
@@ -255,7 +262,8 @@ def build_variant(args: Any) -> VariantConfig:
         return VariantConfig(
             name="qlutattn_k168v4_pt", use_kitty=True, k_codebook="qlut",
             bin_codebooks=("sign", "tern"), n_bins=2, vbits=4, promote_ratio=0.0,
-            channel_selection=0, k_quant_mode="per_token", pertoken_cb_mask=mask)
+            channel_selection=0, k_quant_mode="per_token", pertoken_cb_mask=mask,
+            pertoken_block=pt_block)
     if variant in ("qlutattn_k188v4_pt", "qlutattn-k188v4-pt"):
         # NEW sibling of k168v4-pt: per-token K with an OFFLINE per-channel sign/nf2 codebook.
         # Each post-RoPE K channel is assigned sign(1.25b, low σ²) or nf2(2.5b, high σ²) once
@@ -272,7 +280,8 @@ def build_variant(args: Any) -> VariantConfig:
         return VariantConfig(
             name="qlutattn_k188v4_pt", use_kitty=True, k_codebook="qlut",
             bin_codebooks=("sign", "nf2"), n_bins=2, vbits=4, promote_ratio=0.0,
-            channel_selection=0, k_quant_mode="per_token", pertoken_cb_mask=mask)
+            channel_selection=0, k_quant_mode="per_token", pertoken_cb_mask=mask,
+            pertoken_block=pt_block)
     if variant in ("qlutattn_k125v4_pt", "qlutattn-k125v4-pt"):
         # PER-TOKEN version of qlutattn-k125v4: subtract a per-CHANNEL mean (free
         # for attention -- q.mu cancels in softmax) then PURE per-token binary
@@ -324,7 +333,7 @@ def build_variant(args: Any) -> VariantConfig:
             name="qlutattn_rotated_st_pt", use_kitty=True, k_codebook="qlut",
             bin_codebooks=("sign", "tern"), n_bins=2, vbits=4, promote_ratio=0.0,
             channel_selection=0, k_quant_mode="per_token",
-            pertoken_cb_mask=mask, pertoken_rotate=True)
+            pertoken_cb_mask=mask, pertoken_rotate=True, pertoken_block=pt_block)
     if variant in ("qlutattn_rotated_snf_pt", "qlutattn-rotated-snf-pt"):
         # ROTATED sign/nf2 offline-MIX (k188v4-pt + online Hadamard). sign-frac (in the
         # mask) sets the bit/value; online FWHT rotates the residual before per-bin quant.
@@ -338,7 +347,7 @@ def build_variant(args: Any) -> VariantConfig:
             name="qlutattn_rotated_snf_pt", use_kitty=True, k_codebook="qlut",
             bin_codebooks=("sign", "nf2"), n_bins=2, vbits=4, promote_ratio=0.0,
             channel_selection=0, k_quant_mode="per_token",
-            pertoken_cb_mask=mask, pertoken_rotate=True)
+            pertoken_cb_mask=mask, pertoken_rotate=True, pertoken_block=pt_block)
     if variant in ("qlutattn_pertoken", "qlut_pertoken"):
         # qlutattn-k1v4 turned per-token: a SINGLE submean codebook applied along
         # head_dim per token (sigma^2 binning has no per-channel axis in per-token
@@ -412,6 +421,7 @@ def _cache_factory(config: VariantConfig):
         pertoken_mixed=config.pertoken_mixed,
         pertoken_cb_mask=config.pertoken_cb_mask,
         pertoken_rotate=config.pertoken_rotate,
+        pertoken_block=config.pertoken_block,
     )
     return get_kvcache_kitty(ns)
 
@@ -485,7 +495,7 @@ def method_layout_slug(variant: VariantConfig | str) -> str:
             pr = str(variant.promote_ratio).replace(".", "p")
             return f"kitty-k{variant.kbits}b{variant.promote_bit}v{variant.vbits}-pr{pr}"
         return "kitty"  # str fallback: no bit info available
-    return {
+    slug = {
         "qlutattn_pertoken": "qlutattn-pertoken",
         "fp16": "fp16",
         "custom": "custom-kitty",
@@ -502,6 +512,11 @@ def method_layout_slug(variant: VariantConfig | str) -> str:
         "qlutattn_rotated_st_pt": "qlutattn-rotated-st-pt",
         "qlutattn_rotated_snf_pt": "qlutattn-rotated-snf-pt",
     }.get(name, _layout_slug(name))
+    # block-shared per-token codebook: distinct output dir per block size (e.g.
+    # qlutattn-k188v4-pt-blk16) so a PERTOKEN_BLOCK sweep never collides with block=1.
+    if isinstance(variant, VariantConfig) and getattr(variant, "pertoken_block", 1) > 1:
+        slug = f"{slug}-blk{variant.pertoken_block}"
+    return slug
 
 
 def default_prediction_dir(model: str, model_path: str | None, variant: VariantConfig, max_samples: int) -> Path:

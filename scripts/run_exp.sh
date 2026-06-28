@@ -257,20 +257,28 @@ select_gpus() {
 
 # Map a variant name to its output method slug (mirrors runner.py method_layout_slug).
 method_slug() {
+  local base
   case "${1,,}" in
     kitty)
       local _pr="${PROMOTE_RATIO:-0.125}"
-      printf 'kitty-k%sb%sv%s-pr%s\n' "${KBITS:-2}" "${PROMOTE_BIT:-4}" "${VBITS:-2}" "${_pr//./p}" ;;
-    qlutattn_pertoken) printf 'qlutattn-pertoken\n' ;;
-    fp16) printf 'fp16\n' ;;
-    kivi) printf 'kivi-k%sv%s\n' "${KBITS:-2}" "${VBITS:-2}" ;;
-    kivi_star) printf 'kivi-star-k%sv%s\n' "${KBITS:-2}" "${VBITS:-2}" ;;
-    custom) printf 'custom-kitty\n' ;;
-    shadowkv) printf 'shadowkv\n' ;;
-    qlutattn_k1v4|qlutattn-k1v4) printf 'qlutattn-k1v4\n' ;;
-    qlutattn_k184v4|qlutattn-k184v4) printf 'qlutattn-k184v4\n' ;;
-    *) printf '%s\n' "${1//_/-}" ;;
+      base="$(printf 'kitty-k%sb%sv%s-pr%s' "${KBITS:-2}" "${PROMOTE_BIT:-4}" "${VBITS:-2}" "${_pr//./p}")" ;;
+    qlutattn_pertoken) base='qlutattn-pertoken' ;;
+    fp16) base='fp16' ;;
+    kivi) base="$(printf 'kivi-k%sv%s' "${KBITS:-2}" "${VBITS:-2}")" ;;
+    kivi_star) base="$(printf 'kivi-star-k%sv%s' "${KBITS:-2}" "${VBITS:-2}")" ;;
+    custom) base='custom-kitty' ;;
+    shadowkv) base='shadowkv' ;;
+    qlutattn_k1v4|qlutattn-k1v4) base='qlutattn-k1v4' ;;
+    qlutattn_k184v4|qlutattn-k184v4) base='qlutattn-k184v4' ;;
+    *) base="${1//_/-}" ;;
   esac
+  # block-shared per-token codebook: append -blk{N} so a PERTOKEN_BLOCK sweep lands
+  # in distinct dirs (mirrors runner.py method_layout_slug). N=1 (default) = no suffix.
+  local _blk="${PERTOKEN_BLOCK:-1}"
+  if [[ "${_blk}" =~ ^[0-9]+$ && "${_blk}" -gt 1 ]]; then
+    base="${base}-blk${_blk}"
+  fi
+  printf '%s\n' "${base}"
 }
 
 is_smoke() {

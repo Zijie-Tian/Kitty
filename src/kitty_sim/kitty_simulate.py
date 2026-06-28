@@ -50,6 +50,7 @@ class KittyKVCacheConfig(CacheConfig):
         pertoken_mixed: bool = False,             # per_token only: per-channel submean + sigma^2-binned MIXED codebook (ONLINE sigma^2, legacy k1.68v4-pt path); bin_codebooks = per-bin policy (low sigma^2 -> bin 0).
         pertoken_cb_mask: Optional[str] = None,   # per_token only: path to an OFFLINE per-(layer,head,channel) codebook mask (the corrected k168v4-pt). When set, each channel uses bin_codebooks[mask[c]] FIXED (offline sigma^2 calibration -> sign/tern), no online sigma^2 binning, no nf2.
         pertoken_rotate: bool = False,            # per_token only: Hadamard-rotate (FWHT) the per-channel-centered residual before per-token quant, de-rotate after (FWHT self-inverse). Spreads K outliers -> isotropic -> per-token sign/tern fits one scale. Free for attention (orthogonal; q.mu cancels). qlutattn-rotated-k*v4-pt.
+        pertoken_block: int = 1,                  # per_token only: # of consecutive tokens that SHARE one per-token codebook (Lloyd levels / sign-mag). 1 = current per-token (each token its own); >1 = block-shared (side-info amortized block x). Quant axis is unchanged (still head_dim).
     ):
         super().__init__("kitty_kv")
         self.sink_length = sink_length
@@ -79,6 +80,7 @@ class KittyKVCacheConfig(CacheConfig):
         self.pertoken_mixed = pertoken_mixed
         self.pertoken_cb_mask = pertoken_cb_mask
         self.pertoken_rotate = pertoken_rotate
+        self.pertoken_block = int(pertoken_block)
         #
         self.validate()
 
@@ -102,6 +104,14 @@ class KittyKVCacheConfig(CacheConfig):
             raise ValueError(
                 "k_quant_mode='per_token' requires promote_ratio=0.0 and no per-layer override "
                 "(per-token K has no channel axis at quantization time)")
+        if self.pertoken_block < 1:
+            raise ValueError(
+                incorrect_arg_msg.format(
+                    key="pertoken_block",
+                    correct_value="an integer >= 1 (1 = per-token; >1 = block-shared codebook)",
+                    found_value=self.pertoken_block,
+                ),
+            )
         if self.channel_selection not in [0, 1, 3]:
             raise ValueError(
                 incorrect_arg_msg.format(
@@ -274,6 +284,11 @@ class KittyKVCache(DynamicCache):
             print(f"[qlutattn-offline] loaded codebook mask {tuple(_m.shape)} from "
                   f"{self.pertoken_cb_mask_path} codebooks={self.bin_codebooks} "
                   f"nominal~{_blob.get('nominal_bits')}")
+        # per_token block-shared codebook: pertoken_block consecutive tokens share one
+        # per-token codebook. k_pt_quant_end[layer] = absolute token index quantized so
+        # far (strict block-aligned decode: prefill sets it, decode advances it per block).
+        self.pertoken_block = int(getattr(cache_config, "pertoken_block", 1))
+        self.k_pt_quant_end: dict[int, int] = {}
         #
         #self.query_cache: list[torch.Tensor] = []
         #self.query_score: list[torch.Tensor] = []
@@ -375,6 +390,38 @@ class KittyKVCache(DynamicCache):
             return r * mb
         raise ValueError(cb)
 
+    def _pt_codebook_blocked(self, r, m, cb):
+        """Block-shared wrapper around _pt_codebook_masked. r:[B,nh,T,D], m:[nh,D].
+        pertoken_block<=1 (or T<=1) -> call the core unchanged (bit-identical to the
+        per-token path). block>1 -> flatten each block of `block` consecutive tokens'
+        (block,D) into the last dim so the core's last-dim reduce / Lloyd is SHARED
+        across the block (one codebook per block); the trailing T%block tokens form one
+        smaller block. Works for sign/tern/nf2/uni alike because the core only reduces
+        and masks along the last axis. Any FWHT rotation is applied by the caller on
+        [B,nh,T,D] before this and undone after; this wrapper restores [B,nh,T,D] so it
+        stays transparent to rotate/de-rotate."""
+        blk = self.pertoken_block
+        if blk <= 1 or r.shape[2] <= 1:
+            return KittyKVCache._pt_codebook_masked(r, m, cb)
+        B, nh, T, D = r.shape
+        nb, rem = T // blk, T % blk
+        out = torch.empty_like(r)
+
+        def _run(rt, blk_t):                                    # rt:[B,nh,nB,blk_t,D]
+            nB = rt.shape[2]
+            rf = rt.reshape(B, nh, nB, blk_t * D)
+            mf = m[:, None, :].expand(nh, blk_t, D).reshape(nh, blk_t * D)
+            rec = KittyKVCache._pt_codebook_masked(rf, mf, cb)  # [B,nh,nB,blk_t*D]
+            return rec.reshape(B, nh, nB, blk_t, D)
+
+        if nb > 0:
+            main = _run(r[:, :, :nb * blk, :].reshape(B, nh, nb, blk, D), blk)
+            out[:, :, :nb * blk, :] = main.reshape(B, nh, nb * blk, D)
+        if rem > 0:
+            tail = _run(r[:, :, nb * blk:, :].reshape(B, nh, 1, rem, D), rem)
+            out[:, :, nb * blk:, :] = tail.reshape(B, nh, rem, D)
+        return out
+
     @staticmethod
     def _fwht_lastdim(x):
         """Normalized fast Walsh-Hadamard transform along the last axis (head_dim,
@@ -435,7 +482,7 @@ class KittyKVCache(DynamicCache):
             cb_id = self.k_cb_mask.get(layer_idx)
             if cb_id is None:                                             # layer absent from mask: single codebook
                 full = torch.ones(nh, D, dtype=torch.bool, device=ks.device)
-                out = self._pt_codebook_masked(r, full, self.bin_codebooks[0])
+                out = self._pt_codebook_blocked(r, full, self.bin_codebooks[0])
             else:
                 if cb_id.device != ks.device:
                     cb_id = cb_id.to(ks.device)
@@ -445,7 +492,7 @@ class KittyKVCache(DynamicCache):
                     m = (cb_id == ci)                                     # [nh,D]
                     if not m.any():
                         continue
-                    out = out + self._pt_codebook_masked(r, m, cbk)
+                    out = out + self._pt_codebook_blocked(r, m, cbk)
             if self.pertoken_rotate:                                       # de-rotate (FWHT self-inverse) back to original basis
                 out = self._fwht_lastdim(out)
             return (muB + out).to(ks.dtype)
@@ -481,7 +528,7 @@ class KittyKVCache(DynamicCache):
                     m = (binid == bi)                                     # [nh,D]
                     if not m.any():
                         continue
-                    out = out + self._pt_codebook_masked(r, m, policy[bi])
+                    out = out + self._pt_codebook_blocked(r, m, policy[bi])
                 return (muB + out).to(ks.dtype)
             # Prefill: one big call. Keep the per-head extract loop -- it is already
             # GPU-efficient on the large tensor and far lighter on memory than a
@@ -659,6 +706,9 @@ class KittyKVCache(DynamicCache):
                         ks = current_key_cache[:, :, start_idx:k_end_idx, :]
                         ks = self._quant_k_pertoken(ks, layer_idx)
                         current_key_cache[:, :, start_idx:k_end_idx, :] = ks
+                        # block-shared codebook: remember the absolute token index we
+                        # quantized up to, so strict block-aligned decode resumes here.
+                        self.k_pt_quant_end[layer_idx] = k_end_idx
                 else:
                     # QLUT/KIVI per-channel path: bin channels by sigma^2 once over
                     # the full prompt quant region [sink, end_idx) before flushing buffers.
@@ -692,12 +742,29 @@ class KittyKVCache(DynamicCache):
             # quantize
             num_tokens_kv_to_quantize = current_cache_length - self.sink_length - self.buffer_length
             if self.k_quant_mode == "per_token":
-                # Per-token K follows the KIVI-style V schedule: quantize the
-                # single token sliding out of the recent fp16 window each step.
-                if num_tokens_kv_to_quantize > 0:
-                    ks = current_key_cache[:, :, -self.buffer_length-1:-self.buffer_length, :]
-                    ks = self._quant_k_pertoken(ks, layer_idx)
-                    current_key_cache[:, :, -self.buffer_length-1:-self.buffer_length, :] = ks
+                blk = self.pertoken_block
+                if blk <= 1:
+                    # Per-token K follows the KIVI-style V schedule: quantize the
+                    # single token sliding out of the recent fp16 window each step.
+                    if num_tokens_kv_to_quantize > 0:
+                        ks = current_key_cache[:, :, -self.buffer_length-1:-self.buffer_length, :]
+                        ks = self._quant_k_pertoken(ks, layer_idx)
+                        current_key_cache[:, :, -self.buffer_length-1:-self.buffer_length, :] = ks
+                else:
+                    # Strict block-aligned per-token K: accumulate the tokens sliding out
+                    # of the recent fp16 window and quantize a full `blk`-token block once
+                    # `blk` of them are pending (one shared codebook per block, matching
+                    # prefill). The <blk trailing tokens stay fp16 until the next block
+                    # fills (pending); generation-end leaves at most blk-1 tokens fp16.
+                    qend = self.k_pt_quant_end.get(layer_idx, self.sink_length)
+                    ready = (current_cache_length - self.buffer_length) - qend
+                    while ready >= blk:
+                        ks = current_key_cache[:, :, qend:qend + blk, :]
+                        ks = self._quant_k_pertoken(ks, layer_idx)
+                        current_key_cache[:, :, qend:qend + blk, :] = ks
+                        qend += blk
+                        ready -= blk
+                    self.k_pt_quant_end[layer_idx] = qend
             elif num_tokens_kv_to_quantize > 0 and (num_tokens_kv_to_quantize % self.buffer_length == 1):  # need to quantize
                 # Quantize Key Cache
                 key_slice = current_key_cache[:, :, -self.buffer_length-1:-1, :].transpose(2, 3).contiguous()
@@ -749,6 +816,7 @@ def get_kvcache_kitty(args: argparse.Namespace) -> KittyKVCache:
         pertoken_mixed      = getattr(args, "pertoken_mixed", False),
         pertoken_cb_mask    = getattr(args, "pertoken_cb_mask", None),
         pertoken_rotate     = getattr(args, "pertoken_rotate", False),
+        pertoken_block      = getattr(args, "pertoken_block", 1),
     )
     #
     return KittyKVCache(cache_config=cache_config)

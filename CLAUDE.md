@@ -634,6 +634,102 @@ bash scripts/run_exp.sh llama32 --gpus 0,0,0,1,1,1,2,2,2,3,3,3,4,4,4,5,5,5 --var
   1B 每卡仍可 3 worker;empty-mask 行的 NaN 已修(commit a1433d3)。
 - 这是纯 torch sim fake-quant 路径(精度代理,不省真实 KV 显存),与其余 qlutattn 一致。
 
+### per-token block 共用码本(`PERTOKEN_BLOCK`)
+
+per-token 量化默认给**每个 token 各自一套码本**(nf2 的 4 个 Lloyd levels / sign 的
+per-token mag),side-info 是 per-token 的——这正是 per-token nf2 有效 bit 被抬到 ~2.5
+(而非纯 2-bit codeword)的原因。`PERTOKEN_BLOCK=N`(默认 1)把码本粒度放粗成**每 N 个
+连续 token 共用一套码本**:量化轴**不变**(仍沿 head_dim),只是把一个 block 的
+`(N, head_dim)` 展平进同一量化组,side-info 摊薄 ~N 倍。N=1 即现状(per-token),
+完全向后兼容。
+
+- **旋钮 / 接入**:环境变量 `PERTOKEN_BLOCK`(跟随 `PERTOKEN_OUTLIER_K` 命名),仅在
+  **offline per-token** 变体上生效:`qlutattn_k188v4_pt`(默认推荐,sign/nf2)、
+  `qlutattn_k168v4_pt`(sign/tern)、`qlutattn_rotated_st_pt`、`qlutattn_rotated_snf_pt`。
+  **纯 nf2 + block** 用 `k188v4_pt` + 标定 `--sign-frac 0`(全 nf2 掩码),同走 offline
+  路径。`pertoken_pc_submean` 系(k125/k185/rotated_k125/k185)与 `qlutattn_pertoken`
+  本次**不接** block。
+- **block 对所有码本生效**:block 内 sign 通道也共用一个 mag、nf2 通道共用一套 levels
+  (在 `_pt_codebook_blocked` 里把 `(block,D)` flatten 进最后一维、复用现有 core
+  `_pt_codebook_masked` / `_masked_lloyd_lastdim`,sign/tern/nf2/uni 自动 per-block)。
+- **decode 严格 block-aligned**:`k_pt_quant_end[layer]` 指针(prefill 设、decode 推进),
+  decode 攒够 `block` 个滑出 recent 窗口的 token 才量化一块,与 prefill 分组一致;尾部
+  不满 block 的 token 暂留 fp16(生成结束最多 `block-1` 个 fp16,轻微乐观)。
+- **输出目录**:`method_layout_slug` 在 `block>1` 时自动追加 `-blk{N}`(如
+  `qlutattn-k188v4-pt-blk16`),`tag` 同加 `_blk{N}`,sweep 不同 block 不会撞目录。
+- **bit 账(sim 不自动算)**:codeword 仍 2-bit,side-info 摊薄 block 倍 →
+  有效 nf2 bit ≈ `2.0 + (side·16)/(block·D_nf2)`;按既有口径(per-token nf2 ≈2.5,即
+  +0.5 side),block=16 → ≈ `2.0 + 0.5/16 ≈ 2.03` bit。**sim 分数只反映精度损失,bit
+  收益手算填表。** 0-GPU 已验证 `block=1` 与 per-token core **bit-identical**(diff 0.0)、
+  `block=16` 与手工分块逐块一致(含尾块)。
+
+**代码改动落点.** 这次 block 共用码本由三层一起接通:配置层
+`KittyKVCacheConfig.pertoken_block` / `get_kvcache_kitty(...pertoken_block)`;量化层
+`KittyKVCache._pt_codebook_blocked()` 将 `(block,D)` 展平后复用
+`_pt_codebook_masked` / `_masked_lloyd_lastdim`,并用 `k_pt_quant_end[layer]` 做严格
+block-aligned decode;运行层 `VariantConfig.pertoken_block` 从 `PERTOKEN_BLOCK` 读取,
+同时 `runner.py::method_layout_slug()` 和 `scripts/run_exp.sh::method_slug()` 都在
+`block>1` 时追加 `-blk{N}`。因此实际 LongBench 入口仍然只用
+`scripts/run_exp.sh`,不要绕过它手写输出目录。
+
+**如何调用.** 最小调用只需在 offline per-token 变体前设置
+`PERTOKEN_BLOCK=N` 和对应 `QLUT_CB_MASK`:默认推荐 f50 用
+`qlutattn_k188v4_pt` + `--codebooks sign,nf2 --sign-frac 0.5` 标定出的 mask;纯 nf2 用同
+variant 但 mask 全置 nf2(等价标定 `--sign-frac 0`)。`PERTOKEN_BLOCK=1` 或不设置即原始
+per-token;`PERTOKEN_BLOCK=16` 写入
+`longbench_out/..._qlutattn-k188v4-pt-blk16/{pred,logs}`。block sweep 的结果图统一放在
+`docs/figures/`: `pareto_llama32-1b.png`, `pareto_minicpm5-1b.png`,
+`pareto_llama32-3b.png`, `pareto_qwen3-4b.png`。
+
+**全量结果(Llama-3.2-1B,21 数据集,32k,block=16;GPU 各 3 卡并行)**:
+
+| 掩码 | block1(per-token)| block16 | Δ | 实际 bit(估,side÷16)|
+| --- | ---: | ---: | ---: | ---: |
+| f50 sign/nf2(50/50)| 25.03 | **24.47** | −0.56 | 1.875 → ~1.52 |
+| f00 纯 nf2 | 25.65 | **24.82** | −0.83 | 2.5 → ~2.03 |
+
+fp16 27.59 / per-channel k1v4 24.88(1.68b)。**block16 用 side-info 摊薄 16× 把有效 bit
+显著压低,精度只掉 0.5–0.8**:f00 block16 @~2.03b 得 24.82 ≈ per-channel k1v4;f50
+block16 @~1.52b 仍 24.47。验证 block 共用码本可行、bit-精度权衡良性。注意 LongBench 输出
+目录由 run_exp.sh 的 shell `method_slug()`(非 python)决定,已同步加 `-blk{N}` 后缀。
+
+**多模型全量(block16,21 集,32k;f50=1.875b sign/nf2,f00=纯 nf2 2.5b;3B/Qwen/MiniCPM gen256)**:
+
+| model | fp16 | k188 block1 | block16 f50 | block16 f00 |
+| --- | ---: | ---: | ---: | ---: |
+| Llama-3.2-1B | 27.59 | 25.03 | 24.47 | 24.82 |
+| MiniCPM5-1B | 20.96 | 18.43 | 17.54 | 17.34 |
+| Llama-3.2-3B | 36.33 | 33.99 | 32.91 | 31.80 |
+| Qwen3-4B-2507 | 45.44 | 44.02 | 42.62 | 41.41 |
+
+block16−block1 损失随模型增大单调递增(−0.56/−0.89/−1.08/−1.40),留存 fp16 的 83.7–93.8%;
+**除 1B 外 f50(1.875b)≥ f00(纯 nf2 2.5b)**(sign/nf2 σ²-mix 比纯 nf2 更划算)。3B/MiniCPM 走
+llama32 target(MiniCPM5-1B=LlamaForCausalLM)、Qwen3-4B 走 qwen;f00 掩码可由 f50 复制
+codebook_mask 全置 nf2 秒生(等价 `--sign-frac 0`)。
+
+```bash
+# smoke(2 samples/dataset;同一 mask,block=16 vs 默认 block=1 靠 slug 自动分目录)
+cd /home/zijie/Code/Kitty
+QLUT_CB_MASK=/home/zijie/models/Llama-3.2-1B-Instruct.k188v4pt_f50.pt PERTOKEN_BLOCK=16 \
+LLAMA32_MODEL_PATH=/home/zijie/models/Llama-3.2-1B-Instruct \
+MAX_MODEL_LEN=32768 LLAMA32_MAX_GEN=256 DATASETS_CSV=multifieldqa_en,hotpotqa \
+bash scripts/run_exp.sh llama32 --gpu 1 --variant qlutattn_k188v4_pt --max-samples 2
+# -> longbench_out/smoke/llama32-1b-instruct_qlutattn-k188v4-pt-blk16/{pred,logs}
+```
+
+```bash
+# full(全部 21 数据集,32k;扫 PERTOKEN_BLOCK ∈ {1,8,16,32,64} 画 bit-精度曲线)
+cd /home/zijie/Code/Kitty
+for blk in 1 8 16 32 64; do
+  QLUT_CB_MASK=/home/zijie/models/Llama-3.2-1B-Instruct.k188v4pt_f50.pt PERTOKEN_BLOCK=$blk \
+  LLAMA32_MODEL_PATH=/home/zijie/models/Llama-3.2-1B-Instruct \
+  MAX_MODEL_LEN=32768 LLAMA32_MAX_GEN=256 \
+  bash scripts/run_exp.sh llama32 --gpus 0,0,0,1,1,1,2,2,2,3,3,3,4,4,4,5,5,5 --variant qlutattn_k188v4_pt
+done
+# -> longbench_out/llama32-1b-instruct_qlutattn-k188v4-pt[-blk{N}]/{pred,logs}
+# 纯 nf2+block:先用 --sign-frac 0 标定一个全-nf2 掩码,再以同样命令跑。
+```
+
 ## qlutattn-rotated-k*v4-pt (Hadamard-rotated per-token K)
 
 `qlutattn_rotated_k125v4_pt` (rotated sign) and `qlutattn_rotated_k185v4_pt` (rotated
