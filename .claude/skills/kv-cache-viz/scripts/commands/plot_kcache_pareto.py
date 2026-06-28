@@ -7,12 +7,11 @@ and scatters it against the variant's K-cache bits/value. fp16 is drawn as a
 ceiling line (16-bit, off the bit axis). K bit/value = codeword bits + fp16
 side-info (scale+zero = 2*16/group, group=128 -> 0.25), sink/buffer ignored.
 """
+import argparse
 import json
 import os
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+from lib.common import save_fig, setup_matplotlib
 
 BASE = "longbench_out"
 # (label, output-dir, K bits/value)
@@ -42,7 +41,15 @@ def mean(d):
     return sum(v) / len(v)
 
 
-def main():
+def run(argv=None):
+    setup_matplotlib()
+    import matplotlib.pyplot as plt
+
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--outdir", default=BASE)
+    a = ap.parse_args(argv)
+    os.makedirs(a.outdir, exist_ok=True)
+
     fp16 = mean(FP16_DIR)
     pts = [(lbl, bit, mean(d)) for lbl, d, bit in POINTS]
     print(f"{'variant':16s} {'Kbit':>5s} {'score':>7s}  retain%")
@@ -72,11 +79,10 @@ def main():
     ax.set_xlim(1.0, 2.7)
     ax.set_ylim(min(ys) - 3, fp16 + 1.5)
     ax.grid(True, ls=":", alpha=0.5)
-    fig.tight_layout()
-    out = os.path.join(BASE, "kcache_pareto_llama32_1b.png")
-    fig.savefig(out, dpi=140)
-    print("saved", out)
+
+    out = os.path.join(a.outdir, "kcache_pareto_llama32_1b.png")
+    save_fig(fig, out, dpi=140)
 
 
 if __name__ == "__main__":
-    main()
+    run()

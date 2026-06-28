@@ -1,0 +1,23 @@
+{
+  "skill_name": "kv-cache-viz",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "在 Kitty 仓库里画一个合并的 K-cache Pareto 图（要包含 per-token sign/nf2 sweep 和 reference methods），输出到 docs/ 目录。",
+      "expected_output": "生成 docs/kcache_pareto_combined_llama32_1b.png，图中应包含 fp16 ceiling 虚线、per-channel k1v4 参考线、per-token 非旋转/旋转的 sign/tern/nf2 曲线以及默认甜点标注。",
+      "files": ["docs/kcache_pareto_combined_llama32_1b.png"]
+    },
+    {
+      "id": 2,
+      "prompt": "用 Kitty 仓库里的 kv-cache-viz 画一个 end-to-end 性能柱状图，比较不同 KV 格式随输入长度的性能。",
+      "expected_output": "生成 probe_out/attn_bench/e2e_perf_bars.png，包含不同 KV 格式（fp16/KIVI/Kitty/QLUTATTN 等）在不同输入长度下的分组柱状图。",
+      "files": ["probe_out/attn_bench/e2e_perf_bars.png"]
+    },
+    {
+      "id": 3,
+      "prompt": "用 kv-cache-viz 画一个 KV-cache 显存占用的柱状图，输出到 probe_out/attn_bench/。",
+      "expected_output": "生成 probe_out/attn_bench/kv_memory_bars.png，横轴为 context length，纵轴为 KV memory，按 KV 格式分组。",
+      "files": ["probe_out/attn_bench/kv_memory_bars.png"]
+    }
+  ]
+}

@@ -23,11 +23,10 @@ figure are intentionally dropped so the y-axis can focus on the useful band.
 Pure matplotlib, no GPU, no model load. Run:
   conda run -n kitty python scripts/plot_kcache_pareto_combined.py
 """
+import argparse
 import os
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+from lib.common import save_fig, setup_matplotlib
 
 FP16 = 27.59          # fp16 ceiling (21-dataset mean)
 K1V4_PC = 24.88       # per-channel qlutattn-k1v4 (reference horizontal guide)
@@ -66,7 +65,15 @@ def ys(pts):
     return [p[1] for p in pts]
 
 
-def main():
+def run(argv=None):
+    setup_matplotlib()
+    import matplotlib.pyplot as plt
+
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--outdir", default="docs")
+    a = ap.parse_args(argv)
+    os.makedirs(a.outdir, exist_ok=True)
+
     fig, ax = plt.subplots(figsize=(11.0, 7.0))
 
     # ceiling + per-channel k1v4 guide lines
@@ -116,12 +123,9 @@ def main():
     ax.set_ylim(20.5, 28.0)
     ax.grid(True, ls=":", alpha=0.5)
     ax.legend(loc="lower right", fontsize=9, framealpha=0.95)
-    fig.tight_layout()
 
-    out = os.path.join("docs", "kcache_pareto_combined_llama32_1b.png")
-    os.makedirs("docs", exist_ok=True)
-    fig.savefig(out, dpi=140)
-    print("saved", out)
+    out = os.path.join(a.outdir, "kcache_pareto_combined_llama32_1b.png")
+    save_fig(fig, out, dpi=140)
 
     # console summary
     print(f"\n{'line':28s} {'bit':>6s} {'score':>7s}")
@@ -134,4 +138,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    run()

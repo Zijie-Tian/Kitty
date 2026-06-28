@@ -14,9 +14,16 @@ When recording notes to Notion for this project, route by note type:
   (data source `ee4db7c4-cbd7-4b35-bd6e-fbc04a9c8310`).
 
 Use the `ntn` CLI with `NOTION_KEYRING=0` (headless / file-based auth). Create a
-page under a database via `parent.type=data_source_id`. Note: ntn currently can
-NOT attach a `file_upload` to an image block — save figures locally and drag them
-into Notion manually if embedding is needed.
+page under a database via `parent.type=data_source_id`.
+
+Embedding a local figure (verified 2026-06-23; supersedes the old "ntn can't
+attach file_upload" note): `ntn files create < fig.png` returns a file-upload id,
+then append it as an image block with
+`ntn api v1/blocks/<page_id>/children -X PATCH -d '{"children":[{"object":"block","type":"image","image":{"type":"file_upload","file_upload":{"id":"<id>"}}}]}'`.
+Wrap ntn in `timeout`: `ntn api` GET on a big page's `/children` can hang, but the
+PATCH write works. The Notion MCP `notion-update-page insert_content` path only
+accepts URL images in Markdown (`![](url)`), not file_upload ids — so use MCP
+`insert_content` for text/tables and the ntn api PATCH above for local figures.
 
 ## GPU1-only evaluation rule
 
@@ -235,7 +242,7 @@ datasets across GPUs, use a single target, e.g. `run_exp.sh llama32 --gpus 0,1,2
 | `qlutattn_k184v4` | `qlutattn-k184v4` | Uniform-tern K (all channels tern) + V per-token 4-bit, K ≈ 1.84 bit — the iso-tern baseline `qlutattn-k1v4` is compared against. |
 | `qlutattn_k125v4` | `qlutattn-k125v4` | Uniform-sign K (all channels sign) + V per-token 4-bit, K ≈ 1.25 bit — cheapest member of the qlutattn-k<bits>v4 family; the pure-sign 1-bit codebook isolated for ablation against σ²-mix (1.68) and tern (1.84). |
 | `qlutattn_pertoken` | `qlutattn-pertoken` | Per-token K quant (head_dim-axis grouping), single codebook (`QLUT_BIN_CODEBOOKS`, default `nf2`), V per-token 4-bit. |
-| `qlutattn_k125v4_pt` | `qlutattn-k125v4-pt` | **Per-token sign with per-CHANNEL mean removal** (the fixed submean): subtract a per-channel μ (cached at prefill, free for attention — `q·μ` cancels in softmax), then pure 1-bit binary on the residual. ~1.25 bit K, V per-token 4-bit. Per-token form of `qlutattn-k125v4`; fixes the broken per-TOKEN submean (full LongBench 10.99→**21.68**). `QLUT_BIN_CODEBOOKS=tern` switches codebook. |
+| `qlutattn_k125v4_pt` | `qlutattn-k125v4-pt` | **Per-token sign with per-CHANNEL mean removal** (the fixed submean): subtract a per-channel μ (cached at prefill, free for attention — `q·μ` cancels in softmax), then pure 1-bit binary on the residual. ~1.25 bit K, V per-token 4-bit. Per-token form of `qlutattn-k125v4`; the per-CHANNEL submean is the correct axis (a per-token submean leaves channel DC heterogeneity). Full LongBench **21.68** at ~1.25 bit. `QLUT_BIN_CODEBOOKS=tern` switches codebook. |
 | `qlutattn_k185v4_pt` | `qlutattn-k185v4-pt` | Per-token **tern** + per-channel mean removal. ~1.84 bit K, V 4-bit. Per-token form of `qlutattn-k184v4`. |
 | `qlutattn_k168v4_pt` | `qlutattn-k168v4-pt` | Per-token K with an **OFFLINE per-channel sign/tern codebook**. Each post-RoPE K channel is fixed offline to sign (1.25b, low σ²) or tern (1.85b, high σ²) by `scripts/calibrate_k168v4_pt.py` on wikitext (default ~28% sign → nominal **1.68b**); the mask is given via `QLUT_CB_MASK` and used unchanged — **no online σ² binning, no nf2**. Per-channel mean still self-calibrated at prefill (free for attention). V per-token 4-bit. Corrected impl: the old online-σ²+nf2 path was ~3b, scored 1B-full **14.39** and collapsed summarization (gov_report 0.64); offline sign/tern restores it (smoke gov_report→14.5). |
 | `qlutattn_k188v4_pt` ⭐ | `qlutattn-k188v4-pt` | **默认推荐优化算法.** k168v4-pt 的姊妹方法,rich 码本由 tern 换成 **nf2(per-token Lloyd)**:离线 per-channel **sign/nf2** 掩码(`scripts/calibrate_k168v4_pt.py --codebooks sign,nf2 --sign-frac <f>`),sign 占比 `f` = 实际 K bit 旋钮(`f·1.25+(1−f)·2.5`)。per-channel 均值 prefill 自标定;V 4-bit;**无旋转、纯 per-token**。1B 上 Pareto 实用最优:**f=0.5(1.875b)=25.03 > per-channel k1v4 24.88**,降到 f=0(纯 nf2,2.5b)=25.65。详见下方「默认推荐优化算法」段。 |
@@ -461,6 +468,134 @@ that still writes to the full layout:
 Local model paths come from `.env` (`KITTY_*_PATH`) or per-target `*_MODEL_PATH`
 overrides; never hardcode host paths in tracked files.
 
+## KV-cache 可视化 skill (`kv-cache-viz`)
+
+仓库里所有 KV-cache **探测/离线可视化** 脚本已整理成 Claude Code skill：
+
+- 路径：`.claude/skills/kv-cache-viz/`
+- 统一入口：`bash .claude/skills/kv-cache-viz/scripts/run_kv_cache_viz.sh <cmd>`
+- 也可直接用 slash 命令：`/kv-cache-viz <cmd>`
+
+### 何时触发
+
+在 Kitty 仓库内，用户出现以下意图时**应该调用** `kv-cache-viz`：
+
+- "画一下 KV cache 分布" / "看一下 K/V 的 channel distribution"
+- "probe 一下 sign scale" / "跑一下 mu2sigma2"
+- "画 Pareto" / "画 heatmap" / "画 e2e latency/memory 柱状图"
+- "分析 KV cache 的能量 / DC share / sigma2"
+- "dump layer 8 的 K/V" 用于离线可视化
+
+**注意**：如果用户只是要"跑 LongBench 精度对比"，应使用 `lutdecoding-acc-bench` skill，
+而不是 `kv-cache-viz`。
+
+### 子命令
+
+#### `probe` — 需要 GPU + LongBench 数据
+
+| 命令 | 原脚本 | 作用 | 输出 |
+| --- | --- | --- | --- |
+| `probe channel-energy` | `dump_channel_energy_csv.py` | 每层 K channel 能量统计 CSV | `.csv` |
+| `probe mu2sigma2` | `dump_kv_mu2_sigma2_dist.py` | K/V 每通道 μ²/σ² 分布 | `.pt`, `.json`, `.png` |
+| `probe nf2-pertoken-maxlevel` | `dump_nf2_pertoken_maxlevel.py` | per-token nf2 max level 分布 | `.pt`, `.png` |
+| `probe sigma2-block-concentration` | `dump_sigma2_block_concentration.py` | σ² 在 128-token block 内/跨 block 集中度 | `.json`, `.png` |
+| `probe signpt-dequant` | `dump_signpt_dequant_dist.py` | sign-pt 反量化前后 channel 分布对比 | `.png` |
+| `probe sign-scale` | `dump_sign_scale_dist.py` | sign-group scale 分布 + 16-token 共享实验 | `.pt`, `.json`, `.png` |
+
+#### `dump-layer` — 为离线画图准备 layer K/V
+
+```bash
+bash .claude/skills/kv-cache-viz/scripts/run_kv_cache_viz.sh dump-layer \
+  --layer 8 --model /home/zijie/models/Llama-3.2-1B-Instruct \
+  --longbench-dir /home/zijie/data/LongBench/data \
+  --tag llama32-1b --outdir probe_out
+```
+
+生成 `probe_out/quant_kvcache_analysis/layer8_{K,V}_fp16.pt`，离线 viz 默认会读它。
+
+#### `viz` — 离线画图（纯 CPU / 可选 GPU）
+
+| 命令 | 原脚本 | 作用 |
+| --- | --- | --- |
+| `viz channel-dist` | `plot_kv_channel_dist.py` | layer/head 8 个 channel 的 K/V 分布 |
+| `viz channel-dist-multi` | `plot_kcache_channel_dist_multi.py` | 每 channel 单独一张 PNG |
+| `viz dcshare-heatmap` | `plot_kcache_dcshare_heatmap.py` | DC-energy share 2D heatmap |
+| `viz decomp` | `plot_k_decomp_steps.py` | K = μ + residual + sign-pt 重建的 3D 图 |
+| `viz kv-3d-submean` | `plot_kv_3d_submean.py` | K = μ + residual 3D 图 |
+| `viz kv-seg-mu2sigma2-3d` | `plot_kv_seg_mu2sigma2_3d.py` | 分段 μ²/σ² 3D 图 |
+| `viz codebook-mu2sigma2` | `plot_codebook_mu2sigma2.py` | sign/nf2 codebook 在 μ²/σ² 通道上的示意 |
+| `viz kcache-reorder-2d` | `plot_kcache_reorder_2d.py` | σ² 重排后的 2D 空间图 |
+| `viz reorder-mixed-codebook` | `plot_reorder_mixed_codebook.py` | 重排 + 混合码本示意 |
+| `viz why-sign-beats-minmax` | `plot_why_sign_beats_minmax.py` | sign 打败 minmax 的理论+实证图 |
+| `viz kcache-pareto` | `plot_kcache_pareto.py` | 方法散点 Pareto 图 |
+| `viz kcache-pareto-combined` | `plot_kcache_pareto_combined.py` | 含 per-token sweep 的合并 Pareto 图 |
+| `viz kitty-kv-heatmap` | `plot_kitty_kv_heatmap.py` | Kitty K×V bit sweep heatmap |
+| `viz kivistar-heatmap` | `plot_kivistar_heatmap.py` | KIVI* K×V bit sweep heatmap |
+| `viz kv-channel-dist-layers` | `plot_kv_channel_dist_layers.py` | 跨层 K/V 分布汇总 |
+| `viz pertoken-smooth` | `plot_pertoken_smooth.py` | per-token + SmoothAttention 对比 |
+| `viz e2e-perf` | `plot_e2e_perf_bars.py` | end-to-end 性能柱状图 |
+| `viz kv-memory-bars` | `plot_kv_memory_bars.py` | KV memory 柱状图 |
+| `viz attn-op-latency` | `plot_attn_op_latency_bars.py` | attention op latency 柱状图 |
+| `viz qlutattn-energy-quest1024` | `plot_qlutattn_energy_quest1024.py` | Quest 预算 1024 下的能量对比 |
+
+### 公共参数
+
+probe / dump-layer：
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `--model` | 必填 | 模型路径 |
+| `--longbench-dir` | 必填 | LongBench `data/` 目录 |
+| `--seq-len` | 32768 | prefill 长度 |
+| `--sink` | 32 | sink token 数 |
+| `--recent` | 128 | recent token 数 |
+| `--chunk` | 4096 | chunked prefill 步长 |
+| `--device` | `cuda:0` | 设备 |
+| `--tag` | `model` | 输出文件名标签 |
+| `--outdir` | `probe_out/sign_scale` | 输出目录 |
+
+viz：
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `--layer` | 8 | 目标层 |
+| `--head` | 0 | 目标 head |
+| `--pt` | 自动 | K/V dump 路径；默认 `outdir/quant_kvcache_analysis/layer{L}_{K,V}_fp16.pt` |
+| `--outdir` | `probe_out` | 输出目录前缀 |
+| `--tag` | `llama32-1b` | 输出文件名标签 |
+| `--device` | `cuda:0` | 需要 GPU 的 viz 命令使用 |
+
+### 典型流程示例
+
+```bash
+cd /home/zijie/Code/Kitty
+
+# 1) 探测（GPU1-only 规则：CUDA_VISIBLE_DEVICES=1）
+CUDA_VISIBLE_DEVICES=1 bash .claude/skills/kv-cache-viz/scripts/run_kv_cache_viz.sh probe mu2sigma2 \
+  --model /home/zijie/models/Llama-3.2-1B-Instruct \
+  --longbench-dir /home/zijie/data/LongBench/data \
+  --seq-len 32768 --tag llama32-1b --outdir probe_out/sign_scale
+
+# 2) dump layer 8 的 K/V 用于离线画图
+CUDA_VISIBLE_DEVICES=1 bash .claude/skills/kv-cache-viz/scripts/run_kv_cache_viz.sh dump-layer \
+  --layer 8 --model /home/zijie/models/Llama-3.2-1B-Instruct \
+  --longbench-dir /home/zijie/data/LongBench/data \
+  --seq-len 32768 --tag llama32-1b --outdir probe_out
+
+# 3) 离线画图（纯 CPU）
+bash .claude/skills/kv-cache-viz/scripts/run_kv_cache_viz.sh viz channel-dist \
+  --layer 8 --head 0 --tag llama32-1b --outdir probe_out
+```
+
+### 注意事项
+
+- 所有 `probe` 和 `dump-layer` 命令都会加载模型到 GPU，必须遵守 **GPU1-only evaluation rule**，
+  默认 `CUDA_VISIBLE_DEVICES=1`，除非用户显式放宽硬件约束。
+- `viz` 命令默认读 `probe_out/quant_kvcache_analysis/layer{L}_{K,V}_fp16.pt`；
+  如果路径不同，用 `--pt` 指定。
+- 输出目录若不存在会自动创建。
+- 本 skill 只用于分析和可视化，不替代 LongBench 精度 benchmark。
+
 ## qlutattn* per-token variants with per-channel submean (the submean fix)
 
 The naive per-token submean codebook subtracts the wrong mean: `apply_codebook`
@@ -491,11 +626,12 @@ self-calibrated from the prompt). Decode is **vectorized across heads**
 | `qlutattn_k185v4_pt` | pure tern | ~1.84 | no (single codebook) | `qlutattn-k184v4` |
 | `qlutattn_k168v4_pt` | **offline** sign/tern per channel | ~1.68 (nominal) | **yes** (`QLUT_CB_MASK`) | `qlutattn-k1v4` |
 
-Impact (Llama-3.2-1B, full LongBench 21 datasets, 32k): fixing the submean
-dimension lifts per-token sign from **10.99** (per-token submean bug) to
-**21.68** (`qlutattn-k125v4-pt`, ~1.25 bit) — within 2.1 of the 2.5-bit
-`qlutattn_pertoken` nf2 baseline (23.82); fp16 is 27.59. For **k168v4-pt** the
-first (ONLINE σ²+nf2) impl was wrong — it binned per-channel σ² into 6 bins incl.
+Results (Llama-3.2-1B, full LongBench 21 datasets, 32k): the per-channel submean
+(the correct axis) gives per-token sign **21.68** (`qlutattn-k125v4-pt`, ~1.25 bit)
+and per-token tern **22.87** (`qlutattn-k185v4-pt`, ~1.84 bit) — within ~1–2 of
+the 2.5-bit `qlutattn_pertoken` nf2 baseline (23.82); champion is 26.46, fp16 27.59.
+For **k168v4-pt** the first (ONLINE σ²+nf2) impl was wrong — it binned per-channel
+σ² into 6 bins incl.
 nf2, paid ~3b of per-token side-info, scored only **14.39**, and collapsed
 summarization (gov_report 0.64 / multi_news 0.34 / vcsum 0.15). The corrected impl
 — **OFFLINE** σ²-ranked sign/tern (no nf2, ~1.68b) — restores summarization (smoke
@@ -710,10 +846,7 @@ codebook_mask 全置 nf2 秒生(等价 `--sign-frac 0`)。
 ```bash
 # smoke(2 samples/dataset;同一 mask,block=16 vs 默认 block=1 靠 slug 自动分目录)
 cd /home/zijie/Code/Kitty
-QLUT_CB_MASK=/home/zijie/models/Llama-3.2-1B-Instruct.k188v4pt_f50.pt PERTOKEN_BLOCK=16 \
-LLAMA32_MODEL_PATH=/home/zijie/models/Llama-3.2-1B-Instruct \
-MAX_MODEL_LEN=32768 LLAMA32_MAX_GEN=256 DATASETS_CSV=multifieldqa_en,hotpotqa \
-bash scripts/run_exp.sh llama32 --gpu 1 --variant qlutattn_k188v4_pt --max-samples 2
+QLUT_CB_MASK=/home/zijie/models/Llama-3.2-1B-Instruct.k188v4pt_f50.pt PERTOKEN_BLOCK=16 LLAMA32_MODEL_PATH=/home/zijie/models/Llama-3.2-1B-Instruct MAX_MODEL_LEN=32768 LLAMA32_MAX_GEN=256 DATASETS_CSV=multifieldqa_en,hotpotqa bash scripts/run_exp.sh llama32 --gpu 1 --variant qlutattn_k188v4_pt --max-samples 2
 # -> longbench_out/smoke/llama32-1b-instruct_qlutattn-k188v4-pt-blk16/{pred,logs}
 ```
 
@@ -721,14 +854,141 @@ bash scripts/run_exp.sh llama32 --gpu 1 --variant qlutattn_k188v4_pt --max-sampl
 # full(全部 21 数据集,32k;扫 PERTOKEN_BLOCK ∈ {1,8,16,32,64} 画 bit-精度曲线)
 cd /home/zijie/Code/Kitty
 for blk in 1 8 16 32 64; do
-  QLUT_CB_MASK=/home/zijie/models/Llama-3.2-1B-Instruct.k188v4pt_f50.pt PERTOKEN_BLOCK=$blk \
-  LLAMA32_MODEL_PATH=/home/zijie/models/Llama-3.2-1B-Instruct \
-  MAX_MODEL_LEN=32768 LLAMA32_MAX_GEN=256 \
-  bash scripts/run_exp.sh llama32 --gpus 0,0,0,1,1,1,2,2,2,3,3,3,4,4,4,5,5,5 --variant qlutattn_k188v4_pt
+  QLUT_CB_MASK=/home/zijie/models/Llama-3.2-1B-Instruct.k188v4pt_f50.pt PERTOKEN_BLOCK=$blk   LLAMA32_MODEL_PATH=/home/zijie/models/Llama-3.2-1B-Instruct   MAX_MODEL_LEN=32768 LLAMA32_MAX_GEN=256   bash scripts/run_exp.sh llama32 --gpus 0,0,0,1,1,1,2,2,2,3,3,3,4,4,4,5,5,5 --variant qlutattn_k188v4_pt
 done
 # -> longbench_out/llama32-1b-instruct_qlutattn-k188v4-pt[-blk{N}]/{pred,logs}
 # 纯 nf2+block:先用 --sign-frac 0 标定一个全-nf2 掩码,再以同样命令跑。
 ```
+
+
+## KV-cache 可视化 skill (`kv-cache-viz`)
+
+仓库里所有 KV-cache **探测/离线可视化** 脚本已整理成 Claude Code skill：
+
+- 路径：`.claude/skills/kv-cache-viz/`
+- 统一入口：`bash .claude/skills/kv-cache-viz/scripts/run_kv_cache_viz.sh <cmd>`
+- 也可直接用 slash 命令：`/kv-cache-viz <cmd>`
+
+### 何时触发
+
+在 Kitty 仓库内，用户出现以下意图时**应该调用** `kv-cache-viz`：
+
+- "画一下 KV cache 分布" / "看一下 K/V 的 channel distribution"
+- "probe 一下 sign scale" / "跑一下 mu2sigma2"
+- "画 Pareto" / "画 heatmap" / "画 e2e latency/memory 柱状图"
+- "分析 KV cache 的能量 / DC share / sigma2"
+- "dump layer 8 的 K/V" 用于离线可视化
+
+**注意**：如果用户只是要"跑 LongBench 精度对比"，应使用 `lutdecoding-acc-bench` skill，
+而不是 `kv-cache-viz`。
+
+### 子命令
+
+#### `probe` — 需要 GPU + LongBench 数据
+
+| 命令 | 原脚本 | 作用 | 输出 |
+| --- | --- | --- | --- |
+| `probe channel-energy` | `dump_channel_energy_csv.py` | 每层 K channel 能量统计 CSV | `.csv` |
+| `probe mu2sigma2` | `dump_kv_mu2_sigma2_dist.py` | K/V 每通道 μ²/σ² 分布 | `.pt`, `.json`, `.png` |
+| `probe nf2-pertoken-maxlevel` | `dump_nf2_pertoken_maxlevel.py` | per-token nf2 max level 分布 | `.pt`, `.png` |
+| `probe sigma2-block-concentration` | `dump_sigma2_block_concentration.py` | σ² 在 128-token block 内/跨 block 集中度 | `.json`, `.png` |
+| `probe signpt-dequant` | `dump_signpt_dequant_dist.py` | sign-pt 反量化前后 channel 分布对比 | `.png` |
+| `probe sign-scale` | `dump_sign_scale_dist.py` | sign-group scale 分布 + 16-token 共享实验 | `.pt`, `.json`, `.png` |
+
+#### `dump-layer` — 为离线画图准备 layer K/V
+
+```bash
+bash .claude/skills/kv-cache-viz/scripts/run_kv_cache_viz.sh dump-layer \
+  --layer 8 --model /home/zijie/models/Llama-3.2-1B-Instruct \
+  --longbench-dir /home/zijie/data/LongBench/data \
+  --tag llama32-1b --outdir probe_out
+```
+
+生成 `probe_out/quant_kvcache_analysis/layer8_{K,V}_fp16.pt`，离线 viz 默认会读它。
+
+#### `viz` — 离线画图（纯 CPU / 可选 GPU）
+
+| 命令 | 原脚本 | 作用 |
+| --- | --- | --- |
+| `viz channel-dist` | `plot_kv_channel_dist.py` | layer/head 8 个 channel 的 K/V 分布 |
+| `viz channel-dist-multi` | `plot_kcache_channel_dist_multi.py` | 每 channel 单独一张 PNG |
+| `viz dcshare-heatmap` | `plot_kcache_dcshare_heatmap.py` | DC-energy share 2D heatmap |
+| `viz decomp` | `plot_k_decomp_steps.py` | K = μ + residual + sign-pt 重建的 3D 图 |
+| `viz kv-3d-submean` | `plot_kv_3d_submean.py` | K = μ + residual 3D 图 |
+| `viz kv-seg-mu2sigma2-3d` | `plot_kv_seg_mu2sigma2_3d.py` | 分段 μ²/σ² 3D 图 |
+| `viz codebook-mu2sigma2` | `plot_codebook_mu2_sigma2.py` | sign/nf2 codebook 在 μ²/σ² 通道上的示意 |
+| `viz kcache-reorder-2d` | `plot_kcache_reorder_2d.py` | σ² 重排后的 2D 空间图 |
+| `viz reorder-mixed-codebook` | `plot_reorder_mixed_codebook.py` | 重排 + 混合码本示意 |
+| `viz why-sign-beats-minmax` | `plot_why_sign_beats_minmax.py` | sign 打败 minmax 的理论+实证图 |
+| `viz kcache-pareto` | `plot_kcache_pareto.py` | 方法散点 Pareto 图 |
+| `viz kcache-pareto-combined` | `plot_kcache_pareto_combined.py` | 含 per-token sweep 的合并 Pareto 图 |
+| `viz kitty-kv-heatmap` | `plot_kitty_kv_heatmap.py` | Kitty K×V bit sweep heatmap |
+| `viz kivistar-heatmap` | `plot_kivistar_heatmap.py` | KIVI* K×V bit sweep heatmap |
+| `viz kv-channel-dist-layers` | `plot_kv_channel_dist_layers.py` | 跨层 K/V 分布汇总 |
+| `viz pertoken-smooth` | `plot_pertoken_smooth.py` | per-token + SmoothAttention 对比 |
+| `viz e2e-perf` | `plot_e2e_perf_bars.py` | end-to-end 性能柱状图 |
+| `viz kv-memory-bars` | `plot_kv_memory_bars.py` | KV memory 柱状图 |
+| `viz attn-op-latency` | `plot_attn_op_latency_bars.py` | attention op latency 柱状图 |
+| `viz qlutattn-energy-quest1024` | `plot_qlutattn_energy_quest1024.py` | Quest 预算 1024 下的能量对比 |
+
+### 公共参数
+
+probe / dump-layer：
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `--model` | 必填 | 模型路径 |
+| `--longbench-dir` | 必填 | LongBench `data/` 目录 |
+| `--seq-len` | 32768 | prefill 长度 |
+| `--sink` | 32 | sink token 数 |
+| `--recent` | 128 | recent token 数 |
+| `--chunk` | 4096 | chunked prefill 步长 |
+| `--device` | `cuda:0` | 设备 |
+| `--tag` | `model` | 输出文件名标签 |
+| `--outdir` | `probe_out/sign_scale` | 输出目录 |
+
+viz：
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `--layer` | 8 | 目标层 |
+| `--head` | 0 | 目标 head |
+| `--pt` | 自动 | K/V dump 路径；默认 `outdir/quant_kvcache_analysis/layer{L}_{K,V}_fp16.pt` |
+| `--outdir` | `probe_out` | 输出目录前缀 |
+| `--tag` | `llama32-1b` | 输出文件名标签 |
+| `--device` | `cuda:0` | 需要 GPU 的 viz 命令使用 |
+
+### 典型流程示例
+
+```bash
+cd /home/zijie/Code/Kitty
+
+# 1) 探测（GPU1-only 规则：CUDA_VISIBLE_DEVICES=1）
+CUDA_VISIBLE_DEVICES=1 bash .claude/skills/kv-cache-viz/scripts/run_kv_cache_viz.sh probe mu2sigma2 \
+  --model /home/zijie/models/Llama-3.2-1B-Instruct \
+  --longbench-dir /home/zijie/data/LongBench/data \
+  --seq-len 32768 --tag llama32-1b --outdir probe_out/sign_scale
+
+# 2) dump layer 8 的 K/V 用于离线画图
+CUDA_VISIBLE_DEVICES=1 bash .claude/skills/kv-cache-viz/scripts/run_kv_cache_viz.sh dump-layer \
+  --layer 8 --model /home/zijie/models/Llama-3.2-1B-Instruct \
+  --longbench-dir /home/zijie/data/LongBench/data \
+  --seq-len 32768 --tag llama32-1b --outdir probe_out
+
+# 3) 离线画图（纯 CPU）
+bash .claude/skills/kv-cache-viz/scripts/run_kv_cache_viz.sh viz channel-dist \
+  --layer 8 --head 0 --tag llama32-1b --outdir probe_out
+```
+
+### 注意事项
+
+- 所有 `probe` 和 `dump-layer` 命令都会加载模型到 GPU，必须遵守 **GPU1-only evaluation rule**，
+  默认 `CUDA_VISIBLE_DEVICES=1`，除非用户显式放宽硬件约束。
+- `viz` 命令默认读 `probe_out/quant_kvcache_analysis/layer{L}_{K,V}_fp16.pt`；
+  如果路径不同，用 `--pt` 指定。
+- 输出目录若不存在会自动创建。
+- 本 skill 只用于分析和可视化，不替代 LongBench 精度 benchmark。
+
 
 ## qlutattn-rotated-k*v4-pt (Hadamard-rotated per-token K)
 
