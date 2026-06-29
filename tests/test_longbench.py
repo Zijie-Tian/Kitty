@@ -16,7 +16,7 @@ from kitty_sim.cli.eval_longbench import build_parser
 from kitty_sim.longbench.scorer import score_directory
 from kitty_sim.longbench.templates import build_chat, format_longbench_prompt
 from kitty_sim.longbench.runner import (
-    _maybe_enable_sim_quest,
+    _maybe_enable_quest_kernel,
     build_variant,
     default_prediction_dir,
     method_layout_slug,
@@ -77,13 +77,13 @@ class LongBenchTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 build_parser().parse_args(["Qwen/Qwen3-8B", "--variant", v])
 
-    def test_sim_quest_env_overlays_qlutattn_without_variant_fork(self):
+    def test_quest_kernel_env_overlays_qlutattn_without_variant_fork(self):
         base = build_variant(SimpleNamespace(variant="qlutattn_k125v4_pt"))
-        with patch.dict(os.environ, {"SIM_QUEST": "1", "QUEST_TOKEN_BUDGET": "1024"}, clear=False):
-            variant = _maybe_enable_sim_quest(base, SimpleNamespace())
-        self.assertTrue(variant.sim_quest)
+        with patch.dict(os.environ, {"QUEST_KERNEL": "1", "QUEST_TOKEN_BUDGET": "1024"}, clear=False):
+            variant = _maybe_enable_quest_kernel(base, SimpleNamespace())
+        self.assertTrue(variant.quest_kernel)
         self.assertEqual(variant.quest_token_budget, 1024)
-        self.assertEqual(method_layout_slug(variant), "qlutattn-k125v4-pt-quest-sim")
+        self.assertEqual(method_layout_slug(variant), "qlutattn-k125v4-pt-quest-kernel")
 
     def test_flat_prediction_dir_does_not_append_variant_subdir(self):
         variant = build_variant(SimpleNamespace(variant="kitty"))

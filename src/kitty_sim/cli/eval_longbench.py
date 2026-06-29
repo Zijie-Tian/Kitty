@@ -71,21 +71,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="ShadowKV landmark chunk size (tokens per chunk). Defaults to 8.",
     )
     parser.add_argument(
-        "--sim-quest",
+        "--quest-kernel",
         action="store_true",
-        help="Overlay pure-torch QUEST page selection on the selected Kitty/QLUTATTN sim variant.",
+        help="Overlay Triton QUEST sparse decode on the selected Kitty/QLUTATTN fake-quant variant.",
     )
     parser.add_argument(
         "--quest-token-budget",
         type=int,
         default=None,
-        help="QUEST sparse token budget for --sim-quest. Defaults to 2048.",
+        help="QUEST sparse token budget for --quest-kernel. Defaults to 2048.",
     )
     parser.add_argument(
         "--quest-skip-layers",
         type=int,
         default=0,
-        help="Disable QUEST sparse selection for the first N layers when --sim-quest is used.",
+        help="Disable QUEST sparse selection for the first N layers when --quest-kernel is used.",
     )
     parser.add_argument("--dataset", default=None, help="Run one LongBench dataset only")
     parser.add_argument("--e", action="store_true", help="Evaluate LongBench-E")
