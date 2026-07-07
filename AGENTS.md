@@ -183,6 +183,14 @@ find eval_results_gsm8k_gpu1 -name '*summary.json' -print | sort
 not launch LongBench through any other script. It sources `.env` automatically
 and owns a deterministic, smoke/full-separated output layout.
 
+### LongBench result-scope rule
+
+When summarizing, comparing, or reporting completed LongBench results, only
+consider result drops that currently exist under the repo-root `longbench_out/`
+directory. Treat `archieve/longbench_out/` as archived history: do not include
+those archived runs in scoreboards, tables, recommendations, or "current result"
+answers unless the user explicitly asks to inspect archived results.
+
 ### Command reference: targets, flags, and environment
 
 `scripts/run_exp.sh [TARGET] [flags]` is the only supported way to launch
