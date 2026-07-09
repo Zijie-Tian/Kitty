@@ -60,8 +60,12 @@ class VariantConfig:
     promote_ratio_per_layer: tuple[tuple[int, float], ...] | None = None
     promote_ratio_config_path: str | None = None
     # QLUT (sigma^2-binned) K codebook = qlutattn-k1v4. k_codebook='qlut'
-    # uses bin_codebooks (a per-sigma^2-bin codebook list); 'kivi' = default path.
+    # uses bin_codebooks (a per-sigma^2-bin codebook list); 'kivi' = default path;
+    # 'q4_0' = llama.cpp Q4_0 (per-token 32-channel symmetric blocks).
     k_codebook: str = "kivi"
+    # V-cache codebook: 'kivi' (min-max per-token at vbits) or 'q4_0' (llama.cpp
+    # Q4_0 32-channel symmetric blocks, 4.5 bit/value).
+    v_codebook: str = "kivi"
     bin_codebooks: tuple[str, ...] | None = None
     n_bins: int = 6
     # per_token dense-and-sparse outlier isolation (the autoresearch per-token
@@ -417,6 +421,27 @@ def build_variant(args: Any) -> VariantConfig:
             bin_codebooks=(cb,), n_bins=1, vbits=4, promote_ratio=0.0,
             channel_selection=0, k_quant_mode="per_token",
             pertoken_outlier_k=ok, pertoken_outlier_bits=obits)
+    if variant in ("llamacpp_q40", "llamacpp-q40"):
+        # llama.cpp Q4_0 KV cache, faithful port (sim fake-quant): K and V both
+        # per-token with 32-channel symmetric absmax blocks (d = signed_max/-8,
+        # fp16 scale -> 4.5 bit/value), quantize-on-write. Unlike every other
+        # variant here there is NO sink and NO fp16 recent window (buffer=0).
+        # kbits/vbits=4 are bookkeeping only (the q4_0 codebook fixes the width);
+        # group_size=32 documents the block size (unused by the q4_0 kernel).
+        return VariantConfig(
+            name="llamacpp_q40", use_kitty=True,
+            k_quant_mode="per_token", k_codebook="q4_0", v_codebook="q4_0",
+            kbits=4, vbits=4, promote_ratio=0.0, channel_selection=0,
+            sink_length=0, buffer_length=0, group_size=32)
+    if variant in ("llamacpp_q40_star", "llamacpp-q40-star"):
+        # Q4_0 codebook under the Kitty protection policy (sink=32 + recent-128
+        # fp16 window): isolates how much of the q4_0 gap comes from the codebook
+        # itself vs from having no sink/recent protection.
+        return VariantConfig(
+            name="llamacpp_q40_star", use_kitty=True,
+            k_quant_mode="per_token", k_codebook="q4_0", v_codebook="q4_0",
+            kbits=4, vbits=4, promote_ratio=0.0, channel_selection=0,
+            sink_length=32, buffer_length=128, group_size=32)
     if variant in ("kivi", "kivi_star"):
         # KIVI-style uniform quant (NO promote, NO channel-select): K per-channel
         # + V per-token. kbits/vbits are free via --kbits/--vbits (default 2/2 =
@@ -465,6 +490,7 @@ def _cache_factory(config: VariantConfig):
         channel_selection=config.channel_selection,
         k_quant_mode=config.k_quant_mode,
         k_codebook=config.k_codebook,
+        v_codebook=config.v_codebook,
         bin_codebooks=(list(config.bin_codebooks) if config.bin_codebooks else None),
         n_bins=config.n_bins,
         pertoken_outlier_k=config.pertoken_outlier_k,

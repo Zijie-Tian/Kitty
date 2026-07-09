@@ -57,6 +57,17 @@ def cache_config_from_variant(variant) -> KittyKVCacheConfig:
         ),
         channel_selection=variant.channel_selection,
         k_quant_mode=getattr(variant, "k_quant_mode", "per_channel"),
+        # Mirror the codebook fields _cache_factory passes; without them a GLM
+        # run of a q4_0/qlut variant would silently fall back to the min-max
+        # 'kivi' path while being labelled as the requested method.
+        k_codebook=getattr(variant, "k_codebook", "kivi"),
+        v_codebook=getattr(variant, "v_codebook", "kivi"),
+        bin_codebooks=(
+            list(variant.bin_codebooks)
+            if getattr(variant, "bin_codebooks", None)
+            else None
+        ),
+        n_bins=getattr(variant, "n_bins", 6),
     )
 
 

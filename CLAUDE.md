@@ -251,6 +251,8 @@ datasets across GPUs, use a single target, e.g. `run_exp.sh llama32 --gpus 0,1,2
 | `fp16` | `fp16` | Full-precision baseline — no Kitty cache, HF dense fp16 KV. |
 | `kivi` | `kivi-k{kbits}v{vbits}` | KIVI-style uniform quant (no promote, no channel-select, no sink). K/V bit-width is set via `KBITS`/`VBITS` (default 2/2 = the old `kivi_2`); the slug encodes the bits so each combo gets its own dir (e.g. `kivi-k2v4`). |
 | `kivi_star` | `kivi-star-k{kbits}v{vbits}` | Same as `kivi` but `sink_length=32` (the old `kivi_star_2`). |
+| `llamacpp_q40` | `llamacpp-q40` | llama.cpp/ggml **Q4_0** KV cache, faithful port (sim fake-quant): K and V per-token, 32-channel symmetric absmax blocks (`d = signed_max/-8`, fp16 scale → **4.5 bit/value** each), quantize-on-write — **no sink, no fp16 recent window** (`buffer=0`; unique among variants here). head_dim must be a multiple of 32. Known deviations vs llama.cpp (documented, not simulated): PostQuant lets the current step read pre-quant values (one-token difference), and Q stays fp16 (llama.cpp quantizes Q to Q8_0 for the integer dot), so scores are slightly optimistic. |
+| `llamacpp_q40_star` | `llamacpp-q40-star` | Q4_0 codebook under the Kitty protection policy (`sink=32` + recent-128 fp16 window) — ablates codebook vs no-sink/no-recent effects. |
 | `shadowkv` | `shadowkv` | ShadowKV pure-torch sim (accuracy proxy; no memory/speed savings). |
 | `custom` | `custom-kitty` | Custom Kitty config. |
 
@@ -287,6 +289,82 @@ for kb in 1 2 4; do for vb in 2 4; do
   # -> longbench_out/llama32-1b-instruct_kivi-k${kb}v${vb}/{pred,logs}
 done; done
 # kivi_star (sink=32): same loop with --variant kivi_star -> ..._kivi-star-k{kb}v{vb}
+```
+
+### llama.cpp Q4_0 KV cache (variants `llamacpp_q40` / `llamacpp_q40_star`)
+
+Faithful sim port of the llama.cpp/ggml `-ctk q4_0 -ctv q4_0` KV cache. Q4_0
+quantizes **both K and V per-token along head_dim in 32-channel blocks**
+(`QK4_0=32`): symmetric absmax scale `d = signed_max/-8` (stored fp16), codes
+`min(15, int(x/d + 8.5))`, dequant `(q-8)*d` → **K = V = 4.5 bit/value**.
+
+- **`llamacpp_q40`** — the faithful port: quantize-on-write, **no sink, no fp16
+  recent window** (`sink=0`, `buffer_length=0`; the only variant allowed to run
+  `buffer=0`, and only in per_token mode). Prefill quantizes the whole prompt;
+  decode quantizes each newest token immediately.
+- **`llamacpp_q40_star`** — same codebook under the Kitty protection policy
+  (`sink=32` + recent-128 fp16 window): ablates codebook vs protection effects.
+
+Usage constraints:
+
+- **No calibration step, no env knobs.** `KBITS`/`VBITS`/`QLUT_*` are ignored;
+  the bit-width is fixed by the codebook (kbits/vbits=4 in the config are
+  bookkeeping only). Do NOT set `PERTOKEN_BLOCK` with these variants: the shell
+  `method_slug()` would append `-blk{N}` to the output dir while the Python
+  config ignores it (mislabeled dir).
+- head_dim must be a multiple of 32 (Llama-3.2 1B/3B 64, Llama-3.1-8B 128 OK).
+- Known deviations vs llama.cpp (accepted, not simulated): PostQuant lets the
+  current step read pre-quant values (one-token difference), and Q stays fp16
+  (llama.cpp quantizes Q to Q8_0 for the integer dot) → slightly optimistic.
+- Implementation map: quant core `fake_quant_q4_0_lastdim` in
+  `src/kitty_sim/utils_quant.py` (bit-exact vs the C reference incl. the fp16
+  rounding of the stored d); cache branches `KittyKVCache._quant_k_pertoken`
+  (`k_codebook="q4_0"`) + `_quant_v` (`v_codebook="q4_0"`) and the `buffer=0`
+  schedule in `update()`; variants in `runner.py::build_variant()`. GLM gets
+  `k_codebook`/`v_codebook` via `glm_kitty_patch.cache_config_from_variant`
+  (GLM untested for q4_0).
+
+Verified 2026-07-08 (GPU1, Llama-3.2-1B): 12/12 unit tests pass (bit-exact
+C-oracle; prefill + N decode steps == one-shot quantization, bit-identical);
+smoke completed for `llamacpp_q40`, `llamacpp_q40_star`, and `fp16`.
+
+```bash
+# 0-GPU unit tests (C oracle + schedule invariants)
+cd /mnt/data/tzj/Code/Kitty
+PYTHONPATH=src python -m unittest tests.test_q4_0_fakequant -v
+```
+
+```bash
+# smoke (2 samples/dataset, long-context datasets so the K path is exercised)
+cd /mnt/data/tzj/Code/Kitty
+LLAMA32_MODEL_PATH=/mnt/data/tzj/models/Llama-3.2-1B-Instruct \
+MAX_MODEL_LEN=32768 LLAMA32_MAX_GEN=256 DATASETS_CSV=multifieldqa_en,hotpotqa \
+bash scripts/run_exp.sh llama32 --gpu 1 --variant llamacpp_q40 --max-samples 2
+# -> longbench_out/smoke/llama32-1b-instruct_llamacpp-q40/{pred,logs}
+# ablation: --variant llamacpp_q40_star -> .../llama32-1b-instruct_llamacpp-q40-star
+```
+
+```bash
+# full (all 21 datasets, 32k context)
+cd /mnt/data/tzj/Code/Kitty
+LLAMA32_MODEL_PATH=/mnt/data/tzj/models/Llama-3.2-1B-Instruct \
+MAX_MODEL_LEN=32768 LLAMA32_MAX_GEN=256 \
+bash scripts/run_exp.sh llama32 --gpu 1 --variant llamacpp_q40
+# -> longbench_out/llama32-1b-instruct_llamacpp-q40/{pred,logs}
+# (multi-GPU fan-out, explicit override of the GPU1-only rule: --gpus 0,0,0,1,1,1)
+
+# ablation full run (Q4_0 codebook + Kitty policy: sink=32, recent-128 fp16)
+LLAMA32_MODEL_PATH=/mnt/data/tzj/models/Llama-3.2-1B-Instruct \
+MAX_MODEL_LEN=32768 LLAMA32_MAX_GEN=256 \
+bash scripts/run_exp.sh llama32 --gpu 1 --variant llamacpp_q40_star
+# -> longbench_out/llama32-1b-instruct_llamacpp-q40-star/{pred,logs}
+
+# 4-bit reference points: fp16 (ceiling) and per-channel-K KIVI-4 (4.25b):
+KBITS=4 VBITS=4 \
+LLAMA32_MODEL_PATH=/mnt/data/tzj/models/Llama-3.2-1B-Instruct \
+MAX_MODEL_LEN=32768 LLAMA32_MAX_GEN=256 \
+bash scripts/run_exp.sh llama32 --gpu 1 --variant kivi
+# -> longbench_out/llama32-1b-instruct_kivi-k4v4/{pred,logs}
 ```
 
 ### QLUT-Attn k1v4 (σ²-binned K) test (variants `qlutattn-k1v4` / `qlutattn_k184v4`)

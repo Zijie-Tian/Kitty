@@ -15,7 +15,7 @@ except ImportError:  # transformers>=4.57 removed CacheConfig from cache_utils
         def __init__(self, cache_implementation: str | None = None) -> None:
             self.cache_implementation = cache_implementation
 
-from .utils_quant import build_promote_mask, fake_quant_groupwise_lastdim
+from .utils_quant import build_promote_mask, fake_quant_groupwise_lastdim, fake_quant_q4_0_lastdim
 
 
 @dataclass
@@ -41,7 +41,8 @@ class KittyKVCacheConfig(CacheConfig):
         k_quant_mode: str = "per_channel",        # "per_channel": KIVI-style token-axis groups (+promote/qlut codebook); "per_token": K quantized like V along head_dim (uniform, no promote)
         VCache_BitDecoding: bool = False,         # The behavior of Value Cache, set to True means BitDecoding, otherwise KIVI Style Value Cache
         PostQuant: bool = True,                   # Post Quantization is always enabled
-        k_codebook: str = "kivi",                 # "kivi" = existing min-max groupwise K quant; "qlut" = per-channel sigma^2-binned codebooks (qlutattn-k1v4)
+        k_codebook: str = "kivi",                 # "kivi" = existing min-max groupwise K quant; "qlut" = per-channel sigma^2-binned codebooks (qlutattn-k1v4); "q4_0" = llama.cpp Q4_0 (per-token, 32-ch blocks, symmetric d=max/-8; requires k_quant_mode="per_token")
+        v_codebook: str = "kivi",                 # "kivi" = existing min-max per-token V quant at vbits; "q4_0" = llama.cpp Q4_0 (32-ch blocks, symmetric, 4.5 bit/value)
         bin_codebooks: Optional[list] = None,     # qlut only: list[str] mapping sigma^2-bin -> codebook (meanonly/sign/tern/uni2/nf2/uni3)
         n_bins: int = 6,                          # qlut only: number of per-layer sigma^2 quantile bins
         pertoken_outlier_k: int = 0,              # per_token only: keep top-k peak-|magnitude| channels (per head, fixed) out of the shared per-token scale (dense-and-sparse). 0 = off.
@@ -72,6 +73,7 @@ class KittyKVCacheConfig(CacheConfig):
         self.VCache_BitDecoding = VCache_BitDecoding
         self.PostQuant = PostQuant
         self.k_codebook = k_codebook
+        self.v_codebook = v_codebook
         self.bin_codebooks = list(bin_codebooks) if bin_codebooks is not None else None
         self.n_bins = n_bins
         self.pertoken_outlier_k = pertoken_outlier_k
@@ -90,16 +92,24 @@ class KittyKVCacheConfig(CacheConfig):
             "Some of the keys in `cache_config` are defined incorrectly. `{key}` should be {correct_value}` "
             "but found {found_value}"
         )
-        if self.k_codebook not in ("kivi", "qlut"):
+        if self.k_codebook not in ("kivi", "qlut", "q4_0"):
             raise ValueError(
-                incorrect_arg_msg.format(key="k_codebook", correct_value="'kivi' or 'qlut'",
+                incorrect_arg_msg.format(key="k_codebook", correct_value="'kivi', 'qlut' or 'q4_0'",
                                          found_value=self.k_codebook))
         if self.k_codebook == "qlut" and not self.bin_codebooks:
             raise ValueError("k_codebook='qlut' requires a non-empty bin_codebooks list")
+        if self.v_codebook not in ("kivi", "q4_0"):
+            raise ValueError(
+                incorrect_arg_msg.format(key="v_codebook", correct_value="'kivi' or 'q4_0'",
+                                         found_value=self.v_codebook))
         if self.k_quant_mode not in ("per_channel", "per_token"):
             raise ValueError(
                 incorrect_arg_msg.format(key="k_quant_mode", correct_value="'per_channel' or 'per_token'",
                                          found_value=self.k_quant_mode))
+        if self.k_codebook == "q4_0" and self.k_quant_mode != "per_token":
+            raise ValueError(
+                "k_codebook='q4_0' quantizes along head_dim (llama.cpp row semantics) and "
+                "requires k_quant_mode='per_token'")
         if self.k_quant_mode == "per_token" and (self.promote_ratio != 0.0 or self.promote_ratio_per_layer is not None):
             raise ValueError(
                 "k_quant_mode='per_token' requires promote_ratio=0.0 and no per-layer override "
@@ -210,7 +220,21 @@ class KittyKVCacheConfig(CacheConfig):
                     found_value=self.VCache_BitDecoding,
                 ),
             )
-        if self.group_size > self.buffer_length or self.buffer_length % self.group_size != 0:
+        if self.buffer_length == 0:
+            # buffer_length=0 = llama.cpp-style "quantize on write": no fp16 recent
+            # window at all. Only the per-token K path supports it (the per-channel
+            # decode schedule needs `% buffer_length`), so reject per_channel here
+            # and skip the group/buffer coupling check (group_size is a head_dim
+            # block size in this regime, not a token-axis group).
+            if self.k_quant_mode != "per_token":
+                raise ValueError(
+                    incorrect_arg_msg.format(
+                        key="buffer_length",
+                        correct_value="> 0 for k_quant_mode='per_channel' (0 is only supported per_token)",
+                        found_value=self.buffer_length,
+                    ),
+                )
+        elif self.group_size > self.buffer_length or self.buffer_length % self.group_size != 0:
             raise ValueError(
                 incorrect_arg_msg.format(
                     key="group_size",
@@ -252,6 +276,7 @@ class KittyKVCache(DynamicCache):
         # then reused for every buffer flush + decode. None for the default 'kivi' path.
         self.k_quant_mode = cache_config.k_quant_mode
         self.k_codebook = cache_config.k_codebook
+        self.v_codebook = getattr(cache_config, "v_codebook", "kivi")
         self.bin_codebooks = cache_config.bin_codebooks
         self.n_bins = cache_config.n_bins
         self.k_bin_ids: dict[int, torch.Tensor] = {}
@@ -460,6 +485,10 @@ class KittyKVCache(DynamicCache):
         pulled out and quantized per-channel at pertoken_outlier_bits, while the
         remaining channels get the per-token codebook with a scale computed over
         ONLY them. k=8 @4bit + Lloyd (+ smoothed ckpt) is the winner."""
+        if self.k_codebook == "q4_0":
+            # llama.cpp Q4_0 row semantics: symmetric absmax (d=max/-8) per
+            # 32-channel block along head_dim. No submean, no promote, no bins.
+            return fake_quant_q4_0_lastdim(ks)
         if self.k_codebook != "qlut":
             return fake_quant_groupwise_lastdim(ks, self.group_size, self.kbits)
         from .qlut_quant import apply_codebook
@@ -611,6 +640,14 @@ class KittyKVCache(DynamicCache):
         return fake_quant_groupwise_lastdim(
             key_slice_t, self.group_size, self.kbits, promote_mask, self.promote_bit)
 
+    def _quant_v(self, value_slice):
+        """Quantize a [B,nh,T,D] V slice along head_dim. 'q4_0' = llama.cpp Q4_0
+        (32-channel symmetric absmax blocks, 4.5 bit/value); default 'kivi' =
+        the existing min-max groupwise quant at vbits."""
+        if self.v_codebook == "q4_0":
+            return fake_quant_q4_0_lastdim(value_slice)
+        return fake_quant_groupwise_lastdim(value_slice, self.group_size, self.vbits)
+
     def get_seq_length(self, layer_idx: int = 0) -> int:
         """Return cached sequence length for transformers cache/mask helpers."""
         if layer_idx >= len(self.key_cache):
@@ -692,7 +729,9 @@ class KittyKVCache(DynamicCache):
             if current_cache_length > self.sink_length + self.buffer_length:
                 start_idx = self.sink_length
                 num_tokens = current_cache_length - self.sink_length
-                num_token_to_buffer = num_tokens % self.buffer_length
+                # buffer_length=0 = llama.cpp-style quantize-on-write (no recent
+                # fp16 window): everything past the sink is quantized right away.
+                num_token_to_buffer = num_tokens % self.buffer_length if self.buffer_length > 0 else 0
                 num_token_to_quantize = num_tokens - num_token_to_buffer
                 end_idx = start_idx + num_token_to_quantize
                 # Quantize Key Cache.
@@ -724,7 +763,7 @@ class KittyKVCache(DynamicCache):
                     num_token_to_quantize = num_tokens - self.buffer_length   # KIVI Style Value Cache
                     end_idx = start_idx + num_token_to_quantize
                 value_slice = current_value_cache[:, :, start_idx:end_idx, :]
-                value_slice = fake_quant_groupwise_lastdim(value_slice, self.group_size, self.vbits)
+                value_slice = self._quant_v(value_slice)
                 current_value_cache[:, :, start_idx:end_idx, :] = value_slice
         ################################################## Decoding Phase ##################################################
         else:
@@ -741,15 +780,21 @@ class KittyKVCache(DynamicCache):
 
             # quantize
             num_tokens_kv_to_quantize = current_cache_length - self.sink_length - self.buffer_length
+            # The single token to quantize this step: the one sliding out of the
+            # recent fp16 window. With buffer_length=0 (llama.cpp-style quantize-
+            # on-write) the window is empty and the NEWEST token is quantized --
+            # the [-1:0] slice would otherwise be empty and silently skip it.
+            quant_slice = (slice(-1, None) if self.buffer_length == 0
+                           else slice(-self.buffer_length - 1, -self.buffer_length))
             if self.k_quant_mode == "per_token":
                 blk = self.pertoken_block
                 if blk <= 1:
                     # Per-token K follows the KIVI-style V schedule: quantize the
                     # single token sliding out of the recent fp16 window each step.
                     if num_tokens_kv_to_quantize > 0:
-                        ks = current_key_cache[:, :, -self.buffer_length-1:-self.buffer_length, :]
+                        ks = current_key_cache[:, :, quant_slice, :]
                         ks = self._quant_k_pertoken(ks, layer_idx)
-                        current_key_cache[:, :, -self.buffer_length-1:-self.buffer_length, :] = ks
+                        current_key_cache[:, :, quant_slice, :] = ks
                 else:
                     # Strict block-aligned per-token K: accumulate the tokens sliding out
                     # of the recent fp16 window and quantize a full `blk`-token block once
@@ -773,14 +818,14 @@ class KittyKVCache(DynamicCache):
                 # Quantize Value Cache (BitDecoding)
                 if self.VCache_BitDecoding:
                     value_slice = current_value_cache[:, :, -self.buffer_length-1:-1, :]
-                    value_slice = fake_quant_groupwise_lastdim(value_slice, self.group_size, self.vbits)
+                    value_slice = self._quant_v(value_slice)
                     current_value_cache[:, :, -self.buffer_length-1:-1, :] = value_slice
             # Quantize Value Cache (KIVI Style Value Cache, quantizing a Token each Decoding Step)
             if not self.VCache_BitDecoding:
                 if num_tokens_kv_to_quantize > 0:
-                    value_slice = current_value_cache[:, :, -self.buffer_length-1:-self.buffer_length, :]
-                    value_slice = fake_quant_groupwise_lastdim(value_slice, self.group_size, self.vbits)
-                    current_value_cache[:, :, -self.buffer_length-1:-self.buffer_length, :] = value_slice
+                    value_slice = current_value_cache[:, :, quant_slice, :]
+                    value_slice = self._quant_v(value_slice)
+                    current_value_cache[:, :, quant_slice, :] = value_slice
         ####################################################################################################################
         if self.PostQuant:
             return keys_to_return, values_to_return
@@ -808,6 +853,7 @@ def get_kvcache_kitty(args: argparse.Namespace) -> KittyKVCache:
         VCache_BitDecoding  = False,  # Using KIVI Style V Cache
         PostQuant           = True,  # Post Quantization is always enabled for Kitty KV Cache
         k_codebook          = getattr(args, "k_codebook", "kivi"),
+        v_codebook          = getattr(args, "v_codebook", "kivi"),
         bin_codebooks       = getattr(args, "bin_codebooks", None),
         n_bins              = getattr(args, "n_bins", 6),
         pertoken_outlier_k  = getattr(args, "pertoken_outlier_k", 0),

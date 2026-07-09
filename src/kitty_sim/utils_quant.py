@@ -6,6 +6,7 @@ from typing import Optional
 __all__ = [
     "build_promote_mask",
     "fake_quant_groupwise_lastdim",
+    "fake_quant_q4_0_lastdim",
 ]
 
 
@@ -73,6 +74,40 @@ def build_promote_mask(
         raise ValueError(f"Invalid channel_selection strategy: {channel_selection}")
     #
     return promote_mask
+
+
+def fake_quant_q4_0_lastdim(data: torch.Tensor) -> torch.Tensor:
+    """
+    Simulate llama.cpp/ggml Q4_0 quantization along the last dim (fake quant).
+
+    Faithful to quantize_row_q4_0_ref + dequantize_row_q4_0 (ggml-quants.c):
+      * 32-element blocks along the last dim (QK4_0), per-token when the last
+        dim is head_dim -- symmetric, NO zero-point.
+      * scale d = signed_absmax / -8 (the max-|x| element lands exactly on the
+        -8 code); 1/d is computed from the fp32 d, while dequantization uses
+        the fp16-STORED d (round-tripped through half precision).
+      * codes q = min(15, int(x/d + 8.5)) -> dequant (q - 8) * d.
+    Effective 4.5 bit/value (16B nibbles + 2B fp16 scale per 32 values).
+    Args:
+        data: (..., D) float tensor with D % 32 == 0.
+    Returns:
+        Tensor of the same shape/dtype with fake-quantized values.
+    """
+    QK = 32
+    shape, dtype = data.shape, data.dtype
+    assert shape[-1] % QK == 0, f"Q4_0 needs last dim % {QK} == 0, got {shape[-1]}"
+    x = data.float().reshape(*shape[:-1], shape[-1] // QK, QK)
+    # Signed value of the max-|x| element per block. C uses strict '>' so ties
+    # keep the FIRST occurrence; torch argmax also returns the first max index.
+    idx = x.abs().argmax(dim=-1, keepdim=True)
+    mx = torch.gather(x, -1, idx)
+    d32 = mx / -8.0
+    inv = torch.where(d32 == 0, torch.zeros_like(d32), 1.0 / d32)  # id from fp32 d
+    # (int8_t)(x*id + 8.5) with MIN(15, .). The operand is always >= 0.5 by
+    # construction (|x/d| <= 8), so C's trunc-toward-zero equals floor here.
+    q = (x * inv + 8.5).floor().clamp_(0.0, 15.0)
+    d16 = d32.half().float()  # d is stored as fp16 -> dequant uses the rounded d
+    return ((q - 8.0) * d16).reshape(shape).to(dtype)
 
 
 def fake_quant_groupwise_lastdim(
