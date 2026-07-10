@@ -3,10 +3,10 @@ name: lutdecoding-acc-bench
 description: >-
   对单个模型运行一套标准化的 KV-cache 量化精度对比实验(Kitty 仓库, LongBench 全量
   21 数据集, 32k): fp16 FULL / ShadowKV / Kitty / KIVI*-2 / KIVI-2 / QLUTATTN
-  / QLUTATTN-fast (per-token sign/nf2 离线 σ²-mix snf-pt ≈1.875bit; fast=纯 sign ≈1.25bit)。跑完这一组即为一次
+  / QLUTATTN-fast / Q4_0 (llama.cpp Q4_0, K=V=4.5 bit)。跑完这一组即为一次
   完整精度实验。当用户要"对某模型做精度实验 / 精度评测 / 精度对比""跑 LongBench
   量化对比""测一个新模型的 KV 压缩精度""benchmark 这几种 KV-cache 方法""复现这套
-  对比"时,务必使用本 skill——它封装了 QLUTATTN 的离线标定流程、7 个方法的精确命令、
+  对比"时,务必使用本 skill——它封装了 QLUTATTN 的离线标定流程、8 个方法的精确命令、
   统一 driver 与结果汇总。即使用户只说"测一下 XX 模型"但上下文是 Kitty 的 KV-cache
   量化研究,也应触发本 skill,而不要自行拼命令。
 ---
@@ -14,13 +14,13 @@ description: >-
 # LUT-Decoding 精度基准 (lutdecoding-acc-bench)
 
 对**一个模型**,在 LongBench 上跑一套固定的 KV-cache 量化精度对比。一次完整实验 =
-下面 7 个方法各跑一遍全量 21 数据集,再汇总成一张「方法 × bit × 平均分 × 留存率」表。
+下面 8 个方法各跑一遍全量 21 数据集,再汇总成一张「方法 × bit × 平均分 × 留存率」表。
 
 除 `fp16`/`kivi*` 外都走 Kitty 的**纯 torch sim fake-quant 路径**:这是**精度代理**
 (accuracy proxy),不省真实 KV 显存/不证明加速。这套实验比较的就是各方法在同一精度
 代理下的 LongBench 得分。
 
-## 这套实验测什么(7 个方法,固定顺序)
+## 这套实验测什么(8 个方法,固定顺序)
 
 | # | 方法 | run_exp.sh variant | 关键参数 | 输出 method-slug | K bit/value |
 | --- | --- | --- | --- | --- | ---: |
@@ -31,8 +31,9 @@ description: >-
 | 5 | **KIVI-2** | `kivi` | `KBITS=2 VBITS=2` | `kivi-k2v2` | 2.25 |
 | 6 | **QLUTATTN** | `qlutattn_k188v4_pt` | **需先离线标定** + `QLUT_CB_MASK=<mask>` | `qlutattn-k188v4-pt` | ~1.875 |
 | 7 | **QLUTATTN-fast** | `qlutattn_k125v4_pt` | 无需标定(纯 sign) | `qlutattn-k125v4-pt` | ~1.25 |
+| 8 | **Q4_0** | `llamacpp_q40` | 无需标定;需 `head_dim % 32 == 0` | `llamacpp-q40` | **4.5**(K=V) |
 
-> QUEST + Kitty 曾是第 7 个方法,但已在 commit `8adb49b`(2026-06-17 重构)从仓库
+> QUEST + Kitty 曾是本基准方法之一,但已在 commit `8adb49b`(2026-06-17 重构)从仓库
 > 删除,当前**不在本基准内**。若日后恢复 `quest_kitty_page16_*` variant,在 driver
 > 的方法表里加一行即可。
 
@@ -48,20 +49,31 @@ per-token **纯 1-bit sign**(无 nf2、无 σ²-mix),~**1.25bit**,V per-token 4-
 衡量最低 K bit 下纯 sign 能达到多少精度。driver 里方法名 `qlutattn_fast`(`... full qlutattn_fast`
 单跑),输出 slug `qlutattn-k125v4-pt`。
 
+**Q4_0 = llama.cpp/ggml Q4_0 KV cache**(sim fake-quant 忠实移植)。K 与 V 都沿
+`head_dim` 按 **32-channel** 对称 absmax 块量化(`d = signed_max/-8`,fp16 scale →
+**4.5 bit/value**),quantize-on-write,**无 sink、无 fp16 recent 窗口**(`sink=0`,
+`buffer=0`;本仓库唯一允许 `buffer=0` 的变体)。无需标定/无 env 旋钮。约束:
+`head_dim` 必须是 32 的倍数(Llama-3.2 1B/3B、MiniCPM5-1B、Qwen3-4B 均满足)。
+已知与真 llama.cpp 的偏差(故意不模拟,分数略乐观):PostQuant 让当前步读到量化前值;
+Q 仍为 fp16(llama.cpp 会把 Q 量化成 Q8_0)。driver 方法名 `q4_0`,输出 slug
+`llamacpp-q40`。对照变体 `llamacpp_q40_star`(同码本 + Kitty 保护 sink=32/recent-128)
+**不在本基准内**——需要时手动 `--variant llamacpp_q40_star`。
+
 ## 前置条件
 
 - **在 Kitty 仓库根目录运行**,且 `conda activate kitty`(driver 默认 `REPO=$PWD`)。
-- `scripts/run_exp.sh` 是 LongBench 唯一入口;本 skill 的 driver 只是编排它 6 次。
+- `scripts/run_exp.sh` 是 LongBench 唯一入口;本 skill 的 driver 只是编排它 8 次。
 - **GPU 规则(重要)**:本 skill 会启动 GPU 作业。按项目规则,**开跑前必须先与用户
   确认 GPU 卡号与规模**,driver 不会替你问。
 - **模型/数据路径**:用本机实际路径(或 `.env` 的 `KITTY_*_PATH`)。本机示例:
   - 模型 `/home/zijie/models/Llama-3.2-1B-Instruct`
   - 标定数据 `/home/zijie/data/wikitext/wikitext-2-raw-v1/train-00000-of-00001.parquet`
 - **全量必须** `MAX_MODEL_LEN=32768`,生成长度用 per-target 值(llama32=256, qwen=2048…)。
+- **Q4_0**:确认 `head_dim % 32 == 0`;4B@32k 建议 **1 worker/卡**(2/卡易 OOM)。
 
-## 快速开始:一条命令跑全 6 方法(driver)
+## 快速开始:一条命令跑全 8 方法(driver)
 
-driver `scripts/run_lutdecoding_bench.sh` 会:先做 QLUTATTN 离线标定 → 依次跑 6 个
+driver `scripts/run_lutdecoding_bench.sh` 会:先做 QLUTATTN 离线标定 → 依次跑 8 个
 方法 → 自动汇总。它把通用 `MODEL_PATH/MODEL_SLUG/MAX_GEN` 映射到 `run_exp.sh` 对应
 target 的 per-target env,所以你只设一份。
 
@@ -74,7 +86,7 @@ MODEL_SLUG=llama32-1b-instruct \
 MAX_GEN=256 GPUS=0,1,2 \
 CALIB_DATA=/home/zijie/data/wikitext/wikitext-2-raw-v1/train-00000-of-00001.parquet \
 bash .claude/skills/lutdecoding-acc-bench/scripts/run_lutdecoding_bench.sh smoke
-# -> longbench_out/smoke/llama32-1b-instruct_{fp16,shadowkv,kitty-...,kivi-star-k2v2,kivi-k2v2,qlutattn-k188v4-pt}/
+# -> longbench_out/smoke/llama32-1b-instruct_{fp16,shadowkv,kitty-...,kivi-star-k2v2,kivi-k2v2,qlutattn-k188v4-pt,qlutattn-k125v4-pt,llamacpp-q40}/
 ```
 
 ```bash
@@ -89,8 +101,8 @@ bash .claude/skills/lutdecoding-acc-bench/scripts/run_lutdecoding_bench.sh full
 # -> longbench_out/llama32-1b-instruct_<method-slug>/{pred,logs};末尾打印 + 写汇总 tsv
 ```
 
-只重跑某几个方法:把方法名接在 mode 后(名字 = 上表第 1 列小写,KIVI* 用 `kivi_star`),
-例如只补 QLUTATTN:`... run_lutdecoding_bench.sh full qlutattn`。
+只重跑某几个方法:把方法名接在 mode 后(名字 = 上表第 1 列小写,KIVI* 用 `kivi_star`,
+Q4_0 用 `q4_0`),例如只补 Q4_0:`... run_lutdecoding_bench.sh full q4_0`。
 
 **自动跳过已完成的方法(测前先查,缺了才补)**:full 模式下 driver 在跑每个方法**之前**
 先用 `scripts/check_method_complete.py` 检查该方法的 21 个数据集是否都已完整——判据是每个
@@ -177,6 +189,8 @@ env $COMMON QLUT_CB_MASK=/home/zijie/models/Llama-3.2-1B-Instruct.lutbench_snf_f
   bash scripts/run_exp.sh llama32 --gpus $G --variant qlutattn_k188v4_pt
 # 7) QLUTATTN-fast (纯 sign,无需标定,decode 最快)
 env $COMMON bash scripts/run_exp.sh llama32 --gpus $G --variant qlutattn_k125v4_pt
+# 8) Q4_0 (llama.cpp Q4_0; K=V=4.5 bit; 无 sink/recent; 无需标定)
+env $COMMON bash scripts/run_exp.sh llama32 --gpus $G --variant llamacpp_q40
 ```
 
 ## 汇总结果
@@ -199,6 +213,7 @@ KIVI*-2         2.25    ...     ...    21  kivi-star-k2v2
 KIVI-2          2.25    ...     ...    21  kivi-k2v2
 QLUTATTN       1.875    ...     ...    21  qlutattn-k188v4-pt
 QLUTATTN-fast   1.25    ...     ...    21  qlutattn-k125v4-pt
+Q4_0             4.5    ...     ...    21  llamacpp-q40
 ```
 `MISSING` 行 = 该方法还没跑完(无 result.json)。smoke 用 `--layout smoke`。
 
@@ -208,14 +223,17 @@ QLUTATTN-fast   1.25    ...     ...    21  qlutattn-k125v4-pt
   目录)+ 对应 `MAX_GEN`;**重新跑 QLUTATTN 标定**。非 llama 模型改 `TARGET`
   (`llama`/`qwen`/`glm`/`deepseek`),driver 自动用对应 per-target env 前缀。
   ShadowKV/QLUTATTN 标定仅在 Llama/Qwen 家族验证过;新架构先 smoke。
+  Q4_0 额外要求 `head_dim % 32 == 0`。
 - **换 GPU/规模**:改 `GPUS`(把一张卡列 N 次 = N 个 worker)。显存参考:1B@32k ~5GB
-  → 3 worker/24GB 卡;3B ~12GB → 2/卡;8B ~22GB → 1/卡。**改 GPU 前与用户确认。**
+  → 3 worker/24GB 卡;3B ~12GB → 2/卡;4B/8B ~22GB → **1/卡**(Qwen3-4B 上 Q4_0
+  用 2/卡曾在长样本上 OOM)。**改 GPU 前与用户确认。**
 
 ## 注意事项
 
 - 全部是精度代理(fp16/kivi* 用 dense fp16 KV;其余 sim fake-quant),不要当成显存/速度证明。
 - snf-pt 与 KIVI*-2 一样带 `sink_length=32`,另外还保最近 `buffer_length=128` token 为
-  fp16(KIVI-V 风格近窗);KIVI-2 无 sink。
+  fp16(KIVI-V 风格近窗);KIVI-2 无 sink;Q4_0 **无 sink 也无 recent**(quantize-on-write)。
 - 标定掩码缓存在模型旁(`*.lutbench_snf_f50.pt`,被 `.gitignore` 的 `*.pt` 忽略),换
   `--sign-frac` 记得改输出名以免串用。
 - full 可断点续跑(已完成的数据集保留);smoke 每次重跑会清掉上次 smoke 目录。
+- Q4_0 已在 Llama-3.2-1B/3B、MiniCPM5-1B、Qwen3-4B 上验证(全量留存约 96–99% fp16)。

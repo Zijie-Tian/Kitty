@@ -19,6 +19,7 @@ import json
 import os
 
 # fixed display order; (display, method_slug, default bit label)
+# Q4_0 bit is K=V=4.5 (llama.cpp Q4_0: 32-ch blocks, 4-bit codes + fp16 scale).
 METHODS = [
     ("F16 FULL", "fp16",                 "16"),
     ("ShadowKV", "shadowkv",             "sparse"),
@@ -27,6 +28,7 @@ METHODS = [
     ("KIVI-2",   "kivi-k2v2",            "2.25"),
     ("QLUTATTN", "qlutattn-k188v4-pt",   "1.875"),
     ("QLUTATTN-fast", "qlutattn-k125v4-pt", "1.25"),
+    ("Q4_0",     "llamacpp-q40",         "4.5"),
 ]
 
 

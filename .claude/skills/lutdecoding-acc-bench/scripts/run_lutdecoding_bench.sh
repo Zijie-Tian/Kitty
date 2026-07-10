@@ -3,18 +3,21 @@
 # ONE model on LongBench, via the repo's sole LongBench entry point
 # scripts/run_exp.sh. One run = these methods, in this fixed order:
 #
-#   1. fp16        F16 FULL          dense fp16 KV (the quality ceiling)
-#   2. shadowkv    ShadowKV          pure-torch sparse-KV accuracy proxy
-#   3. kitty       Kitty             paper-style k2/b4/v2/pr0.125
-#   4. kivi_star   KIVI*-2           KIVI uniform K2V2 + sink=32
-#   5. kivi        KIVI-2            KIVI uniform K2V2 (no sink)
-#   6. qlutattn    QLUTATTN          snf-pt: per-token sign/nf2 offline sigma^2-mix,
-#                                    sign-frac=0.5 -> ~1.875 bit K, V per-token 4-bit
-#   7. qlutattn_fast QLUTATTN-fast   per-token PURE sign (qlutattn_k125v4_pt): ~1.25 bit
-#                                    K, V per-token 4-bit. NO calibration, fastest decode.
+#   1. fp16          F16 FULL          dense fp16 KV (the quality ceiling)
+#   2. shadowkv      ShadowKV          pure-torch sparse-KV accuracy proxy
+#   3. kitty         Kitty             paper-style k2/b4/v2/pr0.125
+#   4. kivi_star     KIVI*-2           KIVI uniform K2V2 + sink=32
+#   5. kivi          KIVI-2            KIVI uniform K2V2 (no sink)
+#   6. qlutattn      QLUTATTN          snf-pt: per-token sign/nf2 offline sigma^2-mix,
+#                                      sign-frac=0.5 -> ~1.875 bit K, V per-token 4-bit
+#   7. qlutattn_fast QLUTATTN-fast     per-token PURE sign (qlutattn_k125v4_pt): ~1.25 bit
+#                                      K, V per-token 4-bit. NO calibration, fastest decode.
+#   8. q4_0          Q4_0              llama.cpp/ggml Q4_0 KV (K=V=4.5 bit/value,
+#                                      per-token 32-ch blocks, quantize-on-write,
+#                                      sink=0 buffer=0). NO calibration. head_dim % 32 == 0.
 #
 # (QUEST was dropped from this codebase in commit 8adb49b and is intentionally
-#  NOT part of this benchmark. If it is restored, add it as a 7th method here.)
+#  NOT part of this benchmark. If it is restored, add it back into ALL_METHODS.)
 #
 # All but fp16/kivi run on the pure-torch sim fake-quant path: an ACCURACY PROXY,
 # no real KV-memory/speed savings. QLUTATTN REQUIRES a one-time offline calibration
@@ -30,7 +33,7 @@
 #
 # Positional:
 #   $1   mode: smoke (2 samples/dataset, subset, smoke/ layout) | full (all 21, full layout). default full
-#   $2.. optional method subset (names from column 1 above); empty = all 6
+#   $2.. optional method subset (names from column 1 above); empty = all 8
 #
 # Env:
 #   TARGET         run_exp.sh target -> decides model family + per-target env prefix:
@@ -133,6 +136,7 @@ ALL_METHODS=(
   "kivi|kivi|kivi-k2v2|KBITS=2 VBITS=2"
   "qlutattn|qlutattn_k188v4_pt|qlutattn-k188v4-pt|QLUT_CB_MASK=$MASK"
   "qlutattn_fast|qlutattn_k125v4_pt|qlutattn-k125v4-pt|"
+  "q4_0|llamacpp_q40|llamacpp-q40|"
 )
 
 [ "$MODE" = full ] && BASE_DIR="$REPO/longbench_out" || BASE_DIR="$REPO/longbench_out/smoke"
