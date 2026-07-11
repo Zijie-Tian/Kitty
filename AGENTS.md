@@ -223,6 +223,7 @@ part of `all`.
 | `--max-samples N` | `N>0` = smoke (N samples/dataset, output under `smoke/`); `N<=0` = full (all rows). A bare trailing integer is also taken as `--max-samples` (e.g. `run_exp.sh llama32 2`). |
 | `--max-model-len N` | Context cap (default `32768`). Full runs must keep `32768` unless a smoke/proxy is explicitly requested. |
 | `--variant NAME` | Override the target's default variant. |
+| `--v-tile-channels C` | Required channel block for rescued `*_vtile16` V2 variants. `C>0` and must divide `head_dim`; there is deliberately no silent default. |
 
 `--gpu` vs `--gpus` is purely shell-level task parallelism — the Python eval
 code is identical; `--gpus` just dispatches one dataset per free GPU. This is
@@ -247,6 +248,10 @@ datasets across GPUs, use a single target, e.g. `run_exp.sh llama32 --gpus 0,1,2
 | `qlutattn_k185v4_pt` | `qlutattn-k185v4-pt` | Per-token **tern** + per-channel mean removal. ~1.84 bit K, V 4-bit. Per-token form of `qlutattn-k184v4`. |
 | `qlutattn_k168v4_pt` | `qlutattn-k168v4-pt` | Per-token K with an **OFFLINE per-channel sign/tern codebook**. Each post-RoPE K channel is fixed offline to sign (1.25b, low σ²) or tern (1.85b, high σ²) by `scripts/calibrate_k168v4_pt.py` on wikitext (default ~28% sign → nominal **1.68b**); the mask is given via `QLUT_CB_MASK` and used unchanged — **no online σ² binning, no nf2**. Per-channel mean still self-calibrated at prefill (free for attention). V per-token 4-bit. Corrected impl: the old online-σ²+nf2 path was ~3b, scored 1B-full **14.39** and collapsed summarization (gov_report 0.64); offline sign/tern restores it (smoke gov_report→14.5). |
 | `qlutattn_k188v4_pt` ⭐ | `qlutattn-k188v4-pt` | **默认推荐优化算法.** k168v4-pt 的姊妹方法,rich 码本由 tern 换成 **nf2(per-token Lloyd)**:离线 per-channel **sign/nf2** 掩码(`scripts/calibrate_k168v4_pt.py --codebooks sign,nf2 --sign-frac <f>`),sign 占比 `f` = 实际 K bit 旋钮(`f·1.25+(1−f)·2.5`)。per-channel 均值 prefill 自标定;V 4-bit;**无旋转、纯 per-token**。1B 上 Pareto 实用最优:**f=0.5(1.875b)=25.03 > per-channel k1v4 24.88**,降到 f=0(纯 nf2,2.5b)=25.65。详见下方「默认推荐优化算法」段。 |
+| `qlutattn_k125v2_pt` | `qlutattn-k125v2-pt` | Sign K identical to `qlutattn_k125v4_pt`, but V is named whole-head per-token asymmetric 2-bit. This is the matched sign baseline for rescued V tiles. |
+| `qlutattn_k125v2_pt_vtile16` | `qlutattn-k125v2-pt-vtile16c{C}-rv1` | Same sign K; rescued V2 uses fixed token tile 16 and explicit channel tile `C`: fixed RHT + prompt per-channel mean/RMS + affine MSE1/fallback + inverse RHT + bias correction. |
+| `qlutattn_k188v2_pt` | `qlutattn-k188v2-pt` | SNF K identical to `qlutattn_k188v4_pt`, with whole-head per-token asymmetric V2. Requires the model-specific offline `sign,nf2` mask through `QLUT_CB_MASK`. |
+| `qlutattn_k188v2_pt_vtile16` | `qlutattn-k188v2-pt-vtile16c{C}-rv1` | Same SNF K/mask; rescued tile16cC V2. This is the matched SNF tile arm. |
 | `qlutattn_rotated_k125v4_pt` | `qlutattn-rotated-k125v4-pt` | **Rotated** per-token sign (k125 + Hadamard): per-channel mean, FWHT-rotate residual → isotropic, per-token sign, de-rotate (FWHT self-inverse). ~1.25 bit K, V 4-bit. Rotation hidden inside K quant (free for attention). 1B full **22.14** (vs sign 21.39). See the rotated-k*v4-pt section for the no-offline-fold / cost rationale. |
 | `qlutattn_rotated_k185v4_pt` | `qlutattn-rotated-k185v4-pt` | **Rotated** per-token tern (k185 + Hadamard). ~1.84 bit K. 1B full **24.21** (vs tern 22.54) — approaches per-channel k1v4 24.88 using only sign/tern. |
 | `fp16` | `fp16` | Full-precision baseline — no Kitty cache, HF dense fp16 KV. |
@@ -259,6 +264,245 @@ datasets across GPUs, use a single target, e.g. `run_exp.sh llama32 --gpus 0,1,2
 
 All LongBench variants here run on the pure-torch sim fake-quant path (accuracy
 proxy, no real KV-memory savings); `fp16`/`kivi`/`kivi_star` keep dense fp16 KV.
+
+### Sign / SNF rescued V2 `tile16c64` test method
+
+This is the canonical GPU1-only Llama-3.2-1B comparison. Keep the K arm fixed
+within each pair and change only V:
+
+| K arm | Per-token V2 baseline | Rescued V2 tile arm |
+| --- | --- | --- |
+| sign | `qlutattn_k125v2_pt` | `qlutattn_k125v2_pt_vtile16 --v-tile-channels 64` |
+| SNF (`f=0.5`) | `qlutattn_k188v2_pt` | `qlutattn_k188v2_pt_vtile16 --v-tile-channels 64` |
+
+Both arms keep `sink=32`, recent FP16 window `128`, `MAX_MODEL_LEN=32768`, and
+`LLAMA32_MAX_GEN=256`. The tile arm quantizes only complete 16-token settled
+blocks, so at most 15 pending tokens remain FP16. `C=64` is one whole-head tile
+on Llama-3.2-1B (`head_dim=64`); on a model with `head_dim=128`, it means two
+channel tiles per 16-token block. These are dense-FP16 pure-torch fake-quant
+accuracy proxies: the bit accounting is theoretical and no packed kernel or
+real KV-memory saving is implemented yet.
+
+The corresponding implementation diagrams are tracked at:
+
+- `docs/figures/vcache_2bit_quantization_strategies.png` — grouping strategies;
+- `docs/figures/vcache_tile16c64_rescue_explainer-v2.png` — the rescued tile16c64 pipeline;
+- `docs/figures/vcache_rht_formula_explainer.png` — RHT formulas and
+  accumulate-then-inverse equivalence.
+
+Configure the ignored repo-root `.env` from `.env.example` before running:
+
+```bash
+KITTY_LLAMA32_1B_PATH=/path/to/Llama-3.2-1B-Instruct
+LONGBENCH_DATA_ROOT=/path/to/LongBench
+KITTY_WIKITEXT2_TRAIN_PATH=/path/to/wikitext-2-raw-v1/train-00000-of-00001.parquet
+KITTY_LLAMA32_1B_SNF_MASK=/path/to/Llama-3.2-1B-Instruct.snf-f50.pt
+GPU_IDS_CSV=1
+GPU_ID=1
+```
+
+Do not reuse a `sign,tern` k168 mask for SNF. The current runtime trusts the
+mask blob's `codebooks` metadata, so an incorrectly supplied mask can silently
+change the K method while retaining an SNF output slug. Generate and validate a
+model-specific `sign,nf2`, `f=0.5` mask first. Calibration uses logical
+`cuda:0` after `CUDA_VISIBLE_DEVICES=1`, which is physical GPU1:
+
+```bash
+cd "$(git rev-parse --show-toplevel)"
+source accuracy_simulation/env.sh
+: "${KITTY_LLAMA32_1B_PATH:?set KITTY_LLAMA32_1B_PATH in .env}"
+: "${KITTY_WIKITEXT2_TRAIN_PATH:?set KITTY_WIKITEXT2_TRAIN_PATH in .env}"
+: "${KITTY_LLAMA32_1B_SNF_MASK:?set KITTY_LLAMA32_1B_SNF_MASK in .env}"
+
+CUDA_VISIBLE_DEVICES=1 PYTHONPATH=src "${PYTHON_BIN:-python}" \
+  scripts/calibrate_k168v4_pt.py \
+  --model "${KITTY_LLAMA32_1B_PATH}" \
+  --calib-data "${KITTY_WIKITEXT2_TRAIN_PATH}" \
+  --codebooks sign,nf2 --sign-frac 0.5 --target-bits 1.875 \
+  --device cuda:0 \
+  --output "${KITTY_LLAMA32_1B_SNF_MASK}"
+
+QLUT_CB_MASK="${KITTY_LLAMA32_1B_SNF_MASK}" \
+  "${PYTHON_BIN:-python}" - <<'PY'
+import os
+import torch
+
+payload = torch.load(os.environ["QLUT_CB_MASK"], map_location="cpu", weights_only=True)
+mask = payload["codebook_mask"]
+assert payload["codebooks"] == ["sign", "nf2"], payload["codebooks"]
+assert tuple(mask.shape) == (16, 8, 64), tuple(mask.shape)
+assert mask.dtype == torch.uint8 and set(mask.unique().tolist()) == {0, 1}
+assert abs(float(payload["low_frac"]) - 0.5) < 1e-9, payload["low_frac"]
+print("SNF mask OK:", os.environ["QLUT_CB_MASK"], tuple(mask.shape))
+PY
+```
+
+Run the 0-GPU core/schedule/wiring and accumulate-then-inverse tests before any
+LongBench launch. Expected result for the current suite is 72 tests passing:
+
+```bash
+cd "$(git rev-parse --show-toplevel)"
+source accuracy_simulation/env.sh
+CUDA_VISIBLE_DEVICES= PYTHONPATH=src "${PYTHON_BIN:-python}" -m unittest \
+  tests.test_vcache_2bit_core \
+  tests.test_vcache_2bit_schedule \
+  tests.test_vcache_2bit_wiring \
+  tests.test_vcache_rht_accumulate_then_restore -v
+```
+
+#### Sign: smoke and full
+
+Smoke runs both matched sign arms on two long-context datasets. `V_TILE_CHANNELS=`
+is an explicit unset sentinel for the non-tile baseline; do not omit it, because
+a stale value in `.env` must not leak into PT2. `--gpus 1` is a single GPU1 slot
+and overrides any stale multi-GPU scheduler environment.
+
+```bash
+# sign smoke: PT2 baseline, then rescued tile16c64
+cd "$(git rev-parse --show-toplevel)"
+source accuracy_simulation/env.sh
+: "${KITTY_LLAMA32_1B_PATH:?set KITTY_LLAMA32_1B_PATH in .env}"
+: "${LONGBENCH_DATA_ROOT:?set LONGBENCH_DATA_ROOT in .env}"
+
+CUDA_VISIBLE_DEVICES=1 GPU_IDS_CSV=1 V_TILE_CHANNELS= VBITS=2 PERTOKEN_BLOCK=1 \
+QLUT_BIN_CODEBOOKS=sign QLUT_CB_MASK= PROMOTE_RATIO_CONFIG= \
+PROMPT_TOKEN_RESERVE=0 FORCE=0 \
+QUEST_KERNEL=0 QUEST_TRITON=0 SIM_QUEST=0 QUEST_SIM=0 \
+LLAMA32_MODEL_PATH="${KITTY_LLAMA32_1B_PATH}" \
+LLAMA32_MODEL_SLUG=llama32-1b-instruct-vtile-gpu1-rv1 \
+MAX_MODEL_LEN=32768 LLAMA32_MAX_GEN=256 RUN_MODE=smoke MAX_SAMPLES=2 \
+DATASETS_CSV=multifieldqa_en,hotpotqa \
+bash scripts/run_exp.sh llama32 --gpus 1 --variant qlutattn_k125v2_pt --max-samples 2
+
+CUDA_VISIBLE_DEVICES=1 GPU_IDS_CSV=1 V_TILE_CHANNELS= VBITS=2 PERTOKEN_BLOCK=1 \
+QLUT_BIN_CODEBOOKS=sign QLUT_CB_MASK= PROMOTE_RATIO_CONFIG= \
+PROMPT_TOKEN_RESERVE=0 FORCE=0 \
+QUEST_KERNEL=0 QUEST_TRITON=0 SIM_QUEST=0 QUEST_SIM=0 \
+LLAMA32_MODEL_PATH="${KITTY_LLAMA32_1B_PATH}" \
+LLAMA32_MODEL_SLUG=llama32-1b-instruct-vtile-gpu1-rv1 \
+MAX_MODEL_LEN=32768 LLAMA32_MAX_GEN=256 RUN_MODE=smoke MAX_SAMPLES=2 \
+DATASETS_CSV=multifieldqa_en,hotpotqa \
+bash scripts/run_exp.sh llama32 --gpus 1 --variant qlutattn_k125v2_pt_vtile16 \
+  --v-tile-channels 64 --max-samples 2
+
+# -> longbench_out/smoke/llama32-1b-instruct-vtile-gpu1-rv1_qlutattn-k125v2-pt/{pred,logs}
+# -> longbench_out/smoke/llama32-1b-instruct-vtile-gpu1-rv1_qlutattn-k125v2-pt-vtile16c64-rv1/{pred,logs}
+# report prefix in each arm: <arm>/logs/report_<dataset>.json
+```
+
+```bash
+# sign full: all 21 datasets, 32k, GPU1 only
+cd "$(git rev-parse --show-toplevel)"
+source accuracy_simulation/env.sh
+: "${KITTY_LLAMA32_1B_PATH:?set KITTY_LLAMA32_1B_PATH in .env}"
+: "${LONGBENCH_DATA_ROOT:?set LONGBENCH_DATA_ROOT in .env}"
+
+CUDA_VISIBLE_DEVICES=1 GPU_IDS_CSV=1 V_TILE_CHANNELS= VBITS=2 PERTOKEN_BLOCK=1 \
+QLUT_BIN_CODEBOOKS=sign QLUT_CB_MASK= PROMOTE_RATIO_CONFIG= \
+PROMPT_TOKEN_RESERVE=0 FORCE=0 \
+QUEST_KERNEL=0 QUEST_TRITON=0 SIM_QUEST=0 QUEST_SIM=0 \
+LLAMA32_MODEL_PATH="${KITTY_LLAMA32_1B_PATH}" \
+LLAMA32_MODEL_SLUG=llama32-1b-instruct-vtile-gpu1-rv1 \
+MAX_MODEL_LEN=32768 LLAMA32_MAX_GEN=256 RUN_MODE=full MAX_SAMPLES=-1 DATASETS_CSV= \
+bash scripts/run_exp.sh llama32 --gpus 1 --variant qlutattn_k125v2_pt
+
+CUDA_VISIBLE_DEVICES=1 GPU_IDS_CSV=1 V_TILE_CHANNELS= VBITS=2 PERTOKEN_BLOCK=1 \
+QLUT_BIN_CODEBOOKS=sign QLUT_CB_MASK= PROMOTE_RATIO_CONFIG= \
+PROMPT_TOKEN_RESERVE=0 FORCE=0 \
+QUEST_KERNEL=0 QUEST_TRITON=0 SIM_QUEST=0 QUEST_SIM=0 \
+LLAMA32_MODEL_PATH="${KITTY_LLAMA32_1B_PATH}" \
+LLAMA32_MODEL_SLUG=llama32-1b-instruct-vtile-gpu1-rv1 \
+MAX_MODEL_LEN=32768 LLAMA32_MAX_GEN=256 RUN_MODE=full MAX_SAMPLES=-1 DATASETS_CSV= \
+bash scripts/run_exp.sh llama32 --gpus 1 --variant qlutattn_k125v2_pt_vtile16 \
+  --v-tile-channels 64
+
+# -> longbench_out/llama32-1b-instruct-vtile-gpu1-rv1_qlutattn-k125v2-pt/{pred,logs}
+# -> longbench_out/llama32-1b-instruct-vtile-gpu1-rv1_qlutattn-k125v2-pt-vtile16c64-rv1/{pred,logs}
+# report prefix in each arm: <arm>/logs/report_<dataset>.json
+```
+
+#### SNF: smoke and full
+
+Use the same validated `f=0.5` mask for the PT2 and tile arms so only V changes.
+
+```bash
+# SNF smoke: PT2 baseline, then rescued tile16c64
+cd "$(git rev-parse --show-toplevel)"
+source accuracy_simulation/env.sh
+: "${KITTY_LLAMA32_1B_PATH:?set KITTY_LLAMA32_1B_PATH in .env}"
+: "${LONGBENCH_DATA_ROOT:?set LONGBENCH_DATA_ROOT in .env}"
+: "${KITTY_LLAMA32_1B_SNF_MASK:?set KITTY_LLAMA32_1B_SNF_MASK in .env}"
+
+CUDA_VISIBLE_DEVICES=1 GPU_IDS_CSV=1 V_TILE_CHANNELS= VBITS=2 PERTOKEN_BLOCK=1 \
+QLUT_BIN_CODEBOOKS= PROMOTE_RATIO_CONFIG= PROMPT_TOKEN_RESERVE=0 FORCE=0 \
+QLUT_CB_MASK="${KITTY_LLAMA32_1B_SNF_MASK}" \
+QUEST_KERNEL=0 QUEST_TRITON=0 SIM_QUEST=0 QUEST_SIM=0 \
+LLAMA32_MODEL_PATH="${KITTY_LLAMA32_1B_PATH}" \
+LLAMA32_MODEL_SLUG=llama32-1b-instruct-vtile-gpu1-rv1 \
+MAX_MODEL_LEN=32768 LLAMA32_MAX_GEN=256 RUN_MODE=smoke MAX_SAMPLES=2 \
+DATASETS_CSV=multifieldqa_en,hotpotqa \
+bash scripts/run_exp.sh llama32 --gpus 1 --variant qlutattn_k188v2_pt --max-samples 2
+
+CUDA_VISIBLE_DEVICES=1 GPU_IDS_CSV=1 V_TILE_CHANNELS= VBITS=2 PERTOKEN_BLOCK=1 \
+QLUT_BIN_CODEBOOKS= PROMOTE_RATIO_CONFIG= PROMPT_TOKEN_RESERVE=0 FORCE=0 \
+QLUT_CB_MASK="${KITTY_LLAMA32_1B_SNF_MASK}" \
+QUEST_KERNEL=0 QUEST_TRITON=0 SIM_QUEST=0 QUEST_SIM=0 \
+LLAMA32_MODEL_PATH="${KITTY_LLAMA32_1B_PATH}" \
+LLAMA32_MODEL_SLUG=llama32-1b-instruct-vtile-gpu1-rv1 \
+MAX_MODEL_LEN=32768 LLAMA32_MAX_GEN=256 RUN_MODE=smoke MAX_SAMPLES=2 \
+DATASETS_CSV=multifieldqa_en,hotpotqa \
+bash scripts/run_exp.sh llama32 --gpus 1 --variant qlutattn_k188v2_pt_vtile16 \
+  --v-tile-channels 64 --max-samples 2
+
+# -> longbench_out/smoke/llama32-1b-instruct-vtile-gpu1-rv1_qlutattn-k188v2-pt/{pred,logs}
+# -> longbench_out/smoke/llama32-1b-instruct-vtile-gpu1-rv1_qlutattn-k188v2-pt-vtile16c64-rv1/{pred,logs}
+# report prefix in each arm: <arm>/logs/report_<dataset>.json
+```
+
+```bash
+# SNF full: all 21 datasets, 32k, GPU1 only
+cd "$(git rev-parse --show-toplevel)"
+source accuracy_simulation/env.sh
+: "${KITTY_LLAMA32_1B_PATH:?set KITTY_LLAMA32_1B_PATH in .env}"
+: "${LONGBENCH_DATA_ROOT:?set LONGBENCH_DATA_ROOT in .env}"
+: "${KITTY_LLAMA32_1B_SNF_MASK:?set KITTY_LLAMA32_1B_SNF_MASK in .env}"
+
+CUDA_VISIBLE_DEVICES=1 GPU_IDS_CSV=1 V_TILE_CHANNELS= VBITS=2 PERTOKEN_BLOCK=1 \
+QLUT_BIN_CODEBOOKS= PROMOTE_RATIO_CONFIG= PROMPT_TOKEN_RESERVE=0 FORCE=0 \
+QLUT_CB_MASK="${KITTY_LLAMA32_1B_SNF_MASK}" \
+QUEST_KERNEL=0 QUEST_TRITON=0 SIM_QUEST=0 QUEST_SIM=0 \
+LLAMA32_MODEL_PATH="${KITTY_LLAMA32_1B_PATH}" \
+LLAMA32_MODEL_SLUG=llama32-1b-instruct-vtile-gpu1-rv1 \
+MAX_MODEL_LEN=32768 LLAMA32_MAX_GEN=256 RUN_MODE=full MAX_SAMPLES=-1 DATASETS_CSV= \
+bash scripts/run_exp.sh llama32 --gpus 1 --variant qlutattn_k188v2_pt
+
+CUDA_VISIBLE_DEVICES=1 GPU_IDS_CSV=1 V_TILE_CHANNELS= VBITS=2 PERTOKEN_BLOCK=1 \
+QLUT_BIN_CODEBOOKS= PROMOTE_RATIO_CONFIG= PROMPT_TOKEN_RESERVE=0 FORCE=0 \
+QLUT_CB_MASK="${KITTY_LLAMA32_1B_SNF_MASK}" \
+QUEST_KERNEL=0 QUEST_TRITON=0 SIM_QUEST=0 QUEST_SIM=0 \
+LLAMA32_MODEL_PATH="${KITTY_LLAMA32_1B_PATH}" \
+LLAMA32_MODEL_SLUG=llama32-1b-instruct-vtile-gpu1-rv1 \
+MAX_MODEL_LEN=32768 LLAMA32_MAX_GEN=256 RUN_MODE=full MAX_SAMPLES=-1 DATASETS_CSV= \
+bash scripts/run_exp.sh llama32 --gpus 1 --variant qlutattn_k188v2_pt_vtile16 \
+  --v-tile-channels 64
+
+# -> longbench_out/llama32-1b-instruct-vtile-gpu1-rv1_qlutattn-k188v2-pt/{pred,logs}
+# -> longbench_out/llama32-1b-instruct-vtile-gpu1-rv1_qlutattn-k188v2-pt-vtile16c64-rv1/{pred,logs}
+# report prefix in each arm: <arm>/logs/report_<dataset>.json
+```
+
+Acceptance checks after smoke/full:
+
+- every requested dataset has an `ok` manifest with
+  `written_samples == expected_samples` and the expected `run_config_hash`;
+- PT2 manifests report `last_v_quant_mode="per_token2"` and
+  `v_quantized_tokens>0`;
+- tile manifests report `last_v_quant_mode="tile16_rescued"`,
+  `last_v_tile_channels=64`, `v_tile_blocks>0`, and `v_quantized_tokens>0`;
+- all GPU1-only manifests report `cuda_visible_devices="1"`;
+- full runs have 21 dataset JSONL files plus `pred/result.json`; compare the
+  unweighted 21-dataset means from the two `result.json` files within each K
+  pair. Do not compare smoke means with full means.
 
 ### KIVI K/V bit-width sweep (variants `kivi` / `kivi_star`)
 
