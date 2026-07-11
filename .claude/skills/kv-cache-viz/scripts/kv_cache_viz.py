@@ -28,6 +28,7 @@ PROBE_ALIASES = {
     "sigma2-block-concentration": "sigma2_block_concentration",
     "signpt-dequant": "signpt_dequant_dist",
     "sign-scale": "sign_scale_dist",
+    "v-grouping-error": "v_grouping_error",
 }
 
 VIZ_ALIASES = {

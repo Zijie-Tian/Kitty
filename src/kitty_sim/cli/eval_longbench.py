@@ -4,56 +4,88 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 
 from kitty_sim.cli.utils_cli import update_parser
-from kitty_sim.longbench.runner import run_longbench
+from kitty_sim.longbench.runner import resolve_longbench_preflight, run_longbench
+
+_VARIANT_CHOICES = [
+    "fp16",
+    "kitty",
+    "shadowkv",
+    "qlutattn_pertoken",
+    "kivi",
+    "kivi_star",
+    "llamacpp_q40",
+    "llamacpp-q40",
+    "llamacpp_q40_star",
+    "llamacpp-q40-star",
+    "custom",
+    "qlutattn_k1v4",
+    "qlutattn-k1v4",
+    "qlutattn_k184v4",
+    "qlutattn-k184v4",
+    "qlutattn_k125v4",
+    "qlutattn-k125v4",
+    "qlutattn_k125v4_pt",
+    "qlutattn-k125v4-pt",
+    "qlutattn_k185v4_pt",
+    "qlutattn-k185v4-pt",
+    "qlutattn_k168v4_pt",
+    "qlutattn-k168v4-pt",
+    "qlutattn-k1.68v4-pt",
+    "qlutattn_k188v4_pt",
+    "qlutattn-k188v4-pt",
+    "qlutattn_k125v2_pt",
+    "qlutattn-k125v2-pt",
+    "qlutattn_k188v2_pt",
+    "qlutattn-k188v2-pt",
+    "qlutattn_k125v2_pt_vtile16",
+    "qlutattn-k125v2-pt-vtile16",
+    "qlutattn_k188v2_pt_vtile16",
+    "qlutattn-k188v2-pt-vtile16",
+    "qlutattn_rotated_k125v4_pt",
+    "qlutattn-rotated-k125v4-pt",
+    "qlutattn_rotated_k185v4_pt",
+    "qlutattn-rotated-k185v4-pt",
+    "qlutattn_rotated_st_pt",
+    "qlutattn-rotated-st-pt",
+    "qlutattn_rotated_snf_pt",
+    "qlutattn-rotated-snf-pt",
+]
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Evaluate Kitty/FP16 models on LongBench.")
-    parser.add_argument("model", help="Model alias, HF model id, or local path")
+    parser.add_argument("model", nargs="?", default=None, help="Model alias, HF model id, or local path")
     parser.add_argument("--model-path", default=None, help="Override model path for loading")
     parser.add_argument("--model-tag", default=None, help="Output model tag (variant suffix is added automatically)")
     parser.add_argument("--model-family", default=None, help="Prompt family override, e.g. qwen, llama3, llama2")
     parser.add_argument(
         "--variant",
         default="kitty",
-        choices=[
-            "fp16",
-            "kitty",
-            "shadowkv",
-            "qlutattn_pertoken",
-            "kivi",
-            "kivi_star",
-            "llamacpp_q40",
-            "llamacpp-q40",
-            "llamacpp_q40_star",
-            "llamacpp-q40-star",
-            "custom",
-            "qlutattn_k1v4",
-            "qlutattn-k1v4",
-            "qlutattn_k184v4",
-            "qlutattn-k184v4",
-            "qlutattn_k125v4",
-            "qlutattn-k125v4",
-            "qlutattn_k125v4_pt",
-            "qlutattn-k125v4-pt",
-            "qlutattn_k185v4_pt",
-            "qlutattn-k185v4-pt",
-            "qlutattn_k168v4_pt",
-            "qlutattn-k168v4-pt",
-            "qlutattn-k1.68v4-pt",
-            "qlutattn_k188v4_pt",
-            "qlutattn-k188v4-pt",
-            "qlutattn_rotated_k125v4_pt",
-            "qlutattn-rotated-k125v4-pt",
-            "qlutattn_rotated_k185v4_pt",
-            "qlutattn-rotated-k185v4-pt",
-            "qlutattn_rotated_st_pt",
-            "qlutattn-rotated-st-pt",
-            "qlutattn_rotated_snf_pt",
-            "qlutattn-rotated-snf-pt",
-        ],
+        choices=_VARIANT_CHOICES,
+    )
+    parser.add_argument(
+        "--v-tile-channels",
+        type=int,
+        default=None,
+        help="Channel block C for rescued V tile16cC variants (required for *_vtile16).",
+    )
+    parser.add_argument(
+        "--resolve-config-only",
+        action="store_true",
+        help="No-GPU preflight: resolve variant/slug/hash and exit (use with --json).",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit preflight / report as JSON.",
+    )
+    parser.add_argument(
+        "--expected-run-config-hash",
+        default=None,
+        help="Shell-preflight fingerprint; worker recomputes and must match before model loading.",
     )
     # ShadowKV sim controls (variant=shadowkv only).
     parser.add_argument(
@@ -92,6 +124,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Disable QUEST sparse selection for the first N layers when --quest-kernel is used.",
     )
     parser.add_argument("--dataset", default=None, help="Run one LongBench dataset only")
+    parser.add_argument(
+        "--datasets-csv",
+        default=None,
+        help=argparse.SUPPRESS,  # scheduler preflight: resolve several dataset hashes once
+    )
     parser.add_argument("--e", action="store_true", help="Evaluate LongBench-E")
     parser.add_argument("--data-root", default=None, help="LongBench root containing data/*.jsonl")
     parser.add_argument(
@@ -117,11 +154,32 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--require-gpu1", action="store_true", help="Require CUDA_VISIBLE_DEVICES=1")
     parser.add_argument("--report-json", default=None, help="Write run metadata JSON")
     parser = update_parser(parser)
+    # Preserve whether --vbits was explicitly supplied so the final resolver can
+    # implement CLI > VBITS env > default.  update_parser's global default is 2,
+    # which otherwise makes an explicit stale VBITS=4 impossible to detect.
+    parser.set_defaults(vbits=None)
     return parser
 
 
+def finalize_args(args: argparse.Namespace) -> argparse.Namespace:
+    if args.vbits is None:
+        raw = os.environ.get("VBITS", "").strip()
+        args.vbits = int(raw) if raw else 2
+    return args
+
+
 def main() -> None:
-    args = build_parser().parse_args()
+    args = finalize_args(build_parser().parse_args())
+    if args.resolve_config_only:
+        if not args.model:
+            args.model = "preflight-placeholder"
+        payload = resolve_longbench_preflight(args)
+        print(json.dumps(payload, ensure_ascii=False, indent=2 if not args.json else None))
+        return
+    if args.datasets_csv:
+        raise SystemExit("--datasets-csv is reserved for --resolve-config-only/preflight")
+    if not args.model:
+        raise SystemExit("model is required unless --resolve-config-only is set")
     report = run_longbench(args)
     print(json.dumps({"prediction_dir": report["prediction_dir"], "status": report["status"]}, ensure_ascii=False, indent=2))
 

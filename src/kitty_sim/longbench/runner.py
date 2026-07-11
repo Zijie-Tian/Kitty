@@ -15,7 +15,7 @@ from typing import Any, Optional
 
 import torch
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 from kitty_sim import get_kvcache_kitty
 from kitty_sim.glm_kitty_patch import (
@@ -25,7 +25,7 @@ from kitty_sim.glm_kitty_patch import (
 )
 
 from .config import LONG_BENCH_DATASETS, LONG_BENCH_E_DATASETS, load_json_config
-from .data import load_longbench_dataset
+from .data import default_data_root, load_longbench_dataset
 from .templates import format_longbench_prompt, infer_model_family, post_process
 
 
@@ -63,9 +63,15 @@ class VariantConfig:
     # uses bin_codebooks (a per-sigma^2-bin codebook list); 'kivi' = default path;
     # 'q4_0' = llama.cpp Q4_0 (per-token 32-channel symmetric blocks).
     k_codebook: str = "kivi"
-    # V-cache codebook: 'kivi' (min-max per-token at vbits) or 'q4_0' (llama.cpp
-    # Q4_0 32-channel symmetric blocks, 4.5 bit/value).
+    # V-cache codebook: 'kivi' (configured-group min-max), 'per_token2'
+    # (named whole-head V2), 'q4_0', or rescued 'tile16_rescued'.
     v_codebook: str = "kivi"
+    # Rescued V tile16cC provenance (None on non-tile variants).
+    v_tile_tokens: int | None = None
+    v_tile_channels: int | None = None
+    v_tile_algo_version: str | None = None
+    v_rht_seed: int | None = None
+    v_mse_iters: int | None = None
     bin_codebooks: tuple[str, ...] | None = None
     n_bins: int = 6
     # per_token dense-and-sparse outlier isolation (the autoresearch per-token
@@ -103,12 +109,18 @@ class VariantConfig:
             h = hashlib.sha256(repr(self.bin_codebooks).encode()).hexdigest()[:6]
             iso = (f"_iso{self.pertoken_outlier_k}b{self.pertoken_outlier_bits}"
                    if self.k_quant_mode == "per_token" and self.pertoken_outlier_k > 0 else "")
+            vtile = ""
+            if self.v_codebook == "tile16_rescued":
+                from kitty_sim.v_tile_quant import algo_slug_for_version
+
+                rv = algo_slug_for_version(self.v_tile_algo_version)
+                vtile = f"_vtile16c{self.v_tile_channels}_{rv}"
             blk = f"_blk{self.pertoken_block}" if self.pertoken_block > 1 else ""
             quest = (
                 f"_qb{self.quest_token_budget}_qsl{self.quest_skip_layers}_questkernel"
                 if self.quest_kernel else ""
             )
-            return f"{self.name}_nb{self.n_bins}_v{self.vbits}_cb{h}{iso}{blk}{quest}"
+            return f"{self.name}_nb{self.n_bins}_v{self.vbits}_cb{h}{iso}{vtile}{blk}{quest}"
         if self.shadowkv:
             return f"{self.name}_sb{self.sparse_budget}_r{self.rank}_c{self.chunk_size}"
         suffix = ""
@@ -207,10 +219,226 @@ def _load_promote_ratio_config(
     )
 
 
+def _resolve_v_tile_channels(args: Any) -> int | None:
+    """CLI > env V_TILE_CHANNELS. Empty string is an explicit unset sentinel."""
+    cli = getattr(args, "v_tile_channels", None)
+    if cli is not None:
+        return int(cli)
+    if "V_TILE_CHANNELS" in os.environ:
+        raw = os.environ["V_TILE_CHANNELS"]
+        if raw.strip() == "":
+            return None
+        return int(raw)
+    return None
+
+
+def _reject_conflicting_vbits(args: Any, variant_name: str) -> None:
+    """Named V2 variants hard-lock the final parsed vbits value to two.
+
+    ``scripts/run_exp.sh`` translates ``VBITS`` into ``--vbits``, so checking the
+    parsed argument here preserves the repository-wide CLI-over-environment rule.
+    """
+    vb = getattr(args, "vbits", None)
+    if vb is None:
+        raw = os.environ.get("VBITS", "").strip()
+        vb = int(raw) if raw else 2
+    if int(vb) != 2:
+        raise ValueError(
+            f"{variant_name} requires vbits=2; got --vbits/{vb}"
+        )
+
+
+def _reject_stale_or_missing_v_tile_channels(
+    args: Any, *, tile: bool, variant_name: str
+) -> int | None:
+    C = _resolve_v_tile_channels(args)
+    if tile:
+        if C is None or C <= 0:
+            raise ValueError(
+                f"{variant_name} requires V_TILE_CHANNELS / --v-tile-channels "
+                f"as a positive integer (no silent default); got {C!r}"
+            )
+        return C
+    if C is not None:
+        raise ValueError(
+            f"{variant_name} is not a V-tile variant; unset V_TILE_CHANNELS "
+            f"(got {C}). Empty string V_TILE_CHANNELS= is the unset sentinel."
+        )
+    return None
+
+
+def _lock_sign_bin_codebooks(variant_name: str) -> tuple[str, ...]:
+    cb = os.environ.get("QLUT_BIN_CODEBOOKS")
+    if cb is None or cb.strip() == "" or cb.strip() == "sign":
+        return ("sign",)
+    raise ValueError(
+        f"{variant_name} hard-locks bin_codebooks=('sign',); "
+        f"got QLUT_BIN_CODEBOOKS={cb!r}"
+    )
+
+
+def _reject_sign_pertoken_block(variant_name: str, pt_block: int) -> None:
+    if pt_block > 1:
+        raise ValueError(
+            f"{variant_name} does not support PERTOKEN_BLOCK>1 "
+            f"(got PERTOKEN_BLOCK={pt_block}); use PERTOKEN_BLOCK=1"
+        )
+
+
+NEW_V2_VARIANTS = frozenset({
+    "qlutattn_k125v2_pt",
+    "qlutattn_k188v2_pt",
+    "qlutattn_k125v2_pt_vtile16",
+    "qlutattn_k188v2_pt_vtile16",
+})
+
+NEW_V2_TILE_VARIANTS = frozenset({
+    "qlutattn_k125v2_pt_vtile16",
+    "qlutattn_k188v2_pt_vtile16",
+})
+
+_PERTOKEN_BLOCK_VARIANTS = frozenset({
+    "qlutattn_k168v4_pt",
+    "qlutattn_k188v4_pt",
+    "qlutattn_rotated_st_pt",
+    "qlutattn_rotated_snf_pt",
+    "qlutattn_k188v2_pt",
+    "qlutattn_k188v2_pt_vtile16",
+})
+
+
+def _variant_supports_pertoken_block(variant_name: str) -> bool:
+    aliases = {
+        "qlutattn-k168v4-pt": "qlutattn_k168v4_pt",
+        "qlutattn-k1.68v4-pt": "qlutattn_k168v4_pt",
+        "qlutattn-k188v4-pt": "qlutattn_k188v4_pt",
+        "qlutattn-rotated-st-pt": "qlutattn_rotated_st_pt",
+        "qlutattn-rotated-snf-pt": "qlutattn_rotated_snf_pt",
+    }
+    return aliases.get(variant_name, variant_name) in _PERTOKEN_BLOCK_VARIANTS
+
+
+def validate_new_v2_model_family(variant: VariantConfig, model_family: str | None) -> None:
+    """Fail before model loading when a legacy-cache GLM would bypass this path."""
+    if variant.name in NEW_V2_VARIANTS and is_glm_family(model_family):
+        raise ValueError(
+            f"GLM parity for {variant.name} is not implemented yet; "
+            "refusing to silently fall back to KIVI V. Use a non-GLM model family."
+        )
+
+
+def validate_new_v2_model_config(
+    variant: VariantConfig, model_config: Any, model_dtype: torch.dtype
+) -> None:
+    """Validate model-dependent V2 constraints before any dataset/sample loop."""
+    if variant.name not in NEW_V2_VARIANTS:
+        return
+    if model_dtype != torch.float16:
+        raise ValueError(
+            f"{variant.name} requires an FP16 model for the V2 fake-quant path; "
+            f"got model dtype={model_dtype}"
+        )
+    if variant.name not in NEW_V2_TILE_VARIANTS:
+        return
+    head_dim = getattr(model_config, "head_dim", None)
+    if head_dim is None:
+        hidden_size = getattr(model_config, "hidden_size", None)
+        n_heads = getattr(model_config, "num_attention_heads", None)
+        if hidden_size is None or not n_heads:
+            raise ValueError("Cannot infer head_dim from model config")
+        if int(hidden_size) % int(n_heads) != 0:
+            raise ValueError(
+                f"hidden_size={hidden_size} is not divisible by "
+                f"num_attention_heads={n_heads}; cannot infer head_dim"
+            )
+        head_dim = int(hidden_size) // int(n_heads)
+    head_dim = int(head_dim)
+    C = int(variant.v_tile_channels)
+    if head_dim <= 0:
+        raise ValueError(f"head_dim must be positive, got head_dim={head_dim}")
+    if head_dim % C != 0:
+        raise ValueError(
+            f"head_dim={head_dim} must be divisible by v_tile_channels={C}"
+        )
+    if head_dim & (head_dim - 1):
+        raise ValueError(
+            f"Hadamard/RHT requires power-of-two head_dim, got head_dim={head_dim}"
+        )
+
+
+def _torch_dtype_from_name(name: str) -> torch.dtype:
+    return {
+        "float16": torch.float16,
+        "fp16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "bf16": torch.bfloat16,
+        "float32": torch.float32,
+        "fp32": torch.float32,
+    }[str(name).lower()]
+
+
+def validate_new_v2_preload(args: Any, variant: VariantConfig, model_family: str) -> None:
+    """Config-only validation before scheduling or loading model weights.
+
+    AutoConfig may read a local config or the normal HF metadata cache/network,
+    but it never creates a model or CUDA context.  The same checks run again on
+    the loaded model config to guard custom/remote modeling discrepancies.
+    """
+    if variant.name not in NEW_V2_VARIANTS:
+        return
+    validate_new_v2_model_family(variant, model_family)
+    source = getattr(args, "model_path", None) or getattr(args, "model", None)
+    if not source:
+        raise ValueError(f"{variant.name} preflight requires model metadata")
+    try:
+        config = AutoConfig.from_pretrained(
+            source,
+            trust_remote_code=True,
+            local_files_only=bool(getattr(args, "local_files_only", False)),
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"Unable to load model metadata for {variant.name} from {source!r}; "
+            "refusing to schedule before head_dim/dtype validation"
+        ) from exc
+    validate_new_v2_model_config(
+        variant,
+        config,
+        _torch_dtype_from_name(getattr(args, "torch_dtype", "float16")),
+    )
+
+
 def build_variant(args: Any) -> VariantConfig:
     variant = args.variant.lower()
+    # Normalize hyphen aliases for the new V2 family early.
+    _alias = {
+        "qlutattn-k125v2-pt": "qlutattn_k125v2_pt",
+        "qlutattn-k188v2-pt": "qlutattn_k188v2_pt",
+        "qlutattn-k125v2-pt-vtile16": "qlutattn_k125v2_pt_vtile16",
+        "qlutattn-k188v2-pt-vtile16": "qlutattn_k188v2_pt_vtile16",
+    }
+    variant = _alias.get(variant, variant)
     # per-token block-shared codebook size (offline per-token variants only). 1 = per-token.
     pt_block = int(os.environ.get("PERTOKEN_BLOCK", "1"))
+    if pt_block < 1:
+        raise ValueError(f"PERTOKEN_BLOCK must be a positive integer, got {pt_block}")
+    if pt_block > 1 and not _variant_supports_pertoken_block(variant):
+        raise ValueError(
+            f"{variant} does not support PERTOKEN_BLOCK>1 "
+            f"(got PERTOKEN_BLOCK={pt_block}); use PERTOKEN_BLOCK=1"
+        )
+    resolved_v_tile_channels = _resolve_v_tile_channels(args)
+    if variant in NEW_V2_TILE_VARIANTS:
+        if resolved_v_tile_channels is None or resolved_v_tile_channels <= 0:
+            raise ValueError(
+                f"{variant} requires V_TILE_CHANNELS / --v-tile-channels "
+                "as a positive integer (no silent default)"
+            )
+    elif resolved_v_tile_channels is not None:
+        raise ValueError(
+            f"{variant} is not a V-tile variant; unset V_TILE_CHANNELS "
+            f"(got {resolved_v_tile_channels}). Empty V_TILE_CHANNELS= is the unset sentinel."
+        )
     config_path = getattr(args, "promote_ratio_config", None)
     if config_path and variant != "kitty":
         raise ValueError(
@@ -352,6 +580,77 @@ def build_variant(args: Any) -> VariantConfig:
             bin_codebooks=(cb,), n_bins=1, vbits=4, promote_ratio=0.0,
             channel_selection=0, k_quant_mode="per_token",
             pertoken_pc_submean=True)
+    if variant == "qlutattn_k125v2_pt":
+        # sign K (same as k125v4_pt) + per-token V 2-bit.
+        _reject_conflicting_vbits(args, variant)
+        _reject_stale_or_missing_v_tile_channels(args, tile=False, variant_name=variant)
+        _reject_sign_pertoken_block(variant, pt_block)
+        bins = _lock_sign_bin_codebooks(variant)
+        return VariantConfig(
+            name="qlutattn_k125v2_pt", use_kitty=True, k_codebook="qlut",
+            bin_codebooks=bins, n_bins=1, vbits=2, v_codebook="per_token2",
+            promote_ratio=0.0, channel_selection=0, k_quant_mode="per_token",
+            pertoken_pc_submean=True)
+    if variant == "qlutattn_k188v2_pt":
+        # SNF K (same as k188v4_pt) + per-token V 2-bit.
+        _reject_conflicting_vbits(args, variant)
+        _reject_stale_or_missing_v_tile_channels(args, tile=False, variant_name=variant)
+        mask = os.environ.get("QLUT_CB_MASK", "")
+        if not mask or not os.path.exists(mask):
+            raise FileNotFoundError(
+                "qlutattn_k188v2_pt requires an OFFLINE codebook mask: set "
+                "QLUT_CB_MASK=/path/to/mask.pt (generate via "
+                "scripts/calibrate_k168v4_pt.py --codebooks sign,nf2). "
+                f"Got QLUT_CB_MASK='{mask}'")
+        return VariantConfig(
+            name="qlutattn_k188v2_pt", use_kitty=True, k_codebook="qlut",
+            bin_codebooks=("sign", "nf2"), n_bins=2, vbits=2, v_codebook="per_token2",
+            promote_ratio=0.0, channel_selection=0, k_quant_mode="per_token",
+            pertoken_cb_mask=mask, pertoken_block=pt_block)
+    if variant == "qlutattn_k125v2_pt_vtile16":
+        # sign K + rescued tile16cC V 2-bit.
+        from kitty_sim.v_tile_quant import (
+            V_MSE_ITERS,
+            V_RHT_SEED,
+            V_TILE_ALGO_VERSION,
+            V_TILE_TOKENS,
+        )
+        _reject_conflicting_vbits(args, variant)
+        C = _reject_stale_or_missing_v_tile_channels(args, tile=True, variant_name=variant)
+        _reject_sign_pertoken_block(variant, pt_block)
+        bins = _lock_sign_bin_codebooks(variant)
+        return VariantConfig(
+            name="qlutattn_k125v2_pt_vtile16", use_kitty=True, k_codebook="qlut",
+            bin_codebooks=bins, n_bins=1, vbits=2, v_codebook="tile16_rescued",
+            v_tile_tokens=V_TILE_TOKENS, v_tile_channels=C,
+            v_tile_algo_version=V_TILE_ALGO_VERSION, v_rht_seed=V_RHT_SEED,
+            v_mse_iters=V_MSE_ITERS, promote_ratio=0.0, channel_selection=0,
+            k_quant_mode="per_token", pertoken_pc_submean=True)
+    if variant == "qlutattn_k188v2_pt_vtile16":
+        # SNF K + rescued tile16cC V 2-bit.
+        from kitty_sim.v_tile_quant import (
+            V_MSE_ITERS,
+            V_RHT_SEED,
+            V_TILE_ALGO_VERSION,
+            V_TILE_TOKENS,
+        )
+        _reject_conflicting_vbits(args, variant)
+        C = _reject_stale_or_missing_v_tile_channels(args, tile=True, variant_name=variant)
+        mask = os.environ.get("QLUT_CB_MASK", "")
+        if not mask or not os.path.exists(mask):
+            raise FileNotFoundError(
+                "qlutattn_k188v2_pt_vtile16 requires an OFFLINE codebook mask: set "
+                "QLUT_CB_MASK=/path/to/mask.pt (generate via "
+                "scripts/calibrate_k168v4_pt.py --codebooks sign,nf2). "
+                f"Got QLUT_CB_MASK='{mask}'")
+        return VariantConfig(
+            name="qlutattn_k188v2_pt_vtile16", use_kitty=True, k_codebook="qlut",
+            bin_codebooks=("sign", "nf2"), n_bins=2, vbits=2,
+            v_codebook="tile16_rescued", v_tile_tokens=V_TILE_TOKENS,
+            v_tile_channels=C, v_tile_algo_version=V_TILE_ALGO_VERSION,
+            v_rht_seed=V_RHT_SEED, v_mse_iters=V_MSE_ITERS, promote_ratio=0.0,
+            channel_selection=0, k_quant_mode="per_token",
+            pertoken_cb_mask=mask, pertoken_block=pt_block)
     if variant in ("qlutattn_rotated_k125v4_pt", "qlutattn-rotated-k125v4-pt"):
         # ROTATED per-token sign (k125v4-pt + Hadamard). Per-channel mean removal,
         # then FWHT-rotate the residual into an isotropic basis so one per-token
@@ -500,6 +799,11 @@ def _cache_factory(config: VariantConfig):
         pertoken_cb_mask=config.pertoken_cb_mask,
         pertoken_rotate=config.pertoken_rotate,
         pertoken_block=config.pertoken_block,
+        v_tile_tokens=config.v_tile_tokens,
+        v_tile_channels=config.v_tile_channels,
+        v_tile_algo_version=config.v_tile_algo_version,
+        v_rht_seed=config.v_rht_seed,
+        v_mse_iters=config.v_mse_iters,
     )
     return get_kvcache_kitty(ns)
 
@@ -559,6 +863,16 @@ def model_layout_slug(model: str, model_path: str | None = None) -> str:
 
 def method_layout_slug(variant: VariantConfig | str) -> str:
     name = (variant.name if isinstance(variant, VariantConfig) else str(variant)).lower()
+    if not isinstance(variant, VariantConfig) and name in {
+        "qlutattn_k125v2_pt_vtile16",
+        "qlutattn-k125v2-pt-vtile16",
+        "qlutattn_k188v2_pt_vtile16",
+        "qlutattn-k188v2-pt-vtile16",
+    }:
+        raise ValueError(
+            "A resolved VariantConfig is required to build a V-tile slug because "
+            "the channel block C is runtime-configured"
+        )
     # kivi / kivi_star encode their K/V bit-width into the slug so different bit
     # combinations land in distinct output dirs (kivi-k2v4, kivi-star-k4v4, ...).
     if name in ("kivi", "kivi_star"):
@@ -585,11 +899,23 @@ def method_layout_slug(variant: VariantConfig | str) -> str:
         "qlutattn_k185v4_pt": "qlutattn-k185v4-pt",
         "qlutattn_k168v4_pt": "qlutattn-k168v4-pt",
         "qlutattn_k188v4_pt": "qlutattn-k188v4-pt",
+        "qlutattn_k125v2_pt": "qlutattn-k125v2-pt",
+        "qlutattn_k188v2_pt": "qlutattn-k188v2-pt",
+        # Base without C/rv; tile suffix added below as -vtile16c{C}-rv1
+        "qlutattn_k125v2_pt_vtile16": "qlutattn-k125v2-pt",
+        "qlutattn_k188v2_pt_vtile16": "qlutattn-k188v2-pt",
         "qlutattn_rotated_k125v4_pt": "qlutattn-rotated-k125v4-pt",
         "qlutattn_rotated_k185v4_pt": "qlutattn-rotated-k185v4-pt",
         "qlutattn_rotated_st_pt": "qlutattn-rotated-st-pt",
         "qlutattn_rotated_snf_pt": "qlutattn-rotated-snf-pt",
     }.get(name, _layout_slug(name))
+    # Rescued V tile: encode C + algo slug before optional K-block / QUEST suffixes.
+    # Order frozen: <base>-vtile16c<C>-rv<V>-blk<N>-quest-<mode>
+    if isinstance(variant, VariantConfig) and variant.v_codebook == "tile16_rescued":
+        from kitty_sim.v_tile_quant import algo_slug_for_version
+        C = variant.v_tile_channels
+        rv = algo_slug_for_version(variant.v_tile_algo_version)
+        slug = f"{slug}-vtile16c{C}-{rv}"
     # block-shared per-token codebook: distinct output dir per block size (e.g.
     # qlutattn-k188v4-pt-blk16) so a PERTOKEN_BLOCK sweep never collides with block=1.
     if isinstance(variant, VariantConfig) and getattr(variant, "pertoken_block", 1) > 1:
@@ -597,6 +923,158 @@ def method_layout_slug(variant: VariantConfig | str) -> str:
     if isinstance(variant, VariantConfig) and getattr(variant, "quest_kernel", False):
         slug = f"{slug}-quest-kernel"
     return slug
+
+
+def _sha256_file(path: str | os.PathLike[str]) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _stable_json_hash(payload: dict[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def variant_semantic_payload(variant: VariantConfig) -> dict[str, Any]:
+    """Portable algorithm payload: content digests replace host-local paths."""
+    payload = asdict(variant)
+    mask_path = payload.pop("pertoken_cb_mask", None)
+    payload.pop("promote_ratio_config_path", None)
+    payload["mask_sha256"] = _sha256_file(mask_path) if mask_path else None
+    return payload
+
+
+def variant_semantic_hash(variant: VariantConfig) -> str:
+    return _stable_json_hash(variant_semantic_payload(variant))
+
+
+def _longbench_data_file(data_root: str | os.PathLike[str], data_name: str) -> Path:
+    return Path(data_root) / "data" / f"{data_name}.jsonl"
+
+
+def _nonblank_line_count(path: Path) -> int:
+    with path.open("r", encoding="utf-8") as handle:
+        return sum(1 for line in handle if line.strip())
+
+
+def _model_config_digest(model_path: str | None) -> str | None:
+    if not model_path:
+        return None
+    config_path = Path(model_path) / "config.json"
+    return _sha256_file(config_path) if config_path.is_file() else None
+
+
+def _model_source_identity(model_path: str | None) -> str | None:
+    """Distinguish local checkpoints that share an HF model id/config."""
+    if not model_path:
+        return None
+    path = Path(model_path).expanduser()
+    if path.exists():
+        return str(path.resolve())
+    return str(model_path)
+
+
+def longbench_run_config_payload(
+    args: Any,
+    variant: VariantConfig,
+    dataset: str,
+) -> dict[str, Any]:
+    """Build the stable per-dataset generation fingerprint without model weights."""
+    dataset2prompt = load_json_config("dataset2prompt.json")
+    dataset2maxlen = load_json_config("dataset2maxlen.json")
+    model2maxlen = load_json_config("model2maxlen.json")
+    data_name = f"{dataset}_e" if bool(getattr(args, "e", False)) else dataset
+    data_root = getattr(args, "data_root", None) or default_data_root()
+    data_path = _longbench_data_file(data_root, data_name)
+    if not data_path.is_file():
+        raise FileNotFoundError(f"LongBench data file not found for preflight: {data_path}")
+    total_samples = _nonblank_line_count(data_path)
+    max_samples = int(getattr(args, "max_samples", -1))
+    expected_samples = min(total_samples, max_samples) if max_samples > 0 else total_samples
+    model = getattr(args, "model", None)
+    model_path = getattr(args, "model_path", None) or model
+    default_max = int(getattr(args, "default_max_model_len", 3500))
+    max_model_len = getattr(args, "max_model_len", None) or model2maxlen.get(model, default_max)
+    max_gen = getattr(args, "max_gen", None) or dataset2maxlen[dataset]
+    model_family = getattr(args, "model_family", None) or infer_model_family(
+        getattr(args, "model_tag", None) or model, model_path or model
+    )
+    templates_source = Path(__file__).with_name("templates.py")
+    return {
+        "schema_version": 1,
+        "variant_semantic_hash": variant_semantic_hash(variant),
+        "model_id": model,
+        "model_source_identity": _model_source_identity(model_path),
+        "model_config_sha256": _model_config_digest(model_path),
+        "model_family": model_family,
+        "dataset": dataset,
+        "dataset_sha256": _sha256_file(data_path),
+        "dataset_total_samples": total_samples,
+        "max_samples": max_samples,
+        "expected_samples": expected_samples,
+        "prompt_sha256": hashlib.sha256(dataset2prompt[dataset].encode("utf-8")).hexdigest(),
+        "templates_source_sha256": _sha256_file(templates_source),
+        "max_model_len": int(max_model_len),
+        "max_gen": int(max_gen),
+        "prompt_token_reserve": int(getattr(args, "prompt_token_reserve", 0)),
+        "torch_dtype": str(getattr(args, "torch_dtype", "float16")),
+    }
+
+
+def longbench_run_config_hash(args: Any, variant: VariantConfig, dataset: str) -> str:
+    return _stable_json_hash(longbench_run_config_payload(args, variant, dataset))
+
+
+def resolve_longbench_preflight(args: Any) -> dict[str, Any]:
+    """No-GPU resolver: canonical variant, method slug, semantic hash.
+
+    Shared by shell preflight and direct runner. Does not load model weights.
+    """
+    variant = _maybe_enable_quest_kernel(build_variant(args), args)
+    semantic_payload = variant_semantic_payload(variant)
+    result = {
+        "canonical_variant": variant.name,
+        "method_slug": method_layout_slug(variant),
+        "resolved_variant": asdict(variant),
+        "variant_semantic_hash": _stable_json_hash(semantic_payload),
+        "mask_sha256": semantic_payload["mask_sha256"],
+    }
+    dataset = getattr(args, "dataset", None)
+    datasets_csv = getattr(args, "datasets_csv", None)
+    if dataset and datasets_csv:
+        raise ValueError("Use either --dataset or --datasets-csv, not both")
+    datasets = ([dataset] if dataset else [
+        item.strip() for item in str(datasets_csv or "").split(",") if item.strip()
+    ])
+    if datasets:
+        model = getattr(args, "model", None)
+        model_path = getattr(args, "model_path", None) or model
+        model_family = getattr(args, "model_family", None) or infer_model_family(
+            getattr(args, "model_tag", None) or model, model_path or model
+        )
+        validate_new_v2_preload(args, variant, model_family)
+        resolved_datasets: dict[str, dict[str, Any]] = {}
+        for dataset_name in datasets:
+            run_payload = longbench_run_config_payload(args, variant, dataset_name)
+            resolved_datasets[dataset_name] = {
+                "run_config_hash": _stable_json_hash(run_payload),
+                "expected_rows": run_payload["expected_samples"],
+                "run_config": run_payload,
+            }
+        result["datasets"] = resolved_datasets
+        if len(datasets) == 1:
+            only = resolved_datasets[datasets[0]]
+            result["run_config_hash"] = only["run_config_hash"]
+            result["run_config"] = only["run_config"]
+        else:
+            result["run_config_hash"] = None
+    else:
+        result["run_config_hash"] = None
+    return result
 
 
 def default_prediction_dir(model: str, model_path: str | None, variant: VariantConfig, max_samples: int) -> Path:
@@ -712,6 +1190,7 @@ def generate_dataset(
     strict_complete: bool = True,
     legacy_cache_model: bool = False,
     kitty_stats: dict[str, Any] | None = None,
+    expected_run_config_hash: str | None = None,
 ) -> dict[str, Any]:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     if overwrite:
@@ -721,26 +1200,59 @@ def generate_dataset(
     expected_samples = len(records)
     completed = _completed_rows(out_path)
     if completed >= expected_samples:
-        manifest = {
-            "status": "ok",
-            "dataset": dataset,
-            "expected_samples": expected_samples,
-            "written_samples": completed,
-            "failed_sample_ids": [],
-            "output_path": str(out_path),
-            "resumed": True,
-        }
-        _write_manifest(out_path, manifest)
+        manifest_path = out_path.with_suffix(".manifest.json")
+        if not manifest_path.is_file():
+            raise RuntimeError(
+                f"Refusing to reuse completed {dataset} output without a manifest: {manifest_path}"
+            )
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        actual_hash = manifest.get("run_config_hash")
+        if not expected_run_config_hash or actual_hash != expected_run_config_hash:
+            raise RuntimeError(
+                f"Refusing to reuse completed {dataset}: run_config_hash mismatch "
+                f"(expected={expected_run_config_hash!r}, manifest={actual_hash!r})."
+            )
+        if completed != expected_samples:
+            raise RuntimeError(
+                f"Refusing to reuse completed {dataset}: output has {completed} rows "
+                f"but this run expects exactly {expected_samples}"
+            )
+        if (
+            manifest.get("status") != "ok"
+            or int(manifest.get("written_samples", -1)) != completed
+            or int(manifest.get("expected_samples", -1)) != expected_samples
+        ):
+            raise RuntimeError(
+                f"Refusing to reuse completed {dataset}: manifest status/count is inconsistent"
+            )
         print(f"[skip] {dataset}: all {completed}/{expected_samples} samples already present")
         return manifest
 
     if completed:
+        manifest_path = out_path.with_suffix(".manifest.json")
+        if not manifest_path.is_file():
+            raise RuntimeError(
+                f"Refusing to resume partial {dataset} output without a manifest"
+            )
+        previous = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if previous.get("run_config_hash") != expected_run_config_hash:
+            raise RuntimeError(
+                f"Refusing to resume partial {dataset}: run_config_hash mismatch"
+            )
         print(f"[resume] {dataset}: skip {completed}, remaining {expected_samples - completed}")
         records = records.skip(completed)
 
     failed: list[dict[str, Any]] = []
     written_now = 0
     kitty_engagement_checked = False
+    engagement_evidence = {
+        "samples_observed": 0,
+        "v_quant_calls": 0,
+        "v_quantized_tokens": 0,
+        "v_tile_blocks": 0,
+        "last_v_quant_mode": None,
+        "last_v_tile_channels": None,
+    }
     device = getattr(model, "device", torch.device("cuda" if torch.cuda.is_available() else "cpu"))
 
     for local_idx, json_obj in enumerate(tqdm(records, desc=dataset)):
@@ -801,6 +1313,23 @@ def generate_dataset(
                     **inputs,
                     **gen_kwargs,
                 )[0]
+            if variant.name in NEW_V2_VARIANTS and kv_cache is not None:
+                engagement_evidence["samples_observed"] += 1
+                engagement_evidence["v_quant_calls"] += int(
+                    getattr(kv_cache, "v_quant_calls", 0)
+                )
+                engagement_evidence["v_quantized_tokens"] += int(
+                    getattr(kv_cache, "v_quantized_tokens", 0)
+                )
+                engagement_evidence["v_tile_blocks"] += int(
+                    getattr(kv_cache, "v_tile_blocks", 0)
+                )
+                mode_seen = getattr(kv_cache, "last_v_quant_mode", None)
+                channels_seen = getattr(kv_cache, "last_v_tile_channels", None)
+                if mode_seen is not None:
+                    engagement_evidence["last_v_quant_mode"] = mode_seen
+                if channels_seen is not None:
+                    engagement_evidence["last_v_tile_channels"] = channels_seen
             # Guardrail: refuse to silently report dense fp16 as Kitty. Verify the
             # KV quantization path actually engaged on the first generated sample.
             if variant.use_kitty and not kitty_engagement_checked:
@@ -869,11 +1398,36 @@ def generate_dataset(
                         f"Refusing to proceed. See kitty_sim/shadowkv_sim.py."
                     )
                 else:
-                    engaged = kv_cache is not None and kv_cache.get_seq_length() > 0
+                    seqlen = kv_cache.get_seq_length() if kv_cache is not None else 0
+                    engaged = kv_cache is not None and seqlen > 0
                     detail = (
                         f"KittyKVCache.get_seq_length()="
-                        f"{kv_cache.get_seq_length() if kv_cache is not None else None}"
+                        f"{seqlen}"
                     )
+                    if variant.name in NEW_V2_VARIANTS and kv_cache is not None:
+                        mode = getattr(kv_cache, "last_v_quant_mode", None)
+                        calls = int(getattr(kv_cache, "v_quant_calls", 0))
+                        blocks = int(getattr(kv_cache, "v_tile_blocks", 0))
+                        tokens = int(getattr(kv_cache, "v_quantized_tokens", 0))
+                        c_seen = getattr(kv_cache, "last_v_tile_channels", None)
+                        detail = (
+                            f"{detail} v_quant_calls={calls} v_quantized_tokens={tokens} "
+                            f"v_tile_blocks={blocks} last_v_quant_mode={mode} "
+                            f"last_v_tile_channels={c_seen} context_length={context_length}"
+                        )
+                        print(f"[vcache-2bit] {dataset} first-sample evidence: {detail}")
+                        if variant.v_codebook == "tile16_rescued":
+                            # Long prompts must engage at least one full tile; short
+                            # prompts may legitimately leave blocks=0 (lazy calib).
+                            ready = max(0, context_length - variant.sink_length - variant.buffer_length)
+                            if ready >= 16:
+                                engaged = engaged and blocks > 0 and mode == "tile16_rescued"
+                                if variant.v_tile_channels is not None:
+                                    engaged = engaged and c_seen == variant.v_tile_channels
+                        else:
+                            # PT2: any settled token past sink+recent should flush.
+                            if context_length > variant.sink_length + variant.buffer_length:
+                                engaged = engaged and calls > 0 and mode == "per_token2"
                     raise_msg = (
                         f"Kitty variant '{variant.name}' was requested but KV quantization "
                         f"never engaged for model_family='{model_family}' ({detail}). The model "
@@ -934,6 +1488,10 @@ def generate_dataset(
         "max_gen": max_gen,
         "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "variant_semantic_hash": variant_semantic_hash(variant),
+        "run_config_hash": expected_run_config_hash,
+        "mask_sha256": variant_semantic_payload(variant)["mask_sha256"],
+        "engagement": engagement_evidence,
     }
     manifest["config_hash"] = config_hash(manifest)
     _write_manifest(out_path, manifest)
@@ -951,6 +1509,8 @@ def run_longbench(args: Any) -> dict[str, Any]:
 
     variant = _maybe_enable_quest_kernel(build_variant(args), args)
     model_family = args.model_family or infer_model_family(args.model_tag or args.model, args.model_path or args.model)
+    validate_new_v2_model_family(variant, model_family)
+    validate_new_v2_preload(args, variant, model_family)
     model_tag = args.model_tag or model_basename(args.model, args.model_path)
     output_root = args.output_dir
     flat_output_dir = getattr(args, "flat_output_dir", False)
@@ -982,6 +1542,21 @@ def run_longbench(args: Any) -> dict[str, Any]:
     else:
         datasets = list(LONG_BENCH_DATASETS)
 
+    run_hashes = {
+        dataset: longbench_run_config_hash(args, variant, dataset)
+        for dataset in datasets
+    }
+    supplied_hash = getattr(args, "expected_run_config_hash", None)
+    if supplied_hash is not None:
+        if len(datasets) != 1:
+            raise ValueError("--expected-run-config-hash requires exactly one --dataset")
+        actual_hash = run_hashes[datasets[0]]
+        if supplied_hash != actual_hash:
+            raise RuntimeError(
+                "Worker run_config_hash disagrees with shell preflight: "
+                f"expected={supplied_hash}, recomputed={actual_hash}"
+            )
+
     print("=" * 80)
     print("Kitty LongBench evaluation")
     print(f"model={args.model} path={model_path}")
@@ -1000,6 +1575,7 @@ def run_longbench(args: Any) -> dict[str, Any]:
         dtype=args.torch_dtype,
         local_files_only=args.local_files_only,
     )
+    validate_new_v2_model_config(variant, model_obj.config, model_obj.dtype)
 
     # Validate a per-layer promote_ratio schedule against the model's real layer
     # count now that the model is loaded (build_variant only checked ratios).
@@ -1095,6 +1671,7 @@ def run_longbench(args: Any) -> dict[str, Any]:
                 strict_complete=args.strict_complete,
                 legacy_cache_model=legacy_cache_model,
                 kitty_stats=kitty_stats,
+                expected_run_config_hash=run_hashes[dataset],
             )
             manifests.append(manifest)
     finally:
@@ -1112,6 +1689,9 @@ def run_longbench(args: Any) -> dict[str, Any]:
         "model_tag": model_tag,
         "model_family": model_family,
         "variant": asdict(variant),
+        "variant_semantic_hash": variant_semantic_hash(variant),
+        "mask_sha256": variant_semantic_payload(variant)["mask_sha256"],
+        "run_config_hashes": run_hashes,
         "datasets": datasets,
         "manifests": manifests,
         "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),

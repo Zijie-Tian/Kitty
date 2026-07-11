@@ -13,7 +13,7 @@
 # method_layout_slug), separated by an underscore.
 #
 # Usage:
-#   bash scripts/run_exp.sh [all|llama|qwen|glm|deepseek|llama32] [--gpu GPU | --gpus G0,G1,...] [--max-samples N]
+#   bash scripts/run_exp.sh [all|llama|qwen|glm|deepseek|llama32] [--gpu GPU | --gpus G0,G1,...] [--max-samples N] [--variant NAME] [--v-tile-channels C]
 #   SERIAL=1 bash scripts/run_exp.sh all
 #   bash scripts/run_exp.sh llama32 --gpu 1 --max-samples 2
 #   bash scripts/run_exp.sh llama32 --gpus 0,1,2 --max-samples 2   # fan datasets across GPUs (shell-level parallelism)
@@ -48,6 +48,10 @@ GPUS_OVERRIDE="${GPUS_OVERRIDE:-}"
 MAX_SAMPLES="${MAX_SAMPLES:--1}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-32768}"
 RUN_VARIANT="${RUN_VARIANT:-}"        # empty => per-target default; --variant/RUN_VARIANT overrides
+# Empty string is an explicit unset sentinel (blocks .env re-injection of stale C).
+V_TILE_CHANNELS="${V_TILE_CHANNELS-}"
+V_TILE_CHANNELS_CLI=""
+PRINT_METHOD_SLUG=0
 RUN_MODE="${RUN_MODE:-auto}"          # auto|smoke|full -- forces layout independently of MAX_SAMPLES
 
 # Canonical full LongBench dataset list (21). Override with DATASETS_CSV.
@@ -98,7 +102,7 @@ DEEPSEEK_DEFAULT_VARIANT="${DEEPSEEK_DEFAULT_VARIANT:-kitty}"
 
 usage() {
   cat <<USAGE
-Usage: bash scripts/run_exp.sh [all|llama|qwen|glm|deepseek|llama32] [--gpu GPU | --gpus G0,G1,...] [--max-samples N]
+Usage: bash scripts/run_exp.sh [all|llama|qwen|glm|deepseek|llama32] [--gpu GPU | --gpus G0,G1,...] [--max-samples N] [--variant NAME] [--v-tile-channels C]
 
 run_exp.sh is the ONLY supported entry point for LongBench in this repo.
 
@@ -125,6 +129,14 @@ Environment overrides:
   MAX_SAMPLES=${MAX_SAMPLES}    MAX_MODEL_LEN=${MAX_MODEL_LEN}    RUN_MODE=${RUN_MODE}
   RUN_VARIANT=${RUN_VARIANT:-<per-target default>}
   DATASETS_CSV=${DATASETS_CSV:-<full 21>}    FORCE=${FORCE:-0}
+  V_TILE_CHANNELS=${V_TILE_CHANNELS:-<unset>}    PERTOKEN_BLOCK=${PERTOKEN_BLOCK:-1}
+
+V-cache 2-bit variants:
+  qlutattn_k125v2_pt / qlutattn_k188v2_pt
+      whole-head per-token asymmetric V2 (sign-K / SNF-K respectively)
+  qlutattn_k125v2_pt_vtile16 / qlutattn_k188v2_pt_vtile16
+      rescued tile16cC V2; requires --v-tile-channels C or V_TILE_CHANNELS=C
+      and C must divide the model head_dim. Named V2 variants require VBITS=2.
 USAGE
 }
 
@@ -216,6 +228,26 @@ parse_args() {
         fi
         shift
         ;;
+      --v-tile-channels)
+        if [[ "$#" -lt 2 || -z "${2:-}" || "${2:-}" == -* ]]; then
+          echo "ERROR: --v-tile-channels requires a positive integer" >&2
+          return 2
+        fi
+        V_TILE_CHANNELS_CLI="$2"
+        shift 2
+        ;;
+      --v-tile-channels=*)
+        V_TILE_CHANNELS_CLI="${1#--v-tile-channels=}"
+        if [[ -z "${V_TILE_CHANNELS_CLI}" ]]; then
+          echo "ERROR: --v-tile-channels requires a non-empty integer" >&2
+          return 2
+        fi
+        shift
+        ;;
+      --print-method-slug)
+        PRINT_METHOD_SLUG=1
+        shift
+        ;;
       -*)
         echo "ERROR: unknown option: $1" >&2
         usage >&2
@@ -255,36 +287,91 @@ select_gpus() {
   fi
 }
 
-# Map a variant name to its output method slug (mirrors runner.py method_layout_slug).
+# Resolve the output method slug through the Python canonical resolver.  The
+# shell deliberately owns no variant table: aliases, stale env validation,
+# PERTOKEN_BLOCK support, V-tile C, rv version, and QUEST suffixes all come from
+# the exact same build_variant()/method_layout_slug() path used by workers.
 method_slug() {
-  local base
-  case "${1,,}" in
-    kitty)
-      local _pr="${PROMOTE_RATIO:-0.125}"
-      base="$(printf 'kitty-k%sb%sv%s-pr%s' "${KBITS:-2}" "${PROMOTE_BIT:-4}" "${VBITS:-2}" "${_pr//./p}")" ;;
-    qlutattn_pertoken) base='qlutattn-pertoken' ;;
-    fp16) base='fp16' ;;
-    kivi) base="$(printf 'kivi-k%sv%s' "${KBITS:-2}" "${VBITS:-2}")" ;;
-    kivi_star) base="$(printf 'kivi-star-k%sv%s' "${KBITS:-2}" "${VBITS:-2}")" ;;
-    custom) base='custom-kitty' ;;
-    shadowkv) base='shadowkv' ;;
-    qlutattn_k1v4|qlutattn-k1v4) base='qlutattn-k1v4' ;;
-    qlutattn_k184v4|qlutattn-k184v4) base='qlutattn-k184v4' ;;
-    *) base="${1//_/-}" ;;
-  esac
-  # block-shared per-token codebook: append -blk{N} so a PERTOKEN_BLOCK sweep lands
-  # in distinct dirs (mirrors runner.py method_layout_slug). N=1 (default) = no suffix.
-  local _blk="${PERTOKEN_BLOCK:-1}"
-  if [[ "${_blk}" =~ ^[0-9]+$ && "${_blk}" -gt 1 ]]; then
-    base="${base}-blk${_blk}"
-  fi
+  local variant="${1}"
+  local resolved_c="${V_TILE_CHANNELS_CLI:-${V_TILE_CHANNELS:-}}"
+  local -a pf_cmd=(
+    env "PYTHONPATH=${REPO_ROOT}/src:${PYTHONPATH:-}"
+    "PERTOKEN_BLOCK=${PERTOKEN_BLOCK:-1}"
+    "QLUT_CB_MASK=${QLUT_CB_MASK:-}"
+    "QLUT_BIN_CODEBOOKS=${QLUT_BIN_CODEBOOKS:-}"
+    "VBITS=${VBITS:-}"
+    "V_TILE_CHANNELS=${resolved_c}"
+    "${PYTHON_BIN}" -m kitty_sim.cli.preflight_longbench
+    --variant "${variant}" --resolve-config-only --json
+  )
+  [[ -n "${KBITS:-}" ]] && pf_cmd+=(--kbits "${KBITS}")
+  [[ -n "${VBITS:-}" ]] && pf_cmd+=(--vbits "${VBITS}")
+  [[ -n "${PROMOTE_BIT:-}" ]] && pf_cmd+=(--promote_bit "${PROMOTE_BIT}")
+  [[ -n "${PROMOTE_RATIO:-}" ]] && pf_cmd+=(--promote_ratio "${PROMOTE_RATIO}")
+  [[ -n "${PROMOTE_RATIO_CONFIG:-}" ]] && pf_cmd+=(--promote-ratio-config "${PROMOTE_RATIO_CONFIG}")
+  [[ -n "${resolved_c}" ]] && pf_cmd+=(--v-tile-channels "${resolved_c}")
+  [[ -n "${SHADOWKV_BUDGET:-}" ]] && pf_cmd+=(--shadowkv-budget "${SHADOWKV_BUDGET}")
+  [[ -n "${SHADOWKV_RANK:-}" ]] && pf_cmd+=(--shadowkv-rank "${SHADOWKV_RANK}")
+  [[ -n "${SHADOWKV_CHUNK:-}" ]] && pf_cmd+=(--shadowkv-chunk-size "${SHADOWKV_CHUNK}")
   if [[ "${QUEST_KERNEL:-0}" =~ ^(1|true|TRUE|yes|YES|on|ON)$ \
     || "${QUEST_TRITON:-0}" =~ ^(1|true|TRUE|yes|YES|on|ON)$ \
     || "${SIM_QUEST:-0}" =~ ^(1|true|TRUE|yes|YES|on|ON)$ \
     || "${QUEST_SIM:-0}" =~ ^(1|true|TRUE|yes|YES|on|ON)$ ]]; then
-    base="${base}-quest-kernel"
+    pf_cmd+=(--quest-kernel)
+    pf_cmd+=(--quest-token-budget "${QUEST_TOKEN_BUDGET:-${QUEST_BUDGET:-2048}}")
+    pf_cmd+=(--quest-skip-layers "${QUEST_SKIP_LAYERS:-0}")
   fi
-  printf '%s\n' "${base}"
+  local pf_json
+  pf_json="$("${pf_cmd[@]}")" || {
+    echo "ERROR: Python preflight failed for variant=${variant}" >&2
+    return 2
+  }
+  printf '%s\n' "$(printf '%s' "${pf_json}" | "${PYTHON_BIN}" -c 'import json,sys; print(json.load(sys.stdin)["method_slug"])')"
+}
+
+# Resolve the exact per-dataset fingerprint with the same arguments the worker
+# receives. This is CPU-only and never loads model weights.
+longbench_preflight_json() {
+  local model_id="$1" model_path="$2" model_family="$3" variant="$4" datasets_csv="$5" max_gen="$6"
+  local -a cmd=(
+    env "PYTHONPATH=${REPO_ROOT}/src:${PYTHONPATH:-}"
+    "PERTOKEN_BLOCK=${PERTOKEN_BLOCK:-1}"
+    "QLUT_CB_MASK=${QLUT_CB_MASK:-}"
+    "QLUT_BIN_CODEBOOKS=${QLUT_BIN_CODEBOOKS:-}"
+    "VBITS=${VBITS:-}"
+    "${PYTHON_BIN}" -m kitty_sim.cli.preflight_longbench "${model_id}"
+    --model-path "${model_path}"
+    --model-family "${model_family}"
+    --variant "${variant}"
+    --datasets-csv "${datasets_csv}"
+    --data-root "${DATA_ROOT}"
+    --max-samples "${MAX_SAMPLES}"
+    --max-model-len "${MAX_MODEL_LEN}"
+    --prompt-token-reserve "${PROMPT_TOKEN_RESERVE:-0}"
+    --torch-dtype float16
+    --local-files-only
+    --json
+  )
+  [[ -n "${max_gen}" ]] && cmd+=(--max-gen "${max_gen}")
+  [[ -n "${KBITS:-}" ]] && cmd+=(--kbits "${KBITS}")
+  [[ -n "${VBITS:-}" ]] && cmd+=(--vbits "${VBITS}")
+  [[ -n "${PROMOTE_BIT:-}" ]] && cmd+=(--promote_bit "${PROMOTE_BIT}")
+  [[ -n "${PROMOTE_RATIO:-}" ]] && cmd+=(--promote_ratio "${PROMOTE_RATIO}")
+  [[ -n "${PROMOTE_RATIO_CONFIG:-}" ]] && cmd+=(--promote-ratio-config "${PROMOTE_RATIO_CONFIG}")
+  local resolved_c="${V_TILE_CHANNELS_CLI:-${V_TILE_CHANNELS:-}}"
+  [[ -n "${resolved_c}" ]] && cmd+=(--v-tile-channels "${resolved_c}")
+  [[ -n "${SHADOWKV_BUDGET:-}" ]] && cmd+=(--shadowkv-budget "${SHADOWKV_BUDGET}")
+  [[ -n "${SHADOWKV_RANK:-}" ]] && cmd+=(--shadowkv-rank "${SHADOWKV_RANK}")
+  [[ -n "${SHADOWKV_CHUNK:-}" ]] && cmd+=(--shadowkv-chunk-size "${SHADOWKV_CHUNK}")
+  if [[ "${QUEST_KERNEL:-0}" =~ ^(1|true|TRUE|yes|YES|on|ON)$ \
+    || "${QUEST_TRITON:-0}" =~ ^(1|true|TRUE|yes|YES|on|ON)$ \
+    || "${SIM_QUEST:-0}" =~ ^(1|true|TRUE|yes|YES|on|ON)$ \
+    || "${QUEST_SIM:-0}" =~ ^(1|true|TRUE|yes|YES|on|ON)$ ]]; then
+    cmd+=(--quest-kernel)
+    cmd+=(--quest-token-budget "${QUEST_TOKEN_BUDGET:-${QUEST_BUDGET:-2048}}")
+    cmd+=(--quest-skip-layers "${QUEST_SKIP_LAYERS:-0}")
+  fi
+  "${cmd[@]}"
 }
 
 is_smoke() {
@@ -377,6 +464,7 @@ prepare_dataset() {
   local pred_dir="$1"
   local dataset="$2"
   local max_samples="${3:--1}"
+  local expected_hash="${4:-}"
   local data_file="${DATA_ROOT}/data/${dataset}.jsonl"
   local out_file="${pred_dir}/${dataset}.jsonl"
   local manifest_file="${pred_dir}/${dataset}.manifest.json"
@@ -399,8 +487,30 @@ prepare_dataset() {
   fi
 
   if [[ "${current}" -eq "${expected}" ]]; then
-    echo "[skip] ${dataset}: already complete ${current}/${expected}"
-    return 10
+    local manifest_summary="" actual_hash="" actual_status="" actual_written="" actual_expected=""
+    if [[ -f "${manifest_file}" ]]; then
+      manifest_summary="$("${PYTHON_BIN}" -c \
+        'import json,sys; m=json.load(open(sys.argv[1], encoding="utf-8")); print("\t".join(str(m.get(k, "")) for k in ("run_config_hash", "status", "written_samples", "expected_samples")))' \
+        "${manifest_file}" 2>/dev/null || true)"
+      IFS=$'\t' read -r actual_hash actual_status actual_written actual_expected <<< "${manifest_summary}"
+    fi
+    if [[ -n "${expected_hash}" \
+      && "${actual_hash}" == "${expected_hash}" \
+      && "${actual_status}" == "ok" \
+      && "${actual_written}" == "${expected}" \
+      && "${actual_expected}" == "${expected}" ]]; then
+      echo "[skip] ${dataset}: already complete ${current}/${expected}, run_config_hash matched"
+      return 10
+    fi
+    if [[ "${FORCE:-0}" == "1" ]]; then
+      echo "[force] ${dataset}: complete rows but stale/missing run_config_hash; rerunning"
+      rm -f "${out_file}" "${manifest_file}"
+      return 0
+    fi
+    echo "ERROR: ${dataset}: completed output has stale/missing run_config_hash." >&2
+    echo "expected_hash=${expected_hash:-<missing>} manifest_hash=${actual_hash:-<missing>} status=${actual_status:-<missing>} written=${actual_written:-<missing>} manifest_expected=${actual_expected:-<missing>}" >&2
+    echo "Set FORCE=1 to rerun, or migrate the manifest explicitly." >&2
+    return 2
   fi
 
   # Never silently shrink a more-complete existing output (e.g. full results when
@@ -435,8 +545,9 @@ run_eval_dataset() {
   local pred_dir="$7"
   local report_json="$8"
   local dataset="$9"
-  local max_gen="${10:-}"
-  local transformers_verbosity="${11:-}"
+  local expected_run_hash="${10}"
+  local max_gen="${11:-}"
+  local transformers_verbosity="${12:-}"
 
   local -a env_cmd=(
     env
@@ -466,6 +577,8 @@ run_eval_dataset() {
     --torch-dtype float16
     --local-files-only
     --report-json "${report_json}"
+    --expected-run-config-hash "${expected_run_hash}"
+    --prompt-token-reserve "${PROMPT_TOKEN_RESERVE:-0}"
   )
   if [[ "${gpu}" == "1" ]]; then
     cmd+=(--require-gpu1)
@@ -493,6 +606,13 @@ run_eval_dataset() {
   fi
   if [[ -n "${PROMOTE_RATIO_CONFIG:-}" ]]; then
     cmd+=(--promote-ratio-config "${PROMOTE_RATIO_CONFIG}")
+  fi
+  # Rescued V tile channel block C (CLI > env). Empty string = explicit unset.
+  local resolved_v_tile="${V_TILE_CHANNELS_CLI:-${V_TILE_CHANNELS:-}}"
+  if [[ -n "${V_TILE_CHANNELS_CLI}" ]]; then
+    cmd+=(--v-tile-channels "${V_TILE_CHANNELS_CLI}")
+  elif [[ -n "${resolved_v_tile}" ]]; then
+    cmd+=(--v-tile-channels "${resolved_v_tile}")
   fi
   # ShadowKV sim controls (only meaningful for the shadowkv variant; ignored otherwise).
   if [[ -n "${SHADOWKV_BUDGET:-}" ]]; then
@@ -538,7 +658,7 @@ run_datasets_parallel() {
   local gpus_csv="$1"; shift
   local model_id="$1" model_path="$2" model_tag="$3" model_family="$4" variant="$5"
   local pred_dir="$6" report_prefix="$7" max_gen="$8" verbosity="$9"; shift 9
-  local -a datasets=("$@")
+  local -a jobs=("$@")
 
   local -a gpus
   IFS=',' read -r -a gpus <<< "${gpus_csv}"
@@ -557,9 +677,11 @@ run_datasets_parallel() {
 
   local overall_rc=0
   local -a failures=()
-  local ds assigned_slot assigned p rc
+  local job ds expected_hash assigned_slot assigned p rc
 
-  for ds in "${datasets[@]}"; do
+  for job in "${jobs[@]}"; do
+    ds="${job%%|*}"
+    expected_hash="${job#*|}"
     assigned_slot=-1
     while [[ "${assigned_slot}" -lt 0 ]]; do
       for ((s = 0; s < n_slots; s++)); do
@@ -582,7 +704,7 @@ run_datasets_parallel() {
     run_dataset_worker "${assigned}" \
       "${model_id}" "${model_path}" "${model_tag}" "${model_family}" \
       "${variant}" "${pred_dir}" "${report_prefix}_${ds}.json" \
-      "${ds}" "${max_gen}" "${verbosity}" &
+      "${ds}" "${expected_hash}" "${max_gen}" "${verbosity}" &
     p=$!
     slot_pid[$assigned_slot]="${p}"; pid_ds["${p}"]="${ds}"
     echo "[parallel] dispatch dataset=${ds} -> GPU${assigned} (slot ${assigned_slot}, pid ${p})"
@@ -600,7 +722,7 @@ run_datasets_parallel() {
   done
 
   if [[ "${overall_rc}" -ne 0 ]]; then
-    echo "[parallel] ${#failures[@]}/${#datasets[@]} dataset(s) failed: ${failures[*]}" >&2
+    echo "[parallel] ${#failures[@]}/${#jobs[@]} dataset(s) failed: ${failures[*]}" >&2
   fi
   return "${overall_rc}"
 }
@@ -627,20 +749,42 @@ run_model_loop() {
 
   # --variant / RUN_VARIANT wins; otherwise this target's default.
   local variant="${RUN_VARIANT:-${default_variant}}"
+  local -a datasets
+  mapfile -t datasets < <(resolve_datasets)
+  local datasets_csv
+  datasets_csv="$(IFS=,; printf '%s' "${datasets[*]}")"
+
+  # One config-only Python pass is the canonical source for the method slug and
+  # every per-dataset run hash. It runs before any output is wiped or GPU worker
+  # is launched.
+  local preflight_json method
+  preflight_json="$(longbench_preflight_json \
+    "${model_id}" "${model_path}" "${model_family}" "${variant}" "${datasets_csv}" "${max_gen}")" || {
+    echo "ERROR: LongBench preflight failed for ${label}" >&2
+    return 2
+  }
+  method="$(printf '%s' "${preflight_json}" | "${PYTHON_BIN}" -c \
+    'import json,sys; print(json.load(sys.stdin)["method_slug"])')"
+  if [[ -z "${method}" ]]; then
+    echo "ERROR: preflight returned no method_slug for ${label}" >&2
+    return 2
+  fi
+
   local base pred_dir report_prefix mode model_tag
-  base="$(resolve_base_dir "${model_slug}" "${variant}")"
+  if is_smoke; then
+    base="longbench_out/smoke/${model_slug}_${method}"
+  else
+    base="longbench_out/${model_slug}_${method}"
+  fi
   pred_dir="${base}/pred"
   report_prefix="${base}/logs/report"
   if is_smoke; then mode="smoke${MAX_SAMPLES}"; else mode="full"; fi
-  model_tag="${model_slug}_$(method_slug "${variant}")_${mode}"
+  model_tag="${model_slug}_${method}_${mode}"
   # smoke: start each launch from a clean slate; full: keep/resume existing output.
   if is_smoke; then
     wipe_smoke_base "${base}"
   fi
   mkdir -p "${pred_dir}" "${base}/logs"
-
-  local -a datasets
-  mapfile -t datasets < <(resolve_datasets)
 
   local -a gpu_arr
   IFS=',' read -r -a gpu_arr <<< "${gpus_csv}"
@@ -649,11 +793,18 @@ run_model_loop() {
 
   # Prepare serially in the main process (skip complete, rm stale/partial) so
   # workers never race on the same files; collect the datasets that must run.
-  local dataset rc
+  local dataset rc expected_hash
   local -a to_run=()
   for dataset in "${datasets[@]}"; do
-    if prepare_dataset "${pred_dir}" "${dataset}" "${MAX_SAMPLES}"; then
-      to_run+=("${dataset}")
+    expected_hash="$(printf '%s' "${preflight_json}" | "${PYTHON_BIN}" -c \
+      'import json,sys; print(json.load(sys.stdin).get("datasets", {}).get(sys.argv[1], {}).get("run_config_hash") or "")' \
+      "${dataset}")"
+    if [[ -z "${expected_hash}" ]]; then
+      echo "ERROR: preflight returned no run_config_hash for dataset=${dataset}" >&2
+      return 2
+    fi
+    if prepare_dataset "${pred_dir}" "${dataset}" "${MAX_SAMPLES}" "${expected_hash}"; then
+      to_run+=("${dataset}|${expected_hash}")
     else
       rc=$?
       if [[ "${rc}" -eq 10 ]]; then
@@ -759,6 +910,15 @@ main() {
       return 0
       ;;
   esac
+
+  if [[ "${PRINT_METHOD_SLUG}" == "1" ]]; then
+    if [[ -z "${RUN_VARIANT}" ]]; then
+      echo "ERROR: --print-method-slug requires --variant NAME" >&2
+      return 2
+    fi
+    method_slug "${RUN_VARIANT}"
+    return
+  fi
 
   if [[ "${target}" == "all" && ( -n "${GPU_OVERRIDE}" || -n "${GPUS_OVERRIDE}" ) && "${SERIAL:-0}" != "1" ]]; then
     echo "ERROR: --gpu/--gpus with target 'all' requires SERIAL=1; otherwise the model loops (llama/qwen/glm) already run concurrently on their own GPUs." >&2
