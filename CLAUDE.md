@@ -1501,3 +1501,125 @@ python3 aggregate.py pb2_pr6875_8b   # full-LB avg per config
 8B @32k needs ~22GB/process -> **1 worker/card** on a 24GB GPU (list each GPU once in
 `GPUS`); prefer >=40GB cards for headroom / 2-per-card. `head_dim=128` so pr0.6875 =
 88/128 channels @2-bit.
+
+## RULER-NIAH (捞针) evaluation for the sign/SNF V2 arms
+
+Standalone needle-in-a-haystack harness following the RULER protocol (NVIDIA,
+arXiv 2404.06654): needles are "One of the special magic numbers/uuids for
+{key} is: {value}", scoring is `string_match_all` (case-insensitive substring
+of each gold value in the greedy 128-token continuation). It complements the
+LongBench vtile study with an exact-retrieval stress test. `scripts/run_niah.sh`
+is the sole NIAH entry point; do not launch `kitty_sim.cli.eval_niah` by hand
+for real runs.
+
+### Data generation (offline, one-time per tokenizer family)
+
+`scripts/prepare_niah_data.sh` shells into a RULER checkout
+(`RULER_REPO_ROOT`, default `~/Code/RULER` — the local fork whose `niah.py`
+emits `answer_prefix` and `token_position_answer`) and writes
+`${NIAH_DATA_ROOT}/<LEN>/<task>/validation.jsonl` (default
+`~/data/ruler_niah/llama3`). Generation needs `pip install wonderwords nltk`
+(+ `NLTK_DATA=$RULER_REPO_ROOT/nltk_data`) — pure-Python, only for datagen.
+Data is generated at `LEN - 256` tokens so the eval-time chat template can
+never overflow `max_model_len`: the NIAH runner hard-errors instead of
+truncating (a middle-truncate could silently delete the needle). Llama-3.2
+1B/3B share one llama3-tokenizer dataset; seed 42 makes all arms see identical
+samples.
+
+```bash
+cd "$(git rev-parse --show-toplevel)"
+LLAMA32_MODEL_PATH=/home/zijie/models/Llama-3.2-1B-Instruct \
+RULER_REPO_ROOT=/home/zijie/Code/RULER \
+NIAH_DATA_ROOT=/home/zijie/data/ruler_niah/llama3 \
+bash scripts/prepare_niah_data.sh
+# TASKS / LENS / NUM_SAMPLES env override the 4-task x 4-len x 50 default.
+```
+
+### Eval + scoring
+
+New first-party modules: `src/kitty_sim/niah/{data,runner,scorer}.py`,
+`kitty_sim.cli.eval_niah`, `kitty_sim.cli.score_niah`,
+`scripts/plot_niah_montage.py`, tests in `tests/test_niah_wiring.py` (0-GPU).
+The runner reuses `build_variant` / `load_model_and_tokenizer` /
+`_cache_factory` from the LongBench runner: fresh `KittyKVCache` per sample via
+`past_key_values`, greedy `max_new_tokens=128`, prompt =
+`build_chat(input) + answer_prefix` (family `llama3` = raw text, matching the
+RULER base template and the LongBench vtile-study family). Manifests carry
+`run_config_hash` + the NEW_V2 `engagement` evidence
+(`last_v_quant_mode`/`v_tile_blocks`); full runs resume, smoke wipes.
+Output: `niah_out/[smoke/]<model>_<method>/{pred,logs}`; scoring writes
+`pred/result.json` and depth x length heatmap PNGs into `logs/`
+(`token_position_answer/length` binned into 10 depth bins — the classic NIAH
+heatmap, no controlled-depth regeneration needed).
+
+```bash
+# smoke (2 samples, 1 task, 2 lens; ~3 min total on an A100)
+cd "$(git rev-parse --show-toplevel)"
+QLUT_CB_MASK=/home/zijie/models/Llama-3.2-1B-Instruct.k188v4pt_f50.pt \
+LLAMA32_MODEL_PATH=/home/zijie/models/Llama-3.2-1B-Instruct \
+NIAH_DATA_ROOT=/home/zijie/data/ruler_niah/llama3 \
+bash scripts/run_niah.sh --gpu 0 \
+  --variants fp16,qlutattn_k125v2_pt,qlutattn_k125v2_pt_vtile16,qlutattn_k188v2_pt,qlutattn_k188v2_pt_vtile16 \
+  --tasks niah_single_2 --lens 4096,32768 --max-samples 2
+# -> niah_out/smoke/llama32-1b-instruct_<method>/{pred,logs}
+```
+
+```bash
+# full (4 tasks x 4 lens x 50 samples, all 5 arms serially; ~3.5 h on one A100)
+cd "$(git rev-parse --show-toplevel)"
+QLUT_CB_MASK=/home/zijie/models/Llama-3.2-1B-Instruct.k188v4pt_f50.pt \
+LLAMA32_MODEL_PATH=/home/zijie/models/Llama-3.2-1B-Instruct \
+NIAH_DATA_ROOT=/home/zijie/data/ruler_niah/llama3 \
+bash scripts/run_niah.sh --gpu 0 \
+  --variants fp16,qlutattn_k125v2_pt,qlutattn_k125v2_pt_vtile16,qlutattn_k188v2_pt,qlutattn_k188v2_pt_vtile16
+# -> niah_out/llama32-1b-instruct_<method>/{pred,logs}; per-arm result.json + heatmaps auto-written
+
+# 5-arm comparison heatmap montage (shared color scale):
+PYTHONPATH=src python scripts/plot_niah_montage.py \
+  --arms niah_out/llama32-1b-instruct_fp16 \
+         niah_out/llama32-1b-instruct_qlutattn-k125v2-pt \
+         niah_out/llama32-1b-instruct_qlutattn-k125v2-pt-vtile16c64-rv1 \
+         niah_out/llama32-1b-instruct_qlutattn-k188v2-pt \
+         niah_out/llama32-1b-instruct_qlutattn-k188v2-pt-vtile16c64-rv1 \
+  --labels "fp16" "sign K + V2 PT2" "sign K + V2 tile16c64" "SNF K + V2 PT2" "SNF K + V2 tile16c64" \
+  --task pooled --output niah_out/niah_heatmap_montage_pooled.png
+```
+
+The k188 arms need the model-specific `sign,nf2` `f=0.5` mask via
+`QLUT_CB_MASK` (same file as the LongBench SNF study); tile arms default to
+`--v-tile-channels 64` (`V_TILE_C` env). GPU default is 1 (GPU1-only rule);
+`--gpu 0` on the A100 host was an explicit user override.
+
+### Results (verified 2026-07-12, A100-80GB GPU0, Llama-3.2-1B, 50 samples/cell)
+
+Mean `string_match_all` over niah_single_1/2/3 + niah_multikey_1
+(`llamacpp_q40` is also wired into `run_niah.sh` — Q4_0 needs no masks/env,
+same command with `--variants llamacpp_q40`):
+
+| arm | 4k | 8k | 16k | 32k | overall | LongBench-21 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| fp16 | 99.0 | 98.5 | 96.5 | 96.5 | **97.62** | 27.59 |
+| llama.cpp Q4_0 (K=V=4.5b) | 99.0 | 98.0 | 97.5 | 93.5 | **97.00** | 26.92 |
+| sign K + V2 PT2 | 3.0 | 2.0 | 1.5 | 1.5 | **2.00** | 21.25 |
+| sign K + V2 tile16c64 | 3.0 | 2.0 | 1.5 | 1.5 | **2.00** | 21.37 |
+| SNF K + V2 PT2 | 29.0 | 23.5 | 17.5 | 12.0 | **20.50** | 24.95 |
+| SNF K + V2 tile16c64 | 36.0 | 31.5 | 21.0 | 18.5 | **26.75** | 25.04 |
+
+Findings:
+
+- **Exact retrieval collapses long before LongBench does.** sign-K (~1.25b)
+  scores 21+ on LongBench but ~2 on NIAH at every length — K-driven (the two V
+  variants tie; per-task cell scores are identical, predictions differ on 14/50
+  rows). The only green NIAH cells are the 90-100% depth bin, i.e. needles
+  inside/near the recent-128 fp16 window — a window artifact, not retrieval.
+- **SNF K (~1.875b) retrieves partially and degrades with length**
+  (29 -> 12 for PT2), consistent with "retrieval fails first" from the
+  low-bit-K study.
+- **tile16c64 V2 beats whole-head PT2 V2 by +6.25 NIAH points at equal K**
+  (20.50 -> 26.75), while the same pair is a tie on LongBench (24.95 vs
+  25.04) — NIAH separates the V-cache designs that LongBench cannot.
+- **Q4_0 (4.5b, no sink/no recent window) is a near-fp16 NIAH reference**
+  (97.0 vs 97.62); its only visible dent is multikey_1@32k (78 vs fp16 86),
+  so exact retrieval is essentially intact at 4.5 bit even without any
+  protection policy.
+- fp16 shows no lost-in-the-middle at these lengths (uniformly green).
