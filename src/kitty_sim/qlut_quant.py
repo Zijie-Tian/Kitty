@@ -25,6 +25,28 @@ _SIDE_FP16 = {
 }
 CODEBOOKS = tuple(_CODEWORD_BITS.keys())
 
+# Symmetric NF2 (IR-QLoRA appendix B.2, Table 11): fixed normalized levels
+# {-1, -c, +c, +1}. The published +/- inner entries differ in the 8th decimal
+# (float artifacts); we symmetrize to the fp32 magnitude of the negative entry.
+# Nearest-neighbor boundary between inner and outer level is t = (1 + c) / 2;
+# a strict `>` sends the exact boundary to the INNER level, matching argmin's
+# first-hit tie rule over the sorted LUT. NOTE: this replaced the old adaptive
+# per-group Lloyd-Max "nf2" -- the codebook is now a FIXED LUT, only the group
+# mean mu and the absmax scale s are data-dependent (2 fp16 side values).
+NF2_INNER = 0.25256848335266113
+NF2_THRESH = (1.0 + NF2_INNER) / 2.0
+
+
+def nf2_symmetric_lastdim(r):
+    """Symmetric-NF2 snap of a ZERO-CENTERED group along the last axis:
+    per-group absmax scale s, closed-form nearest level sign(r)*s*(c or 1)
+    (no argmin tensor, no division -- s==0 all-zero groups reconstruct 0).
+    sign(0)==0 maps an exact-zero value to 0 (measure-zero event; the strict
+    LUT would give -c*s)."""
+    s = r.abs().amax(-1, keepdim=True)
+    level = torch.where(r.abs() > NF2_THRESH * s, s, NF2_INNER * s)
+    return torch.sign(r) * level
+
 
 def codebook_bits(name, group_size):
     return _CODEWORD_BITS[name] + 16.0 * _SIDE_FP16[name] / group_size
@@ -65,25 +87,11 @@ def apply_codebook(x, G, name):
         q = ((xg - mn) / scale).round().clamp(0, L - 1)
         rec = q * scale + mn
     elif name == "nf2":
-        rec = _lloyd(xg, L=4, iters=10)
+        mu = xg.mean(-1, keepdim=True)
+        rec = mu + nf2_symmetric_lastdim(xg - mu)
     else:
         raise ValueError(name)
     return _ungroup(rec, x, ng, G)
-
-
-def _lloyd(xg, L=4, iters=10):
-    lo = xg.min(-1, keepdim=True).values
-    hi = xg.max(-1, keepdim=True).values
-    lev = lo + (hi - lo) * (torch.arange(L, device=xg.device) + 0.5) / L
-    for _ in range(iters):
-        d = (xg.unsqueeze(-1) - lev.unsqueeze(-2)).abs()
-        a = d.argmin(-1)
-        oh = torch.nn.functional.one_hot(a, L).to(xg.dtype)
-        cnt = oh.sum(-2)
-        summ = (oh * xg.unsqueeze(-1)).sum(-2)
-        lev = torch.where(cnt > 0, summ / cnt.clamp(min=1), lev)
-    a = (xg.unsqueeze(-1) - lev.unsqueeze(-2)).abs().argmin(-1)
-    return torch.gather(lev, 3, a)
 
 
 def channel_sigma2(x_quant, G):

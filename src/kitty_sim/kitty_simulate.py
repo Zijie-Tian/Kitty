@@ -57,11 +57,11 @@ class KittyKVCacheConfig(CacheConfig):
         n_bins: int = 6,                          # qlut only: number of per-layer sigma^2 quantile bins
         pertoken_outlier_k: int = 0,              # per_token only: keep top-k peak-|magnitude| channels (per head, fixed) out of the shared per-token scale (dense-and-sparse). 0 = off.
         pertoken_outlier_bits: int = 4,           # per_token only: precision of the kept outlier channels (per-channel along token; >=16 = fp16)
-        pertoken_pc_submean: bool = False,        # per_token only: subtract a per-CHANNEL mean (cached at prefill, free for attention) then pure binary/ternary on the residual (qlutattn-k125v4-pt). NOT the per-token submean.
+        pertoken_pc_submean: bool = False,        # per_token only: subtract a per-CHANNEL mean (cached at prefill, free for attention) then a PURE per-token codebook on the residual (sign/tern/nf2; qlutattn-k125v4-pt / k185v4-pt / qlutattn-pertoken). NOT the per-token submean.
         pertoken_mixed: bool = False,             # per_token only: per-channel submean + sigma^2-binned MIXED codebook (ONLINE sigma^2, legacy k1.68v4-pt path); bin_codebooks = per-bin policy (low sigma^2 -> bin 0).
         pertoken_cb_mask: Optional[str] = None,   # per_token only: path to an OFFLINE per-(layer,head,channel) codebook mask (the corrected k168v4-pt). When set, each channel uses bin_codebooks[mask[c]] FIXED (offline sigma^2 calibration -> sign/tern), no online sigma^2 binning, no nf2.
         pertoken_rotate: bool = False,            # per_token only: Hadamard-rotate (FWHT) the per-channel-centered residual before per-token quant, de-rotate after (FWHT self-inverse). Spreads K outliers -> isotropic -> per-token sign/tern fits one scale. Free for attention (orthogonal; q.mu cancels). qlutattn-rotated-k*v4-pt.
-        pertoken_block: int = 1,                  # per_token only: # of consecutive tokens that SHARE one per-token codebook (Lloyd levels / sign-mag). 1 = current per-token (each token its own); >1 = block-shared (side-info amortized block x). Quant axis is unchanged (still head_dim).
+        pertoken_block: int = 1,                  # per_token only: # of consecutive tokens that SHARE one per-token codebook (nf2 absmax scale / sign-mag). 1 = current per-token (each token its own); >1 = block-shared (side-info amortized block x). Quant axis is unchanged (still head_dim).
         v_tile_tokens: Optional[int] = None,      # tile16_rescued only: fixed 16
         v_tile_channels: Optional[int] = None,    # tile16_rescued only: channel block C
         v_tile_algo_version: Optional[str] = None,# tile16_rescued only: "rht-pcaff-mse1-bias-v1"
@@ -437,8 +437,10 @@ class KittyKVCache(DynamicCache):
     @staticmethod
     def _pure_pt_codebook(sub, cb):
         """Per-token PURE codebook over `sub` [...,nch] (last axis = a sigma^2-bin's
-        channels of one token). sign/tern are pure (NO submean -- the residual is
-        already per-channel centered); nf2/uni2/etc. go through apply_codebook (Lloyd)."""
+        channels of one token). sign/tern/nf2 are pure (NO submean -- the residual
+        is already per-channel centered; nf2 = symmetric-NF2 LUT with an absmax
+        scale only, matching the masked decode path); uni2/etc. still go through
+        apply_codebook."""
         if cb == "sign":
             mag = sub.abs().mean(-1, keepdim=True)
             return torch.sign(sub) * mag
@@ -447,37 +449,29 @@ class KittyKVCache(DynamicCache):
             mask = sub.abs() > 0.5 * mag
             m2 = (sub.abs() * mask).sum(-1, keepdim=True) / mask.sum(-1, keepdim=True).clamp(min=1)
             return torch.sign(sub) * m2 * mask
+        if cb == "nf2":
+            from .qlut_quant import nf2_symmetric_lastdim
+            return nf2_symmetric_lastdim(sub)
         from .qlut_quant import apply_codebook
         return apply_codebook(sub, sub.shape[-1], cb)
 
     @staticmethod
-    def _masked_lloyd_lastdim(r, mb, L=4, iters=10):
-        """Vectorized masked Lloyd-Max along head_dim, matching qlut_quant._lloyd
-        but only over channels where mb is True (per [B,nh,T] row). Lets every head
-        run its per-bin nf2 quantizer in one shot (no per-head Python loop).
-        r:[B,nh,T,D] float, mb:[1,nh,1,D] bool -> reconstruction [B,nh,T,D] (caller
-        zeros the non-bin channels via *mb). Non-bin channels never affect the
-        levels (one-hot is masked), so this is numerically identical to extracting
-        the bin's channels and calling _lloyd on them."""
-        import torch.nn.functional as F
+    def _masked_nf2sym_lastdim(r, mb):
+        """Vectorized masked SYMMETRIC NF2 along head_dim (fixed IR-QLoRA LUT
+        {-1,-c,+c,+1}, c=NF2_INNER), only over channels where mb is True (per
+        [B,nh,T] row). The residual is already centered (per-channel mu_d on the
+        offline path), so there is NO second mean here: one masked absmax scale
+        s per group is the only side-info, then the closed-form snap
+        sign(r)*s*(c or 1). r:[B,nh,T,D] float, mb:[1,nh,1,D] bool ->
+        reconstruction [B,nh,T,D] (caller zeros non-bin channels via *mb).
+        Non-bin channels never affect s (masked amax); all-False rows get s=0
+        -> reconstruction 0, no inf/NaN (no division anywhere)."""
+        from .qlut_quant import NF2_INNER, NF2_THRESH
         neg = (~mb).expand_as(r)
-        lo = r.masked_fill(neg, float("inf")).amin(-1, keepdim=True)
-        hi = r.masked_fill(neg, float("-inf")).amax(-1, keepdim=True)
-        empty = lo > hi                                                # all-False row: a head with NO channel in this bin
-        lo = torch.where(empty, torch.zeros_like(lo), lo)             # avoid +inf/-inf -> NaN levels (this head is masked out anyway)
-        hi = torch.where(empty, torch.zeros_like(hi), hi)
-        ar = torch.arange(L, device=r.device, dtype=r.dtype)
-        lev = lo + (hi - lo) * (ar + 0.5) / L                          # [B,nh,T,L]
-        mbf = mb.to(r.dtype).unsqueeze(-1)                             # [1,nh,1,D,1]
-        for _ in range(iters):
-            d = (r.unsqueeze(-1) - lev.unsqueeze(-2)).abs()           # [B,nh,T,D,L]
-            a = d.argmin(-1)                                          # [B,nh,T,D]
-            oh = F.one_hot(a, L).to(r.dtype) * mbf                    # mask non-bin channels
-            cnt = oh.sum(-2)                                          # [B,nh,T,L]
-            summ = (oh * r.unsqueeze(-1)).sum(-2)
-            lev = torch.where(cnt > 0, summ / cnt.clamp(min=1), lev)
-        a = (r.unsqueeze(-1) - lev.unsqueeze(-2)).abs().argmin(-1)    # [B,nh,T,D]
-        return torch.gather(lev, -1, a)                              # [B,nh,T,D]
+        s = r.abs().masked_fill(neg, float("-inf")).amax(-1, keepdim=True)  # [B,nh,T,1]
+        s = torch.where(s.isinf(), torch.zeros_like(s), s)             # all-False row: a head with NO channel in this bin
+        level = torch.where(r.abs() > NF2_THRESH * s, s, NF2_INNER * s)
+        return torch.sign(r) * level
 
     @staticmethod
     def _pt_codebook_masked(r, m, cb):
@@ -512,7 +506,7 @@ class KittyKVCache(DynamicCache):
             q = ((r - mn) / scale).round().clamp(0, L - 1)
             return (q * scale + mn) * mb
         if cb == "nf2":
-            return KittyKVCache._masked_lloyd_lastdim(r, mb, L=4, iters=10) * mb
+            return KittyKVCache._masked_nf2sym_lastdim(r, mb) * mb
         if cb == "fp16":
             return r * mb
         raise ValueError(cb)
@@ -521,8 +515,8 @@ class KittyKVCache(DynamicCache):
         """Block-shared wrapper around _pt_codebook_masked. r:[B,nh,T,D], m:[nh,D].
         pertoken_block<=1 (or T<=1) -> call the core unchanged (bit-identical to the
         per-token path). block>1 -> flatten each block of `block` consecutive tokens'
-        (block,D) into the last dim so the core's last-dim reduce / Lloyd is SHARED
-        across the block (one codebook per block); the trailing T%block tokens form one
+        (block,D) into the last dim so the core's last-dim reduce (nf2 absmax scale
+        / sign-mag) is SHARED across the block; the trailing T%block tokens form one
         smaller block. Works for sign/tern/nf2/uni alike because the core only reduces
         and masks along the last axis. Any FWHT rotation is applied by the caller on
         [B,nh,T,D] before this and undone after; this wrapper restores [B,nh,T,D] so it
@@ -575,18 +569,19 @@ class KittyKVCache(DynamicCache):
     def _quant_k_pertoken(self, ks, layer_idx=0):
         """Per-token K quant of a [B,nh,T,D] slice: one quantizer per token per
         head along head_dim (like the KIVI-style V cache). k_codebook='qlut'
-        applies a SINGLE submean codebook along head_dim -- sigma^2 binning has no
-        per-channel axis in per-token mode, so bin_codebooks[0] is used for every
-        token (mu = per-token mean over head_dim channels); 'kivi' uses uniform
-        min-max. Pair with a SmoothAttention checkpoint to flatten per-channel
-        outliers that per-token sharing would otherwise smear into one scale.
+        applies bin_codebooks[0] per token; 'kivi' uses uniform min-max. All named
+        qlutattn per-token variants (offline mask / mixed / pc_submean incl.
+        qlutattn_pertoken) center on the PER-CHANNEL mean mu_d first; only the
+        legacy tail below (reachable via hand-built configs / the outlier probe)
+        still uses apply_codebook's per-token mean over head_dim channels.
 
         pertoken_outlier_k>0 adds dense-and-sparse isolation (the autoresearch
-        per-token champion): the top-k PEAK-|magnitude| channels per head (fixed,
-        found once at prefill -- they dominate the shared per-token scale) are
-        pulled out and quantized per-channel at pertoken_outlier_bits, while the
-        remaining channels get the per-token codebook with a scale computed over
-        ONLY them. k=8 @4bit + Lloyd (+ smoothed ckpt) is the winner."""
+        per-token champion, LEGACY per-token-mean axis): the top-k PEAK-|magnitude|
+        channels per head (fixed, found once at prefill -- they dominate the shared
+        per-token scale) are pulled out and quantized per-channel at
+        pertoken_outlier_bits, while the remaining channels get the per-token
+        codebook with a scale computed over ONLY them. k=8 @4bit + nf2 (+ smoothed
+        ckpt) was the Lloyd-era winner (nf2 is now the fixed symmetric-NF2 LUT)."""
         if self.k_codebook == "q4_0":
             # llama.cpp Q4_0 row semantics: symmetric absmax (d=max/-8) per
             # 32-channel block along head_dim. No submean, no promote, no bins.
@@ -596,11 +591,12 @@ class KittyKVCache(DynamicCache):
         from .qlut_quant import apply_codebook
         cb = self.bin_codebooks[0]
         B, nh, T, D = ks.shape
-        # k168v4-pt (corrected): OFFLINE sign/tern per-channel codebook. The channel->
-        # codebook assignment is fixed by offline sigma^2 calibration (self.k_cb_mask),
-        # NOT recomputed per prompt; the per-channel MEAN is still self-calibrated at
-        # prefill (free for attention). Per-token 2-codebook quant on the residual,
-        # vectorized across heads (reuses _pt_codebook_masked). No nf2, no online bins.
+        # k168/k188-v4-pt: OFFLINE per-channel codebook mask (sign/tern or sign/nf2).
+        # The channel->codebook assignment is fixed by offline sigma^2 calibration
+        # (self.k_cb_mask), NOT recomputed per prompt; the per-channel MEAN is still
+        # self-calibrated at prefill (free for attention). Per-token per-bin quant on
+        # the residual, vectorized across heads (reuses _pt_codebook_masked); nf2 bins
+        # use the symmetric-NF2 LUT with an absmax scale (no second mean). No online bins.
         if self.pertoken_offline:
             if layer_idx not in self.k_pc_mean and T >= D:
                 self.k_pc_mean[layer_idx] = ks[0].float().mean(dim=1)      # [nh,D] per-channel mean
@@ -663,7 +659,7 @@ class KittyKVCache(DynamicCache):
                 return (muB + out).to(ks.dtype)
             # Prefill: one big call. Keep the per-head extract loop -- it is already
             # GPU-efficient on the large tensor and far lighter on memory than a
-            # full-head_dim masked Lloyd over ~32k tokens.
+            # full-head_dim masked pass over ~32k tokens.
             out = torch.empty_like(r)
             for h in range(nh):
                 oh = torch.empty_like(r[:, h])                             # [B,T,D]
@@ -674,10 +670,11 @@ class KittyKVCache(DynamicCache):
                     oh[:, :, mask] = self._pure_pt_codebook(r[:, h][:, :, mask], policy[bi])
                 out[:, h] = oh
             return (muB + out).to(ks.dtype)
-        # k125v4-pt: subtract a per-CHANNEL mean (cached once at prefill, reused at
-        # decode -- free for attention since q.mu is a per-query constant that cancels
-        # in softmax), then PURE binary/ternary on the residual (NO second per-token
-        # submean). This is the confirmed per-token sign recipe (per-channel center).
+        # k125v4-pt / k185v4-pt / qlutattn_pertoken: subtract a per-CHANNEL mean
+        # (cached once at prefill, reused at decode -- free for attention since q.mu
+        # is a per-query constant that cancels in softmax), then a PURE per-token
+        # codebook on the residual (NO second per-token submean): sign/tern inline,
+        # nf2 = symmetric-NF2 absmax LUT, anything else via _pure_pt_codebook.
         if self.pertoken_pc_submean:
             if layer_idx not in self.k_pc_mean and T >= D:
                 self.k_pc_mean[layer_idx] = ks[0].float().mean(dim=1)      # [nh,D] per-channel mean over tokens
@@ -687,13 +684,19 @@ class KittyKVCache(DynamicCache):
             r = ks.float() - muB
             if self.pertoken_rotate:                                       # Hadamard-rotate residual into isotropic basis
                 r = self._fwht_lastdim(r)
-            mag = r.abs().mean(dim=3, keepdim=True)                        # [B,nh,T,1] per-token scale
             if cb == "tern":
+                mag = r.abs().mean(dim=3, keepdim=True)                    # [B,nh,T,1] per-token scale
                 mask = r.abs() > 0.5 * mag
                 mag2 = (r.abs() * mask).sum(3, keepdim=True) / mask.sum(3, keepdim=True).clamp(min=1)
                 q = torch.sign(r) * mag2 * mask
-            else:                                                          # "sign": pure 1-bit binary
+            elif cb == "sign":                                             # pure 1-bit binary
+                mag = r.abs().mean(dim=3, keepdim=True)                    # [B,nh,T,1] per-token scale
                 q = torch.sign(r) * mag
+            elif cb == "nf2":                                              # symmetric-NF2 LUT, absmax scale only
+                from .qlut_quant import nf2_symmetric_lastdim
+                q = nf2_symmetric_lastdim(r)
+            else:                                                          # uni2/...: pure per-token codebook on the residual
+                q = torch.stack([self._pure_pt_codebook(r[b], cb) for b in range(B)])
             if self.pertoken_rotate:                                       # de-rotate (FWHT self-inverse) back to original basis
                 q = self._fwht_lastdim(q)
             return (muB + q).to(ks.dtype)

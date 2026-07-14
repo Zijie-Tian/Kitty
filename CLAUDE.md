@@ -759,6 +759,30 @@ superseded (14.39 on 1B).
 
 ## ⭐ 默认推荐优化算法: `qlutattn_k188v4_pt`(per-token sign/nf2 σ²-mix,非旋转)
 
+> **nf2 语义变更(2026-07-14,symnf2-v1)。** 全仓库的 `nf2` 码本已从"每组在线
+> Lloyd-Max(k-means,10 轮)"替换为 **IR-QLoRA 对称 NF2 固定 LUT**:归一化电平
+> `{−1, −c, +c, +1}`,`c = 0.25256848`。两条路径的均值口径:per-token 掩码路径
+> (k188/k168/rotated 系)在 per-channel μ_d 中心化残差上**只做 absmax scale**
+> (无二次均值,side=1×fp16 → nf2 名义 **2.25b**,旧 Lloyd 记 2.5b),k188 旋钮公式
+> 改为 `bit = f·1.25 + (1−f)·2.25`(f=0.5 → **1.75b**);per-channel 分组路径
+> (`apply_codebook`,qlutattn-k1v4/pertoken)= 组内减 μ + absmax + LUT(side=2×fp16,
+> 2.25b@G=128 记账不变)。实现:`qlut_quant.nf2_symmetric_lastdim` /
+> `KittyKVCache._masked_nf2sym_lastdim`(闭式,无迭代,原 Lloyd 运行时瓶颈消失);
+> 0-GPU 测试 `tests/test_nf2_symmetric.py`。哈希隔离:`VariantConfig.nf2_impl="symnf2-v1"`
+> 进入 run_config_hash,旧 Lloyd manifest 的 resume/复用会响亮报错,非 nf2 变体哈希
+> 逐字节不变。**下文所有含 nf2 的分数(k188 全线、k1v4、pertoken-nf2、rotated-snf、
+> SNF V2/NIAH)均为 Lloyd 时代 legacy**,原始结果目录已移至
+> `archieve/longbench_out/`(含 smoke)与 `archieve/niah_out/`,对称 NF2 重测 pending。
+> 现有 `QLUT_CB_MASK` 掩码(σ² 排序)全部继续有效,无需重新标定;
+> `calibrate_k168v4_pt.py` 的 `--target-bits` 反解已按 nf2=2.25 更新。
+> **`qlutattn_pertoken` 同步改轴**:该变体现在也走 per-channel μ_d
+> (`pertoken_pc_submean=True`,与 k125/k188 同配方;旧的整头 per-token 均值是错误轴),
+> 该字段进语义哈希 → 它所有旧结果(含 sign/tern 码本)一并失效;遗留
+> `PERTOKEN_OUTLIER_K` 稠密-稀疏组合已显式拒绝(ValueError,不再接线)。另修复:
+> `QLUT_BIN_CODEBOOKS` 空字符串现在等价于未设置(run_exp.sh preflight 注入空串,
+> 旧行为会让 qlutattn_pertoken/k125v4_pt/rotated 系在 preflight 与 worker 间算出
+> 不同 bin_codebooks,触发 "Worker run_config_hash disagrees with shell preflight")。
+
 经过 sign/tern vs sign/nf2 的**全量 Pareto 扫描**(Llama-3.2-1B,21 数据集,32k,
 横轴 = K-cache 实际 bit/value 按比例算,纵轴 = LongBench 平均分),**非旋转的
 per-token sign/nf2 σ²-混合码本 `qlutattn_k188v4_pt` 是当前默认推荐的优化算法**:

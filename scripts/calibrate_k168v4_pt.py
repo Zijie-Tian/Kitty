@@ -33,8 +33,11 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "src"))
 from kitty_sim.qlut_quant import channel_sigma2  # noqa: E402
 
-# nominal per-token effective bits of each codebook (matches the k125/k185 names)
-BITS = {"sign": 1.25, "tern": 1.85, "nf2": 2.5}
+# nominal per-token effective bits of each codebook (matches the k125/k185 names).
+# nf2 is the fixed symmetric-NF2 LUT (IR-QLoRA) on the per-channel-centered
+# residual: 2-bit codeword + ONE fp16 absmax scale per token (no second mean)
+# -> 2 + 16/64 = 2.25 at head_dim 64 (the Lloyd era booked 2.5).
+BITS = {"sign": 1.25, "tern": 1.85, "nf2": 2.25}
 
 
 def parse_args():

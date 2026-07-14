@@ -1,5 +1,14 @@
 # QLUT-Attn k1v4 — σ²-binned K-cache Quantization
 
+> **nf2 semantics change (2026-07-14).** The `nf2` codebook is now a FIXED
+> **symmetric NF2 LUT** (IR-QLoRA appendix B.2): subtract the group mean μ,
+> absmax-normalize the residual and snap to `{−1, −0.252568, +0.252568, +1}`.
+> It is no longer the per-group Lloyd-Max (k-means) quantizer this document's
+> results were measured with. All nf2-involving scores below are **Lloyd-era
+> legacy** (the raw result dirs are archived under `archieve/`); symmetric-NF2
+> re-runs are pending. The Lloyd-specific rationale in §2/§3 (free levels fit
+> the bimodal arcsine modes) no longer applies to the fixed LUT.
+
 A per-channel **mixed-codebook** K-cache quantization strategy: within a layer,
 different K channels are quantized with **different codebooks**, chosen by the
 channel's residual energy σ². Bits are spent where quantization actually hurts —
@@ -78,13 +87,14 @@ All post-RoPE, per 128-token group; effective bit = codeword bits + fp16 side-in
 | `sign` | μ ± m (1 bit) | μ, m | 1.25 | 1-bit Lloyd-optimal residual |
 | `tern` | μ−m, μ, μ+m (log₂3) | μ, m | 1.83 | dead-zone three-level (τ=0.5) |
 | `uni2` | 4 (2 bit) | min, scale | 2.25 | uniform min-max 2-bit |
-| `nf2` | 4 (2 bit) | scale, zp | 2.25 | per-group Lloyd-optimal 4 levels |
+| `nf2` | 4 (2 bit) | μ, s | 2.25 | symmetric NF2 LUT `μ + s·{−1,−c,+c,+1}` |
 | `uni3` | 8 (3 bit) | min, scale | 3.25 | uniform min-max 3-bit |
 
-`nf2` runs a per-group 1-D Lloyd-Max (k-means, 10 iters) — the optimal 4-level scalar
-quantizer, which fits the bimodal (arcsine) distribution of fast-RoPE blue channels
-far better than uniform/tern. It is the runtime bottleneck; a deployable form is an
-offline-calibrated NF4-style fixed-shape codebook at the same 2.25 bit.
+`nf2` is the FIXED symmetric NF2 LUT (IR-QLoRA): subtract the group mean μ, take the
+residual's absmax scale s, snap each value to the nearest of `{−1, −c, +c, +1}·s`
+with `c = 0.25256848`. Closed-form (one compare per value), no iterations — the old
+per-group Lloyd-Max (k-means, 10 iters) implementation is gone; scores measured with
+it are marked Lloyd-era legacy.
 
 ### Bit accounting (winner, Llama-3.2-1B, 6 equal bins ≈ 16.7% each)
 
@@ -114,7 +124,8 @@ channels where the marginal accuracy gain is large — a rate-distortion bit-all
 
 ## 4. Implementation
 
-- `src/kitty_sim/qlut_quant.py` — codebooks (`apply_codebook`), Lloyd (`_lloyd`),
+- `src/kitty_sim/qlut_quant.py` — codebooks (`apply_codebook`), symmetric NF2
+  (`nf2_symmetric_lastdim`, constants `NF2_INNER`/`NF2_THRESH`),
   σ² binning (`channel_sigma2`, `sigma2_bins`, `compute_sigma_bins`), buffer quant
   (`fake_quant_qlut_buffer`), and offline-proxy helpers (`apply_qlut`,
   `effective_bits`).
@@ -223,9 +234,9 @@ exactly on the retrieval-critical high-σ² channels.
 
 - Pure-torch `kitty_sim` fake-quant: accuracy proxy only, **no memory/speed savings**;
   a real kernel needs mixed-codebook packing.
-- `nf2` is measured as the per-group Lloyd upper bound; deployable form is an
-  offline-calibrated NF4-style fixed-shape codebook (same 2.25 bit). Lloyd k-means is
-  the runtime bottleneck for the LongBench eval.
+- The tabled nf2 scores were measured with the old per-group Lloyd upper bound;
+  since 2026-07-14 `nf2` IS the deployable fixed-shape codebook (symmetric NF2 LUT,
+  same 2.25 bit) and the Lloyd runtime bottleneck is gone. Re-measured scores pending.
 - Validated on Llama-3.2-1B only. Qwen3-8B has a different σ² mix (more genuine
   heavy-tail "blue" channels) and may favor a different policy.
 - Post-RoPE only by design (preserves the int path). de-RoPE is more accurate on

@@ -28,6 +28,11 @@ from .config import LONG_BENCH_DATASETS, LONG_BENCH_E_DATASETS, load_json_config
 from .data import default_data_root, load_longbench_dataset
 from .templates import format_longbench_prompt, infer_model_family, post_process
 
+# nf2 algorithm generation stamped into run_config_hash via VariantConfig.nf2_impl.
+# "symnf2-v1" = fixed symmetric NF2 LUT (IR-QLoRA), replacing the unversioned
+# Lloyd-Max era. Bump on any future nf2 semantics change.
+NF2_IMPL_VERSION = "symnf2-v1"
+
 
 @dataclass(frozen=True)
 class VariantConfig:
@@ -89,9 +94,15 @@ class VariantConfig:
     # qlutattn-rotated-k*v4-pt: Hadamard-rotate the per-channel-centered residual before per-token quant.
     pertoken_rotate: bool = False
     # block-shared per-token codebook: # of consecutive tokens that SHARE one per-token
-    # codebook (Lloyd levels / sign-mag). 1 = per-token (current); >1 = block-shared
+    # codebook (nf2 absmax scale / sign-mag). 1 = per-token (current); >1 = block-shared
     # (side-info amortized block x). Only the offline per-token paths honor it.
     pertoken_block: int = 1
+    # nf2 implementation marker: "symnf2-v1" whenever the effective codebooks include
+    # "nf2" (static bin_codebooks or the offline mask blob), None otherwise. Purely a
+    # run_config_hash version gate -- Lloyd-era nf2 manifests must NOT be resumed or
+    # reused after the symmetric-NF2 (IR-QLoRA LUT) switch. variant_semantic_payload
+    # drops the key when None so non-nf2 variants keep their historical hashes.
+    nf2_impl: Optional[str] = None
     # Triton QUEST page-selection overlay for sim/fake-quant variants.
     # Query-aware sparse decode lives in an attention-forward hook because the HF
     # Cache.update() interface does not receive Q. The decode attention itself is
@@ -408,7 +419,34 @@ def validate_new_v2_preload(args: Any, variant: VariantConfig, model_family: str
     )
 
 
+def _mask_blob_codebooks(mask_path: str) -> tuple[str, ...]:
+    """Codebook names carried by an offline QLUT_CB_MASK blob (empty on absence).
+    The runtime cache trusts the blob's `codebooks` over the variant's static
+    bin_codebooks, so the nf2 marker must consult the blob too."""
+    blob = torch.load(mask_path, map_location="cpu", weights_only=False)
+    return tuple(blob.get("codebooks") or ())
+
+
+def _apply_nf2_impl_marker(config: VariantConfig) -> VariantConfig:
+    """Stamp nf2_impl on variants whose effective codebooks include "nf2".
+
+    This is a pure run_config_hash version gate for the symmetric-NF2 switch
+    (Lloyd-era nf2 results must not be resumed/reused). Variants without nf2
+    keep nf2_impl=None, and variant_semantic_payload drops the None key, so
+    their historical hashes stay byte-identical."""
+    effective = set(config.bin_codebooks or ())
+    if config.pertoken_cb_mask:
+        effective.update(_mask_blob_codebooks(config.pertoken_cb_mask))
+    if "nf2" in effective:
+        return replace(config, nf2_impl=NF2_IMPL_VERSION)
+    return config
+
+
 def build_variant(args: Any) -> VariantConfig:
+    return _apply_nf2_impl_marker(_build_variant_impl(args))
+
+
+def _build_variant_impl(args: Any) -> VariantConfig:
     variant = args.variant.lower()
     # Normalize hyphen aliases for the new V2 family early.
     _alias = {
@@ -549,11 +587,12 @@ def build_variant(args: Any) -> VariantConfig:
             channel_selection=0, k_quant_mode="per_token", pertoken_cb_mask=mask,
             pertoken_block=pt_block)
     if variant in ("qlutattn_k188v4_pt", "qlutattn-k188v4-pt"):
-        # NEW sibling of k168v4-pt: per-token K with an OFFLINE per-channel sign/nf2 codebook.
-        # Each post-RoPE K channel is assigned sign(1.25b, low σ²) or nf2(2.5b, high σ²) once
-        # offline (scripts/calibrate_k168v4_pt.py --codebooks sign,nf2; default ~50/50 ->
-        # nominal ~1.88b). Mask via QLUT_CB_MASK (its codebooks override bin_codebooks at load).
-        # Same machinery as k168v4-pt but the rich codebook is nf2 (Lloyd) instead of tern.
+        # Sibling of k168v4-pt: per-token K with an OFFLINE per-channel sign/nf2 codebook.
+        # Each post-RoPE K channel is assigned sign(1.25b, low σ²) or nf2(2.25b, high σ²) once
+        # offline (scripts/calibrate_k168v4_pt.py --codebooks sign,nf2; default ~50/50).
+        # Mask via QLUT_CB_MASK (its codebooks override bin_codebooks at load). Same machinery
+        # as k168v4-pt but the rich codebook is nf2 (symmetric-NF2 LUT, absmax scale on the
+        # per-channel-centered residual -- no second mean) instead of tern.
         mask = os.environ.get("QLUT_CB_MASK", "")
         if not mask or not os.path.exists(mask):
             raise FileNotFoundError(
@@ -573,8 +612,9 @@ def build_variant(args: Any) -> VariantConfig:
         # mu is amortized/free), V per-token 4-bit. This is the confirmed
         # per-token sign recipe: per-channel center fixes the broken per-token
         # submean (+0.26 overlap vs the naive per-token sign). QLUT_BIN_CODEBOOKS
-        # picks sign (default) or tern.
-        cb = os.environ.get("QLUT_BIN_CODEBOOKS", "sign")
+        # picks sign (default) or tern; empty string = unset sentinel (run_exp.sh
+        # preflight injects "" -- must resolve identically to the worker's unset).
+        cb = os.environ.get("QLUT_BIN_CODEBOOKS") or "sign"
         return VariantConfig(
             name="qlutattn_k125v4_pt", use_kitty=True, k_codebook="qlut",
             bin_codebooks=(cb,), n_bins=1, vbits=4, promote_ratio=0.0,
@@ -656,8 +696,9 @@ def build_variant(args: Any) -> VariantConfig:
         # then FWHT-rotate the residual into an isotropic basis so one per-token
         # scale fits all channels (spreads post-RoPE K outliers), pure 1-bit sign,
         # then de-rotate (FWHT self-inverse). ~1.25 bit K, V 4-bit. Rotation is
-        # free for attention (orthogonal). QLUT_BIN_CODEBOOKS picks sign/tern.
-        cb = os.environ.get("QLUT_BIN_CODEBOOKS", "sign")
+        # free for attention (orthogonal). QLUT_BIN_CODEBOOKS picks sign/tern
+        # (empty string = unset sentinel, matches the run_exp.sh preflight).
+        cb = os.environ.get("QLUT_BIN_CODEBOOKS") or "sign"
         return VariantConfig(
             name="qlutattn_rotated_k125v4_pt", use_kitty=True, k_codebook="qlut",
             bin_codebooks=(cb,), n_bins=1, vbits=4, promote_ratio=0.0,
@@ -666,7 +707,8 @@ def build_variant(args: Any) -> VariantConfig:
     if variant in ("qlutattn_rotated_k185v4_pt", "qlutattn-rotated-k185v4-pt"):
         # ROTATED per-token tern (k185v4-pt + Hadamard): ternary codebook on the
         # rotated per-channel-centered residual. ~1.84 bit K, V 4-bit.
-        cb = os.environ.get("QLUT_BIN_CODEBOOKS", "tern")
+        # Empty QLUT_BIN_CODEBOOKS = unset sentinel (run_exp.sh preflight).
+        cb = os.environ.get("QLUT_BIN_CODEBOOKS") or "tern"
         return VariantConfig(
             name="qlutattn_rotated_k185v4_pt", use_kitty=True, k_codebook="qlut",
             bin_codebooks=(cb,), n_bins=1, vbits=4, promote_ratio=0.0,
@@ -704,22 +746,28 @@ def build_variant(args: Any) -> VariantConfig:
             channel_selection=0, k_quant_mode="per_token",
             pertoken_cb_mask=mask, pertoken_rotate=True, pertoken_block=pt_block)
     if variant in ("qlutattn_pertoken", "qlut_pertoken"):
-        # qlutattn-k1v4 turned per-token: a SINGLE submean codebook applied along
-        # head_dim per token (sigma^2 binning has no per-channel axis in per-token
-        # mode, so QLUT_BIN_CODEBOOKS gives one codebook, default nf2). V per-token
-        # 4-bit, no promote. Pair with a SmoothAttention checkpoint
-        # (scripts/calibrate_smooth_qk.py) to flatten per-channel K outliers that
-        # the shared per-token scale would otherwise smear.
-        cb = os.environ.get("QLUT_BIN_CODEBOOKS", "nf2")
-        # PERTOKEN_OUTLIER_K>0 enables dense-and-sparse isolation (champion: 8 @4bit
-        # + smoothed ckpt). PERTOKEN_OUTLIER_BITS = per-channel precision of the kept.
-        ok = int(os.environ.get("PERTOKEN_OUTLIER_K", "0"))
-        obits = int(os.environ.get("PERTOKEN_OUTLIER_BITS", "4"))
+        # qlutattn-k1v4 turned per-token: a SINGLE codebook applied along head_dim
+        # per token (sigma^2 binning has no per-channel axis in per-token mode, so
+        # QLUT_BIN_CODEBOOKS gives one codebook, default nf2). V per-token 4-bit,
+        # no promote. Since the symnf2 switch this variant centers on the
+        # PER-CHANNEL mean mu_d (pertoken_pc_submean=True, same recipe/axis as
+        # k125v4_pt/k188v4_pt; the old per-token submean was the wrong axis) --
+        # the flag also invalidates every legacy per-token-mean run_config_hash.
+        # Empty QLUT_BIN_CODEBOOKS = unset sentinel (run_exp.sh preflight
+        # injects "").
+        cb = os.environ.get("QLUT_BIN_CODEBOOKS") or "nf2"
+        ok = int(os.environ.get("PERTOKEN_OUTLIER_K", "0") or "0")
+        if ok > 0:
+            raise ValueError(
+                "qlutattn_pertoken now uses per-channel mean removal "
+                "(pertoken_pc_submean); the legacy PERTOKEN_OUTLIER_K "
+                "dense-and-sparse path (per-token mean axis) is no longer wired "
+                f"to this variant. Unset PERTOKEN_OUTLIER_K (got {ok}).")
         return VariantConfig(
             name="qlutattn_pertoken", use_kitty=True, k_codebook="qlut",
             bin_codebooks=(cb,), n_bins=1, vbits=4, promote_ratio=0.0,
             channel_selection=0, k_quant_mode="per_token",
-            pertoken_outlier_k=ok, pertoken_outlier_bits=obits)
+            pertoken_pc_submean=True)
     if variant in ("llamacpp_q40", "llamacpp-q40"):
         # llama.cpp Q4_0 KV cache, faithful port (sim fake-quant): K and V both
         # per-token with 32-channel symmetric absmax blocks (d = signed_max/-8,
@@ -944,6 +992,10 @@ def variant_semantic_payload(variant: VariantConfig) -> dict[str, Any]:
     payload = asdict(variant)
     mask_path = payload.pop("pertoken_cb_mask", None)
     payload.pop("promote_ratio_config_path", None)
+    # Drop the nf2 marker when unset so variants without nf2 keep the exact
+    # pre-symnf2 payload (their historical run_config_hashes stay valid).
+    if payload.get("nf2_impl") is None:
+        payload.pop("nf2_impl", None)
     payload["mask_sha256"] = _sha256_file(mask_path) if mask_path else None
     return payload
 
