@@ -320,6 +320,26 @@ def load_qlutattn_mask_blob(mask_path: str) -> dict[str, Any]:
             f"qlutattn requires an exact {QLUTATTN_SIGN_FRACTION:.0%} sign "
             f"channel fraction; the mask in {mask_path} has {sign_frac:.6f}"
         )
+    # Token-tier fields: blob and QLUT_TOKEN_TIER env must agree (fail-fast
+    # before any GPU work; kitty_simulate re-checks at cache init).
+    tier_env = os.environ.get("QLUT_TOKEN_TIER", "").strip() == "1"
+    tier_blob = "tier_hi_mask" in blob
+    if tier_env != tier_blob:
+        raise ValueError(
+            f"QLUT_TOKEN_TIER={'1' if tier_env else '<unset>'} but the mask blob "
+            f"{'has' if tier_blob else 'lacks'} tier_hi_mask ({mask_path})")
+    if tier_blob:
+        if not research:
+            raise ValueError(f"token-tier masks require QLUT_RESEARCH=1 ({mask_path})")
+        hm = blob["tier_hi_mask"]
+        if not isinstance(hm, torch.Tensor) or hm.shape != mask.shape or hm.dtype != torch.uint8:
+            raise ValueError(f"tier_hi_mask must be uint8 with shape {tuple(mask.shape)} ({mask_path})")
+        if not set(torch.unique(hm).tolist()) <= {0, 1}:
+            raise ValueError(f"tier_hi_mask values must be within {{0,1}} ({mask_path})")
+        rho = float(blob.get("tier_rho", -1.0))
+        win = int(blob.get("tier_window", 0))
+        if not (0.0 < rho < 1.0) or win <= 0:
+            raise ValueError(f"tier_rho in (0,1) and tier_window > 0 required ({mask_path})")
     if research:
         # stderr: run_exp.sh preflight parses this process's stdout as JSON.
         fracs = {cb: float((mask == ci).float().mean()) for ci, cb in enumerate(codebooks)}
@@ -945,6 +965,15 @@ def load_model_and_tokenizer(
         local_files_only=local_files_only,
     )
     model_obj.eval()
+    # Research token-tier needs this layer's post-RoPE queries at cache.update
+    # time; the tap wraps the llama rope helper (llama family only).
+    if os.environ.get("QLUT_TOKEN_TIER", "").strip() == "1":
+        if "llama" not in model_family:
+            raise ValueError(
+                f"QLUT_TOKEN_TIER=1 supports the llama rope path only; got model_family={model_family}")
+        from kitty_sim.token_tier import install_rope_q_tap
+        install_rope_q_tap()
+        print("[qlutattn-token-tier] rope q-tap installed", file=sys.stderr)
     return model_obj, tokenizer, resolved
 
 

@@ -63,6 +63,11 @@ def main():
     p.add_argument("--rope-pairs", action="store_true",
                    help="bind RoPE rotation pairs (d, d+D/2): rank pairs by their mean signal and assign both "
                         "members the same codebook (structural prior: q.k error couples within a pair)")
+    p.add_argument("--tier-hi-frac", type=float, default=None,
+                   help="token-tier: fraction rho of tokens per head promoted to the all-nf2 HIGH mask at "
+                        "prefill (observation-window attention scoring; runtime needs QLUT_TOKEN_TIER=1)")
+    p.add_argument("--tier-window", type=int, default=64,
+                   help="token-tier: number of trailing prompt queries in the observation window")
     p.add_argument("--output", required=True)
     args = p.parse_args()
 
@@ -145,12 +150,27 @@ def main():
         "research_base": str(Path(args.base)),
         "research_layer_fracs": overrides or None,
     })
+    tier_note = ""
+    if args.tier_hi_frac is not None:
+        rho = args.tier_hi_frac
+        if not (0.0 < rho < 1.0):
+            raise ValueError("--tier-hi-frac must be in (0, 1)")
+        out.update({
+            "tier_hi_mask": torch.ones(nl, n_kv, D, dtype=torch.uint8),  # all-nf2 HIGH mask
+            "tier_rho": rho,
+            "tier_window": args.tier_window,
+        })
+        # rho of tokens at 2.25b, rest at the LOW mask width, + 1 tier bit per
+        # (head, token) amortized over D channels.
+        nominal = (1 - rho) * nominal + rho * BITS["nf2"] + 1.0 / D
+        out["nominal_bits"] = nominal
+        tier_note = f" tier(rho={rho}, W={args.tier_window}, hi=all-nf2)"
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     torch.save(out, args.output)
     print(f"[research-mask] {args.output}")
     sched = f" layer-overrides={overrides}" if overrides else ""
     print(f"[research-mask] signal={args.signal} global sign={fs:.4f} "
-          f"-> nominal K {nominal:.4f} bit/value{sched}")
+          f"-> nominal K {nominal:.4f} bit/value{sched}{tier_note}")
 
 
 if __name__ == "__main__":

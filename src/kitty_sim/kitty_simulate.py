@@ -4,6 +4,8 @@
 from typing import Optional, Any
 from dataclasses import dataclass
 import argparse
+import os
+import sys
 
 import torch
 try:
@@ -346,6 +348,32 @@ class KittyKVCache(DynamicCache):
                 self.bin_codebooks = list(_cbs)
             print(f"[qlutattn-offline] loaded codebook mask {tuple(_m.shape)} from "
                   f"{self.pertoken_cb_mask_path} codebooks={self.bin_codebooks}")
+            # Research token-tier (QLUT_TOKEN_TIER=1): prefill observation-window
+            # attention promotes the top rho tokens per head to the HIGH channel
+            # mask; everything else (and all decode-time tokens in v1) uses the
+            # regular LOW mask above. Blob and env must agree (fail-fast against
+            # silently mislabeled runs).
+            _tier_env = os.environ.get("QLUT_TOKEN_TIER", "").strip() == "1"
+            _tier_blob = "tier_hi_mask" in _blob
+            if _tier_env != _tier_blob:
+                raise ValueError(
+                    f"QLUT_TOKEN_TIER={'1' if _tier_env else '<unset>'} but mask blob "
+                    f"{'has' if _tier_blob else 'lacks'} tier_hi_mask "
+                    f"({self.pertoken_cb_mask_path}); refusing a mislabeled run")
+            self.token_tier = _tier_env
+            self.k_tier_hi_mask: dict[int, torch.Tensor] = {}
+            self.tier_rho: Optional[float] = None
+            self.tier_window: Optional[int] = None
+            if self.token_tier:
+                _hm = _blob["tier_hi_mask"]
+                for _li in range(_hm.shape[0]):
+                    self.k_tier_hi_mask[_li] = _hm[_li].long()
+                self.tier_rho = float(_blob["tier_rho"])
+                self.tier_window = int(_blob["tier_window"])
+                print(f"[qlutattn-token-tier] rho={self.tier_rho} window={self.tier_window} "
+                      f"hi=all-nf2 prefill-only", file=sys.stderr)
+        else:
+            self.token_tier = False
         # per-token K settled-token pointer: prefill sets it, decode advances it,
         # so chunked/multi-token decode cannot leave an fp16 gap.
         self.k_pt_quant_end: dict[int, int] = {}
@@ -410,7 +438,7 @@ class KittyKVCache(DynamicCache):
             return KittyKVCache._masked_nf2sym_lastdim(r, mb) * mb
         raise ValueError(cb)
 
-    def _quant_k_pertoken(self, ks, layer_idx=0):
+    def _quant_k_pertoken(self, ks, layer_idx=0, tier=None):
         """Per-token K quant of a [B,nh,T,D] slice: one quantizer per token per
         head along head_dim (like the KIVI-style V cache).
 
@@ -445,13 +473,31 @@ class KittyKVCache(DynamicCache):
         if cb_id.device != ks.device:
             cb_id = cb_id.to(ks.device)
             self.k_cb_mask[layer_idx] = cb_id
+        out = self._pt_apply_cb_mask(r, cb_id)
+        if tier is not None:
+            # Research token-tier: rows flagged True are re-quantized with the
+            # HIGH channel mask instead (same sign/nf2 codebooks, different
+            # channel assignment). tier: [nh, T] bool for this slice.
+            hi_id = self.k_tier_hi_mask.get(layer_idx)
+            if hi_id is None:
+                raise RuntimeError(f"token-tier hi mask missing for layer {layer_idx}")
+            if hi_id.device != ks.device:
+                hi_id = hi_id.to(ks.device)
+                self.k_tier_hi_mask[layer_idx] = hi_id
+            out_hi = self._pt_apply_cb_mask(r, hi_id)
+            t = tier[None, :, :, None].to(r.dtype)                     # [1,nh,T,1]
+            out = out_hi * t + out * (1.0 - t)
+        return (muB + out).to(ks.dtype)
+
+    def _pt_apply_cb_mask(self, r, cb_id):
+        """Sum the per-token codebook reconstructions of one channel mask."""
         out = torch.zeros_like(r)
         for ci, cbk in enumerate(self.bin_codebooks):                  # ["sign", "nf2"]
             m = (cb_id == ci)                                          # [nh,D]
             if not m.any():
                 continue
             out = out + self._pt_codebook_masked(r, m, cbk)
-        return (muB + out).to(ks.dtype)
+        return out
 
     def _quant_k_buffer(self, key_slice_t, layer_idx):
         """Quantize a [B,nh,D,buffer] post-RoPE K buffer with the KIVI-style
@@ -752,8 +798,17 @@ class KittyKVCache(DynamicCache):
                     # 'qlut' = canonical qlutattn offline sign/nf2 mask; 'kivi' uniform.
                     k_end_idx = start_idx + (num_tokens - self.buffer_length)
                     if k_end_idx > start_idx:
+                        tier = None
+                        if getattr(self, "token_tier", False):
+                            from . import token_tier as _tt
+                            q_full = _tt.take_q()
+                            if q_full is not None and q_full.shape[2] == current_cache_length:
+                                sc = _tt.observation_scores(
+                                    q_full, current_key_cache, k_end_idx,
+                                    self.tier_window, current_key_cache.shape[1])
+                                tier = _tt.tier_from_scores(sc, self.tier_rho)[:, start_idx:k_end_idx]
                         ks = current_key_cache[:, :, start_idx:k_end_idx, :]
-                        ks = self._quant_k_pertoken(ks, layer_idx)
+                        ks = self._quant_k_pertoken(ks, layer_idx, tier=tier)
                         current_key_cache[:, :, start_idx:k_end_idx, :] = ks
                         # remember the absolute token index we quantized up to,
                         # so the decode pointer resumes here.
