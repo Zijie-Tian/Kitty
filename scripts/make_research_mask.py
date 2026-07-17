@@ -55,6 +55,9 @@ def main():
     p.add_argument("--sign-frac", type=float, required=True, help="global sign fraction in [0,1]")
     p.add_argument("--signal", default="sigma2", choices=["sigma2", "sigma2_x_q", "q_abs"])
     p.add_argument("--qstats", default=None, help="q_absmean blob for query-aware signals")
+    p.add_argument("--q-power", type=float, default=1.0,
+                   help="temper the |q| factor: signal = sigma2 * E|q|^alpha (alpha<1 pulls the "
+                        "ranking toward the domain-neutral sigma2; mitigates calib-domain bias)")
     p.add_argument("--layer-fracs", default=None,
                    help="per-layer sign-frac overrides 'L:f,L:f'; other layers rebalance to keep the global budget")
     p.add_argument("--per-head", action="store_true",
@@ -89,6 +92,7 @@ def main():
         qmag = qb["q_absmean"].float()                              # [nl, n_kv, D]
         if qmag.shape != sigma2.shape:
             raise ValueError(f"qstats shape {tuple(qmag.shape)} != sigma2 {tuple(sigma2.shape)}")
+        qmag = qmag.clamp(min=1e-8).pow(args.q_power) if args.q_power != 1.0 else qmag
         signal = sigma2 * qmag if args.signal == "sigma2_x_q" else qmag
 
     N = n_kv * D
