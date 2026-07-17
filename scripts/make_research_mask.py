@@ -60,6 +60,9 @@ def main():
     p.add_argument("--per-head", action="store_true",
                    help="rank channels within each kv-head separately (each head gets the same sign fraction) "
                         "instead of the default layer-global ranking that lets loud heads take more nf2 budget")
+    p.add_argument("--rope-pairs", action="store_true",
+                   help="bind RoPE rotation pairs (d, d+D/2): rank pairs by their mean signal and assign both "
+                        "members the same codebook (structural prior: q.k error couples within a pair)")
     p.add_argument("--output", required=True)
     args = p.parse_args()
 
@@ -101,7 +104,18 @@ def main():
     per_layer_sign = []
     for li in range(nl):
         f_li = overrides.get(li, rest_frac if rest else args.sign_frac)
-        if args.per_head:
+        if args.rope_pairs:
+            half = D // 2
+            pair_sig = (signal[li, :, :half] + signal[li, :, half:]) / 2   # [n_kv, D/2]
+            n_pairs = n_kv * half
+            k_sign_p = int(round(f_li * n_pairs))
+            order = torch.argsort(pair_sig.reshape(-1))             # ascending, layer-global pairs
+            mp = torch.ones(n_pairs, dtype=torch.uint8)             # default nf2(1)
+            mp[order[:k_sign_p]] = 0
+            mp = mp.reshape(n_kv, half)
+            mask[li] = torch.cat([mp, mp], dim=1)                   # both pair members same codebook
+            per_layer_sign.append(k_sign_p * 2)
+        elif args.per_head:
             k_sign_h = int(round(f_li * D))
             m = torch.ones(n_kv, D, dtype=torch.uint8)              # default nf2(1)
             for hi in range(n_kv):
