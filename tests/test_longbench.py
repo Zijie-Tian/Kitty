@@ -77,13 +77,13 @@ class LongBenchTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 build_parser().parse_args(["Qwen/Qwen3-8B", "--variant", v])
 
-    def test_quest_kernel_env_overlays_qlutattn_without_variant_fork(self):
-        base = build_variant(SimpleNamespace(variant="qlutattn_k125v4_pt"))
+    def test_quest_kernel_env_overlays_kitty_without_variant_fork(self):
+        base = build_variant(SimpleNamespace(variant="kitty"))
         with patch.dict(os.environ, {"QUEST_KERNEL": "1", "QUEST_TOKEN_BUDGET": "1024"}, clear=False):
             variant = _maybe_enable_quest_kernel(base, SimpleNamespace())
         self.assertTrue(variant.quest_kernel)
         self.assertEqual(variant.quest_token_budget, 1024)
-        self.assertEqual(method_layout_slug(variant), "qlutattn-k125v4-pt-quest-kernel")
+        self.assertEqual(method_layout_slug(variant), "kitty-k2b4v2-pr0p125-quest-kernel")
 
     def test_flat_prediction_dir_does_not_append_variant_subdir(self):
         variant = build_variant(SimpleNamespace(variant="kitty"))

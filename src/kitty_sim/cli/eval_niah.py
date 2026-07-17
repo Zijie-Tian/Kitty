@@ -21,12 +21,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-family", default=None, help="Prompt family override, e.g. llama3.2")
     parser.add_argument("--variant", default="fp16", choices=_VARIANT_CHOICES)
     parser.add_argument(
-        "--v-tile-channels",
-        type=int,
-        default=None,
-        help="Channel block C for rescued V tile16cC variants (required for *_vtile16).",
-    )
-    parser.add_argument(
         "--tasks",
         default="niah_single_1,niah_single_2,niah_single_3,niah_multikey_1",
         help="CSV of RULER niah task names",

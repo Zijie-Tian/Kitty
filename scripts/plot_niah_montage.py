@@ -8,9 +8,8 @@ per-length task-mean accuracy under each panel title.
 Usage:
   PYTHONPATH=src python scripts/plot_niah_montage.py \
       --arms niah_out/llama32-1b-instruct_fp16 \
-             niah_out/llama32-1b-instruct_qlutattn-k125v2-pt \
-             ... \
-      --labels "fp16" "sign PT2" ... \
+             niah_out/llama32-1b-instruct_qlutattn \
+      --labels "fp16" "qlutattn" \
       --task pooled \
       --output niah_out/niah_heatmap_montage.png
 """

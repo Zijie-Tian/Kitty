@@ -1,6 +1,6 @@
-"""Triton QUEST sparse decode overlay for qlutattn/Kitty fake-quant caches.
+"""Triton QUEST sparse decode overlay for Kitty/KIVI fake-quant caches.
 
-The qlutattn family in ``kitty_sim`` stores a dense fake-quantized K/V history in
+The Kitty fake-quant variants in ``kitty_sim`` store a dense fake-quantized K/V history in
 ``KittyKVCache``.  QUEST page selection needs the post-RoPE query, so it cannot
 live inside ``Cache.update()``.  This module patches the HF attention forward:
 
@@ -362,7 +362,7 @@ def _quest_kernel_attention_forward(
 
     kv_cache = past_key_value if past_key_value is not None else past_key_values
     assert kv_cache is not None, (
-        "QUEST kernel requires a KittyKVCache via past_key_values (qlutattn fake-quant)."
+        "QUEST kernel requires a KittyKVCache via past_key_values (Kitty fake-quant)."
     )
     cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
     key_q, value_q = kv_cache.update(key_states, value_states, self.layer_idx, cache_kwargs)
@@ -409,7 +409,7 @@ def _quest_kernel_attention_forward(
 
 
 def install_quest_kernel(model: torch.nn.Module, quest_cfg: QuestConfig) -> dict[str, Any]:
-    """Patch attention layers to run Triton QUEST over qlutattn fake-quant K/V."""
+    """Patch attention layers to run Triton QUEST over Kitty fake-quant K/V."""
     stats: dict[str, Any] = {
         "installed": 0,
         "prefill_calls": 0,

@@ -1,4 +1,4 @@
-"""0-GPU core tests for V per-token2 + rescued tile16cC.
+"""0-GPU core tests for the rescued tile16cC V path (canonical qlutattn V).
 
 Literal tile oracle is an independent loop reference (does NOT call production
 helpers for expected values).
@@ -120,26 +120,7 @@ def _oracle_v4_whole_head(x: torch.Tensor) -> torch.Tensor:
     return (q * scale + mn).half()
 
 
-class TestPT2Core(unittest.TestCase):
-    def test_bit_exact_vs_groupwise(self):
-        torch.manual_seed(0)
-        for shape in ((1, 2, 7, 64), (2, 3, 5, 128)):
-            for scale in (0.0, 1e-5, 1.0, 30.0):
-                x = (torch.randn(*shape) * scale).half()
-                if scale == 0.0:
-                    x = torch.zeros(*shape).half()
-                got = vt.fake_quant_v_pertoken2(x)
-                expected = fake_quant_groupwise_lastdim(x, x.shape[-1], 2)
-                torch.testing.assert_close(got, expected, atol=0.0, rtol=0.0)
-
-    def test_whole_head_d64_d128(self):
-        for D in (64, 128):
-            x = torch.randn(1, 1, 3, D).half()
-            got = vt.fake_quant_v_pertoken2(x)
-            # One group per token: reconstructing with group_size=D matches.
-            exp = fake_quant_groupwise_lastdim(x, D, 2)
-            torch.testing.assert_close(got, exp, atol=0.0, rtol=0.0)
-
+class TestGroupwiseHelperRegression(unittest.TestCase):
     def test_v4_regression_unchanged_helper(self):
         torch.manual_seed(1)
         for D in (64, 128):
@@ -271,8 +252,6 @@ class TestTileOracle(unittest.TestCase):
         self.assertIn("power-of-two", str(ctx2.exception))
 
     def test_bit_accounting(self):
-        self.assertAlmostEqual(vt.theoretical_v_pt2_bits(64), 2.5)
-        self.assertAlmostEqual(vt.theoretical_v_pt2_bits(128), 2.25)
         b = vt.theoretical_v_tile_bits(16, 160)
         self.assertAlmostEqual(b, 2.0 + 32.0 / (16 * 16) + 48.0 / 160)
         full0 = vt.theoretical_v_tile_full_cache_bits(
@@ -288,8 +267,6 @@ class TestTileOracle(unittest.TestCase):
 
     def test_bit_accounting_rejects_impossible_states(self):
         with self.assertRaises(ValueError):
-            vt.theoretical_v_pt2_bits(0)
-        with self.assertRaises(ValueError):
             vt.theoretical_v_tile_bits(16, 17)  # partial token tile
         with self.assertRaises(ValueError):
             vt.theoretical_v_tile_bits(0, 16)
@@ -302,11 +279,6 @@ class TestTileOracle(unittest.TestCase):
         for kwargs in invalid_tile_kwargs:
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                 vt.theoretical_v_tile_full_cache_bits(**kwargs)
-        for tq in (-1, 201):
-            with self.subTest(T_quantized=tq), self.assertRaises(ValueError):
-                vt.theoretical_v_pt2_full_cache_bits(
-                    D=64, T_total=200, T_quantized=tq
-                )
 
     def test_frozen_stats_require_exact_shape_dtype_finite_and_positive_rms(self):
         torch.manual_seed(8)

@@ -164,19 +164,13 @@ class BuildVariantTests(unittest.TestCase):
 
     def test_config_rejected_for_non_kitty(self):
         path = self._write({"default": 0.5})
-        for bad in ("custom", "fp16", "kivi", "qlutattn_k1v4"):
+        for bad in ("custom", "fp16", "kivi"):
             with self.assertRaises(ValueError):
                 build_variant(SimpleNamespace(
                     variant=bad, promote_ratio_config=path,
                     sink_length=32, buffer_length=128, group_size=128,
                     kbits=2, vbits=2, promote_ratio=0.0, promote_bit=4, channel_selection=1,
                 ))
-
-    def test_deleted_variants_are_gone(self):
-        for gone in ("kitty_pro", "kitty_k1v4", "kitty_k1v4_xhead",
-                     "kitty_k1v2", "kitty_pertoken", "tern_uniform"):
-            with self.assertRaises(ValueError):
-                build_variant(SimpleNamespace(variant=gone, promote_ratio_config=None))
 
 
 class GetKvcacheKittyTests(unittest.TestCase):

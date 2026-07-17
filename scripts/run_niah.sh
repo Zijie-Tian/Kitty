@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
-# RULER-NIAH driver for the sign/SNF x PT2/vtile16 V2 study (+ fp16 ceiling).
+# RULER-NIAH driver: fp16 ceiling vs the canonical qlutattn variant.
 #
 # Serial over variants on ONE GPU; each variant loads the model once and loops
 # tasks x lengths internally, then the pred dir is scored and depth x length
 # heatmaps are rendered into <arm>/logs/.
 #
 # Usage:
-#   bash scripts/run_niah.sh --gpu 0 --variants fp16,qlutattn_k125v2_pt,qlutattn_k125v2_pt_vtile16,qlutattn_k188v2_pt,qlutattn_k188v2_pt_vtile16
+#   bash scripts/run_niah.sh --gpu 0 --variants fp16,qlutattn
 #   bash scripts/run_niah.sh --gpu 0 --variants fp16 --max-samples 2          # smoke
 #
 # Env (explicit env/CLI > .env):
 #   LLAMA32_MODEL_PATH  model checkpoint (default ~/models/Llama-3.2-1B-Instruct)
 #   MODEL_SLUG          output <model> segment (default llama32-1b-instruct)
 #   NIAH_DATA_ROOT      data root from scripts/prepare_niah_data.sh
-#   QLUT_CB_MASK        sign,nf2 f=0.5 mask (required by k188* arms)
-#   V_TILE_CHANNELS_CLI is not used here; pass --v-tile-channels (default 64 for *_vtile16)
+#   QLUT_CB_MASK        offline sign/nf2 f=0.5 codebook mask (required by the
+#                       qlutattn arm; scripts/calibrate_qlutattn_mask.py)
 
 set -euo pipefail
 
@@ -26,18 +26,17 @@ cd "${REPO_ROOT}"
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
 GPU="${GPU_ID:-1}"   # repo default is the GPU1-only rule; override with --gpu
-VARIANTS="fp16,qlutattn_k125v2_pt,qlutattn_k125v2_pt_vtile16,qlutattn_k188v2_pt,qlutattn_k188v2_pt_vtile16"
+VARIANTS="fp16,qlutattn"
 TASKS="${TASKS:-niah_single_1,niah_single_2,niah_single_3,niah_multikey_1}"
 LENS="${LENS:-4096,8192,16384,32768}"
 MAX_SAMPLES="${MAX_SAMPLES:--1}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-32768}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-128}"
-V_TILE_C="${V_TILE_C:-64}"
 
 MODEL_ID="${MODEL_ID:-meta-llama/Llama-3.2-1B-Instruct}"
 MODEL_PATH="${LLAMA32_MODEL_PATH:-${KITTY_LLAMA32_1B_PATH:-${HOME}/models/Llama-3.2-1B-Instruct}}"
 MODEL_SLUG="${MODEL_SLUG:-llama32-1b-instruct}"
-# Same family the LongBench vtile study used (llama3 = raw prompt, matches
+# Same family the LongBench study used (llama3 = raw prompt, matches
 # RULER's base template protocol).
 MODEL_FAMILY="${MODEL_FAMILY:-llama3}"
 NIAH_DATA_ROOT="${NIAH_DATA_ROOT:-${HOME}/data/ruler_niah/llama3}"
@@ -51,7 +50,6 @@ while [[ $# -gt 0 ]]; do
     --lens)            LENS="$2"; shift 2 ;;
     --max-samples)     MAX_SAMPLES="$2"; shift 2 ;;
     --max-model-len)   MAX_MODEL_LEN="$2"; shift 2 ;;
-    --v-tile-channels) V_TILE_C="$2"; shift 2 ;;
     *) echo "[run-niah] unknown argument: $1" >&2; exit 1 ;;
   esac
 done
@@ -64,13 +62,10 @@ fi
 method_slug() {
   local variant="$1"
   case "${variant}" in
-    fp16)                        echo "fp16" ;;
-    qlutattn_k125v2_pt)          echo "qlutattn-k125v2-pt" ;;
-    qlutattn_k188v2_pt)          echo "qlutattn-k188v2-pt" ;;
-    qlutattn_k125v2_pt_vtile16)  echo "qlutattn-k125v2-pt-vtile16c${V_TILE_C}-rv1" ;;
-    qlutattn_k188v2_pt_vtile16)  echo "qlutattn-k188v2-pt-vtile16c${V_TILE_C}-rv1" ;;
-    llamacpp_q40)                echo "llamacpp-q40" ;;
-    llamacpp_q40_star)           echo "llamacpp-q40-star" ;;
+    fp16)              echo "fp16" ;;
+    qlutattn)          echo "qlutattn" ;;
+    llamacpp_q40)      echo "llamacpp-q40" ;;
+    llamacpp_q40_star) echo "llamacpp-q40-star" ;;
     *) echo "" ;;
   esac
 }
@@ -98,41 +93,25 @@ for VARIANT in "${VARIANT_ARR[@]}"; do
     rm -rf "${pred_dir}" && mkdir -p "${pred_dir}"
   fi
 
-  # Per-arm env guards (mirrors the AGENTS.md sign/SNF V2 test method).
+  # Per-arm env guards: retired knobs are always passed as explicit-unset
+  # sentinels so a stale caller environment cannot leak into any arm.
   declare -a env_kv=(
     "CUDA_VISIBLE_DEVICES=${GPU}"
     "GPU_ID=${GPU}" "GPU_IDS_CSV=${GPU}"
     "TOKENIZERS_PARALLELISM=false"
     "PYTHONPATH=${REPO_ROOT}/src:${PYTHONPATH:-}"
     "NIAH_DATA_ROOT=${NIAH_DATA_ROOT}"
-    "PERTOKEN_BLOCK=1" "PROMOTE_RATIO_CONFIG=" "PROMPT_TOKEN_RESERVE=0"
+    "PERTOKEN_BLOCK=" "PROMOTE_RATIO_CONFIG=" "PROMPT_TOKEN_RESERVE=0"
+    "QLUT_BIN_CODEBOOKS=" "V_TILE_CHANNELS=" "PERTOKEN_OUTLIER_K="
     "QUEST_KERNEL=0" "QUEST_TRITON=0" "SIM_QUEST=0" "QUEST_SIM=0"
   )
-  declare -a extra_args=()
   case "${VARIANT}" in
-    fp16)
-      env_kv+=("VBITS=" "QLUT_BIN_CODEBOOKS=" "QLUT_CB_MASK=" "V_TILE_CHANNELS=")
+    qlutattn)
+      : "${QLUT_CB_MASK:?qlutattn needs QLUT_CB_MASK=/path/to/sign-nf2 f0.5 mask}"
+      env_kv+=("VBITS=2" "QLUT_CB_MASK=${QLUT_CB_MASK}")
       ;;
-    qlutattn_k125v2_pt)
-      env_kv+=("VBITS=2" "QLUT_BIN_CODEBOOKS=sign" "QLUT_CB_MASK=" "V_TILE_CHANNELS=")
-      ;;
-    qlutattn_k125v2_pt_vtile16)
-      env_kv+=("VBITS=2" "QLUT_BIN_CODEBOOKS=sign" "QLUT_CB_MASK=")
-      extra_args+=(--v-tile-channels "${V_TILE_C}")
-      ;;
-    qlutattn_k188v2_pt)
-      : "${QLUT_CB_MASK:?k188 arms need QLUT_CB_MASK=/path/to/sign-nf2 f0.5 mask}"
-      env_kv+=("VBITS=2" "QLUT_BIN_CODEBOOKS=" "QLUT_CB_MASK=${QLUT_CB_MASK}" "V_TILE_CHANNELS=")
-      ;;
-    qlutattn_k188v2_pt_vtile16)
-      : "${QLUT_CB_MASK:?k188 arms need QLUT_CB_MASK=/path/to/sign-nf2 f0.5 mask}"
-      env_kv+=("VBITS=2" "QLUT_BIN_CODEBOOKS=" "QLUT_CB_MASK=${QLUT_CB_MASK}")
-      extra_args+=(--v-tile-channels "${V_TILE_C}")
-      ;;
-    llamacpp_q40|llamacpp_q40_star)
-      # Q4_0 fixes the bit-width in the codebook; KBITS/VBITS/QLUT_* are
-      # ignored by the variant, so pass explicit-unset sentinels only.
-      env_kv+=("VBITS=" "QLUT_BIN_CODEBOOKS=" "QLUT_CB_MASK=" "V_TILE_CHANNELS=")
+    *)
+      env_kv+=("VBITS=" "QLUT_CB_MASK=")
       ;;
   esac
 
@@ -156,8 +135,7 @@ for VARIANT in "${VARIANT_ARR[@]}"; do
     --torch-dtype float16 \
     --local-files-only \
     --require-cuda-visible-devices "${GPU}" \
-    --report-json "${logs_dir}/report.json" \
-    "${extra_args[@]}" 2>&1 | tee "${logs_dir}/run.log"
+    --report-json "${logs_dir}/report.json" 2>&1 | tee "${logs_dir}/run.log"
   rc=${PIPESTATUS[0]}
   set -e
   if [[ ${rc} -ne 0 ]]; then

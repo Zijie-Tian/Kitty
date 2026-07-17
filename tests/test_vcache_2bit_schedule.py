@@ -1,4 +1,4 @@
-"""0-GPU schedule tests for V tile16cC + PT2 cache integration."""
+"""0-GPU schedule tests for the rescued V tile16cC cache integration."""
 
 from __future__ import annotations
 
@@ -16,12 +16,14 @@ from kitty_sim.v_tile_quant import (
     V_TILE_TOKENS,
     calibrate_and_quantize_first_v_tile_block,
     calibrate_and_quantize_v_tile_prompt,
-    fake_quant_v_pertoken2,
     quantize_v_tile_blocks_with_frozen_stats,
 )
 
 
 def _tile_cache(sink=32, recent=128, C=16, D=64, layers=1):
+    """Rescued tile16cC V cache with a generic per-token K (the canonical
+    qlutattn masked-K numerics are covered by tests/test_qlutattn_wiring.py
+    and tests/test_nf2_symmetric.py; here the subject is the V schedule)."""
     args = SimpleNamespace(
         sink_length=sink,
         buffer_length=recent,
@@ -32,44 +34,13 @@ def _tile_cache(sink=32, recent=128, C=16, D=64, layers=1):
         promote_bit=4,
         channel_selection=0,
         k_quant_mode="per_token",
-        k_codebook="qlut",
+        k_codebook="kivi",
         v_codebook="tile16_rescued",
-        bin_codebooks=["sign"],
-        n_bins=1,
-        pertoken_pc_submean=True,
-        pertoken_mixed=False,
-        pertoken_cb_mask=None,
-        pertoken_rotate=False,
-        pertoken_block=1,
         v_tile_tokens=V_TILE_TOKENS,
         v_tile_channels=C,
         v_tile_algo_version=V_TILE_ALGO_VERSION,
         v_rht_seed=V_RHT_SEED,
         v_mse_iters=V_MSE_ITERS,
-    )
-    return get_kvcache_kitty(args)
-
-
-def _pt2_cache(sink=32, recent=128):
-    args = SimpleNamespace(
-        sink_length=sink,
-        buffer_length=recent,
-        group_size=min(128, recent) if recent > 0 else 128,
-        kbits=2,
-        vbits=2,
-        promote_ratio=0.0,
-        promote_bit=4,
-        channel_selection=0,
-        k_quant_mode="per_token",
-        k_codebook="qlut",
-        v_codebook="per_token2",
-        bin_codebooks=["sign"],
-        n_bins=1,
-        pertoken_pc_submean=True,
-        pertoken_mixed=False,
-        pertoken_cb_mask=None,
-        pertoken_rotate=False,
-        pertoken_block=1,
     )
     return get_kvcache_kitty(args)
 
@@ -161,17 +132,6 @@ class TestVTileSchedule(unittest.TestCase):
         self.assertEqual(cache.v_tile_quant_end[0], qend + 16)
         self.assertEqual(cache.v_tile_blocks, 3)
 
-    def test_pt2_per_token_flush(self):
-        sink, recent = 4, 8
-        cache = _pt2_cache(sink=sink, recent=recent)
-        T = sink + recent + 5
-        cache.update(torch.randn(1, 1, T, 64).half(), torch.randn(1, 1, T, 64).half(), 0)
-        self.assertEqual(cache.last_v_quant_mode, "per_token2")
-        self.assertGreater(cache.v_quant_calls, 0)
-        calls = cache.v_quant_calls
-        cache.update(torch.randn(1, 1, 1, 64).half(), torch.randn(1, 1, 1, 64).half(), 0)
-        self.assertEqual(cache.v_quant_calls, calls + 1)
-
     def test_reset_clears_state(self):
         cache = _tile_cache(sink=4, recent=32, C=16)
         T = 4 + 32 + 37
@@ -183,7 +143,6 @@ class TestVTileSchedule(unittest.TestCase):
         self.assertEqual(len(cache.v_pc_rms), 0)
         self.assertEqual(len(cache.v_error_bias), 0)
         self.assertEqual(len(cache.v_tile_quant_end), 0)
-        self.assertEqual(len(cache.v_pt_quant_end), 0)
         self.assertEqual(len(cache.k_pt_quant_end), 0)
         self.assertEqual(cache.v_quant_calls, 0)
         self.assertEqual(cache.v_quantized_tokens, 0)
@@ -289,7 +248,7 @@ class TestVTileSchedule(unittest.TestCase):
         x = torch.randn(1, 2, 3, 16).half()
         got = cache._quant_v(0, x)
         expected = fake_quant_groupwise_lastdim(x, 8, 2)
-        whole_head = fake_quant_v_pertoken2(x)
+        whole_head = fake_quant_groupwise_lastdim(x, x.shape[-1], 2)
         torch.testing.assert_close(got, expected, atol=0.0, rtol=0.0)
         self.assertFalse(torch.equal(got, whole_head))
         self.assertIsNone(cache.last_v_quant_mode)
@@ -334,36 +293,6 @@ class TestVTileSchedule(unittest.TestCase):
         self.assertEqual(cache.v_tile_quant_end[0], sink + 32)
         self.assertEqual(cache.v_tile_blocks, 2)
         self.assertEqual(cache.k_pt_quant_end[0], sink + 32)
-
-    def test_pt2_multi_token_append_quantizes_every_settled_token(self):
-        sink, recent = 4, 8
-        torch.manual_seed(23)
-        cache = _pt2_cache(sink=sink, recent=recent)
-        T = sink + recent + 5
-        k0 = torch.randn(1, 1, T, 64).half()
-        v0 = torch.randn(1, 1, T, 64).half()
-        cache.update(k0, v0, 0)
-        old_qend = cache.v_pt_quant_end[0]
-        k1 = torch.randn(1, 1, 7, 64).half()
-        v1 = torch.randn(1, 1, 7, 64).half()
-        _, returned_v = cache.update(k1, v1, 0)
-        raw = torch.cat((v0, v1), dim=2)
-        ready_end = raw.shape[2] - recent
-        expected = fake_quant_v_pertoken2(raw[:, :, old_qend:ready_end, :])
-        torch.testing.assert_close(
-            returned_v[:, :, old_qend:ready_end, :],
-            raw[:, :, old_qend:ready_end, :],
-            atol=0.0,
-            rtol=0.0,
-        )
-        torch.testing.assert_close(
-            cache.value_cache[0][:, :, old_qend:ready_end, :],
-            expected,
-            atol=0.0,
-            rtol=0.0,
-        )
-        self.assertEqual(cache.v_pt_quant_end[0], ready_end)
-        self.assertEqual(cache.k_pt_quant_end[0], ready_end)
 
     def test_per_token_k_multi_token_append_is_exact(self):
         sink, recent, D = 4, 8, 16
@@ -520,12 +449,6 @@ class TestVTileSchedule(unittest.TestCase):
         self.assertEqual(cache.k_pt_quant_end[0], sink + 16)
         self.assertTrue(cache._v_tile_stats_ready(0))
 
-        pt = _pt2_cache(sink=sink, recent=recent)
-        pt.update(torch.randn(1, 1, T, 64).half(), torch.randn(1, 1, T, 64).half(), 0)
-        pt.crop(sink + 13)  # per-token V/K can crop at any token boundary
-        self.assertEqual(pt.v_pt_quant_end[0], sink + 13)
-        self.assertEqual(pt.k_pt_quant_end[0], sink + 13)
-
 
 class TestV2ConfigStrictness(unittest.TestCase):
     def _tile_kwargs(self):
@@ -533,8 +456,7 @@ class TestV2ConfigStrictness(unittest.TestCase):
             promote_ratio=0.0,
             channel_selection=0,
             k_quant_mode="per_token",
-            k_codebook="qlut",
-            bin_codebooks=["sign"],
+            k_codebook="kivi",
             v_codebook="tile16_rescued",
             vbits=2,
             v_tile_tokens=V_TILE_TOKENS,
@@ -564,10 +486,6 @@ class TestV2ConfigStrictness(unittest.TestCase):
         T = 4 + 32 + 16
         with self.assertRaisesRegex(ValueError, "FP16"):
             cache.update(torch.randn(1, 1, T, 64), torch.randn(1, 1, T, 64), 0)
-
-    def test_per_token2_requires_vbits2(self):
-        with self.assertRaises(ValueError):
-            KittyKVCacheConfig(v_codebook="per_token2", vbits=4)
 
 
 if __name__ == "__main__":

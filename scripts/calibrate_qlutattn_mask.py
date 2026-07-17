@@ -1,26 +1,25 @@
 # -*- coding: utf-8 -*-
-"""Offline calibration for qlutattn-k168v4-pt (sign/tern per-channel mix).
+"""Offline codebook-mask calibration for the canonical qlutattn variant.
 
-Design (per user): k168v4-pt is a per-token K quant where each post-RoPE K
-channel is assigned ONE of two codebooks OFFLINE by its residual sigma^2:
-  - low-sigma^2 channels  -> sign  (~1.25 bit, k125v4-pt)
-  - high-sigma^2 channels -> tern  (~1.85 bit, k185v4-pt)
-The split fraction is fixed here at calibration time (default targets a nominal
-~1.68 bit average), producing a per-(layer, kv-head, channel) codebook mask that
-the runtime loads and uses unchanged (NOT recomputed per prompt). No nf2, no
-online sigma^2 binning.
+qlutattn quantizes the post-RoPE K cache per token on the per-channel-mean-
+centered residual. Each channel is assigned ONE of two codebooks OFFLINE by
+its residual sigma^2 on a calibration corpus:
+  - the 50% lowest-sigma^2 channels  -> sign (1.25 bit nominal)
+  - the 50% highest-sigma^2 channels -> nf2  (symnf2-v1, 2.25 bit nominal)
+The split is FIXED at 50/50, giving a nominal K width of
+0.5 * 1.25 + 0.5 * 2.25 = 1.75 bit/value. The runtime loads the mask and uses
+it unchanged (NOT recomputed per prompt); there is no online sigma^2 binning.
 
-The per-channel MEAN is NOT calibrated here -- the runtime subtracts a per-channel
-mean self-calibrated from each prompt at prefill (free for attention, q.mu cancels
-in softmax), exactly like k125v4-pt/k185v4-pt. This script only fixes the cheap
-vs rich CODEBOOK assignment, which is a model-intrinsic property.
+The per-channel MEAN is NOT calibrated here -- the runtime subtracts a
+per-channel mean self-calibrated from each prompt at prefill (free for
+attention, q.mu cancels in softmax). This script only fixes the sign-vs-nf2
+CODEBOOK assignment, which is a model-intrinsic property.
 
 Run:
-  CUDA_VISIBLE_DEVICES=0 PYTHONPATH=src python scripts/calibrate_k168v4_pt.py \
-    --model /home/zijie/models/Llama-3.2-1B-Instruct \
+  CUDA_VISIBLE_DEVICES=0 PYTHONPATH=src python scripts/calibrate_qlutattn_mask.py \
+    --model /path/to/model \
     --calib-data /path/to/wikitext-2-raw-v1/train-00000-of-00001.parquet \
-    --target-bits 1.68 \
-    --output /home/zijie/models/Llama-3.2-1B-Instruct.k168v4pt_cbmask.pt
+    --output /path/to/model.qlutattn_mask.pt
 """
 import argparse
 import sys
@@ -33,11 +32,15 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "src"))
 from kitty_sim.qlut_quant import channel_sigma2  # noqa: E402
 
-# nominal per-token effective bits of each codebook (matches the k125/k185 names).
-# nf2 is the fixed symmetric-NF2 LUT (IR-QLoRA) on the per-channel-centered
-# residual: 2-bit codeword + ONE fp16 absmax scale per token (no second mean)
-# -> 2 + 16/64 = 2.25 at head_dim 64 (the Lloyd era booked 2.5).
-BITS = {"sign": 1.25, "tern": 1.85, "nf2": 2.25}
+# The canonical qlutattn codebook pair and split are fixed; they are not knobs.
+CODEBOOKS = ("sign", "nf2")
+SIGN_FRACTION = 0.5
+# nominal per-token bits: sign = 1-bit codeword + one fp16 scale per 64-channel
+# token group; nf2 = 2-bit symnf2-v1 codeword + one fp16 absmax scale (no
+# second mean).
+BITS = {"sign": 1.25, "nf2": 2.25}
+NOMINAL_K_BITS = SIGN_FRACTION * BITS["sign"] + (1 - SIGN_FRACTION) * BITS["nf2"]  # 1.75
+NF2_IMPL = "symnf2-v1"
 
 
 def parse_args():
@@ -48,15 +51,6 @@ def parse_args():
     p.add_argument("--sample-len", type=int, default=2048)
     p.add_argument("--group-size", type=int, default=128, help="sigma^2 submean group along tokens")
     p.add_argument("--skip-first", type=int, default=32, help="skip the sink window when measuring")
-    p.add_argument("--codebooks", default="sign,tern",
-                   help="two codebooks 'low_sigma,high_sigma' from sign/tern/nf2 "
-                        "(k168v4-pt=sign,tern; k188v4-pt=sign,nf2)")
-    p.add_argument("--target-bits", type=float, default=1.68,
-                   help="nominal avg bits -> low-codebook fraction reverse-solved from the two codebooks' bits")
-    p.add_argument("--sign-frac", type=float, default=None,
-                   help="override: fraction of lowest-sigma^2 channels assigned to the LOW codebook")
-    p.add_argument("--per-head", action="store_true",
-                   help="rank sigma^2 within each (layer,kv-head); default ranks per-layer over nh*D")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--output", required=True)
@@ -114,42 +108,25 @@ def collect_per_channel_sigma2(model, batches, skip_first, group_size, device):
     return accum / max(n, 1)
 
 
-def build_mask(sigma2, sign_frac, per_head):
-    """sigma2:[nl,n_kv,D] -> codebook mask [nl,n_kv,D] uint8 (0=sign, 1=tern).
-    Lowest-sigma^2 `sign_frac` channels -> sign, the rest -> tern."""
+def build_mask(sigma2):
+    """sigma2:[nl,n_kv,D] -> codebook mask [nl,n_kv,D] uint8 (0=sign, 1=nf2).
+    Per layer, the lowest-sigma^2 half of the nh*D channels -> sign, rest -> nf2."""
     nl, n_kv, D = sigma2.shape
-    mask = torch.ones(nl, n_kv, D, dtype=torch.uint8)           # default tern(1)
+    mask = torch.ones(nl, n_kv, D, dtype=torch.uint8)           # default nf2(1)
     for li in range(nl):
-        if per_head:
-            for h in range(n_kv):
-                flat = sigma2[li, h]                            # [D]
-                k = int(round(sign_frac * D))
-                if k > 0:
-                    idx = torch.argsort(flat)[:k]
-                    mask[li, h, idx] = 0
-        else:
-            flat = sigma2[li].reshape(-1)                       # [n_kv*D]
-            k = int(round(sign_frac * flat.numel()))
-            if k > 0:
-                idx = torch.argsort(flat)[:k]
-                m = mask[li].reshape(-1)
-                m[idx] = 0
-                mask[li] = m.reshape(n_kv, D)
+        flat = sigma2[li].reshape(-1)                           # [n_kv*D]
+        k = int(round(SIGN_FRACTION * flat.numel()))
+        if k > 0:
+            idx = torch.argsort(flat)[:k]
+            m = mask[li].reshape(-1)
+            m[idx] = 0
+            mask[li] = m.reshape(n_kv, D)
     return mask
 
 
 def main():
     args = parse_args()
     torch.manual_seed(args.seed)
-    cbs = [c.strip() for c in args.codebooks.split(",")]
-    if len(cbs) != 2 or any(c not in BITS for c in cbs):
-        raise ValueError(f"--codebooks must be two of {list(BITS)} (low_sigma,high_sigma); got {args.codebooks!r}")
-    lo, hi = cbs
-    if args.sign_frac is not None:
-        lo_frac = args.sign_frac
-    else:
-        lo_frac = (BITS[hi] - args.target_bits) / (BITS[hi] - BITS[lo])
-    lo_frac = float(min(max(lo_frac, 0.0), 1.0))
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
     t0 = time.time()
@@ -161,31 +138,27 @@ def main():
     n_kv = cfg.num_key_value_heads
     head_dim = getattr(cfg, "head_dim", None) or cfg.hidden_size // n_q
     print(f"[calib] model={args.model} layers={cfg.num_hidden_layers} q={n_q} kv={n_kv} D={head_dim}")
-    print(f"[calib] codebooks low={lo}({BITS[lo]}b)/high={hi}({BITS[hi]}b) "
-          f"target_bits={args.target_bits} -> low_frac={lo_frac:.3f} "
-          f"({'per-head' if args.per_head else 'per-layer'} sigma^2 ranking)")
+    print(f"[calib] codebooks low=sign({BITS['sign']}b)/high=nf2({BITS['nf2']}b, {NF2_IMPL}) "
+          f"sign_fraction={SIGN_FRACTION} -> nominal K ~{NOMINAL_K_BITS} bit/value")
 
     batches = load_calib_token_batches(tok, args.calib_data, args.num_samples, args.sample_len, args.seed)
     sigma2 = collect_per_channel_sigma2(model, batches, args.skip_first, args.group_size, args.device)
-    mask = build_mask(sigma2, lo_frac, args.per_head)
+    mask = build_mask(sigma2)
 
     n_lo = int((mask == 0).sum())
     tot = int(mask.numel())
     frac = n_lo / tot
-    nominal = frac * BITS[lo] + (1 - frac) * BITS[hi]
-    print(f"[calib] {lo}={n_lo}/{tot} ({frac:.1%}) {hi}={tot - n_lo} "
-          f"-> nominal eff bit ~{nominal:.3f}")
+    print(f"[calib] sign={n_lo}/{tot} ({frac:.1%}) nf2={tot - n_lo}")
     print(f"[calib] sigma^2 global range {sigma2.min():.4e}..{sigma2.max():.4e}")
 
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)
     torch.save({
-        "codebook_mask": mask,                  # [nl, n_kv, D] uint8: 0=low(lo), 1=high(hi)
-        "codebooks": [lo, hi],
-        "low_frac": lo_frac,
-        "target_bits": args.target_bits,
-        "nominal_bits": nominal,
-        "per_head": args.per_head,
+        "codebook_mask": mask,                  # [nl, n_kv, D] uint8: 0=sign, 1=nf2
+        "codebooks": list(CODEBOOKS),
+        "low_frac": SIGN_FRACTION,
+        "nominal_bits": NOMINAL_K_BITS,
+        "nf2_impl": NF2_IMPL,
         "group_size": args.group_size,
         "skip_first": args.skip_first,
         "model": args.model,

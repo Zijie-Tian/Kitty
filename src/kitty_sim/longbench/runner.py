@@ -33,6 +33,15 @@ from .templates import format_longbench_prompt, infer_model_family, post_process
 # Lloyd-Max era. Bump on any future nf2 semantics change.
 NF2_IMPL_VERSION = "symnf2-v1"
 
+# The single public QLUTATTN variant. K: post-RoPE per-token quant on the
+# per-channel-mean-centered residual, per-channel codebook fixed by an OFFLINE
+# sign/nf2 mask (50/50 split -> nominal 0.5*1.25 + 0.5*2.25 = 1.75 bit/value);
+# Q stays FP16. V: rescued 2-bit tile16c64 (rht-pcaff-mse1-bias-v1).
+QLUTATTN_VARIANT = "qlutattn"
+QLUTATTN_BIN_CODEBOOKS = ("sign", "nf2")
+QLUTATTN_SIGN_FRACTION = 0.5
+QLUTATTN_V_TILE_CHANNELS = 64
+
 
 @dataclass(frozen=True)
 class VariantConfig:
@@ -47,9 +56,8 @@ class VariantConfig:
     promote_bit: int = 4
     channel_selection: int = 1
     # K-cache quant orientation: "per_channel" (KIVI-style token-axis groups +
-    # promote/qlut codebook) or "per_token" (K quantized like V along head_dim,
-    # uniform, no promote) -- the QServe SmoothAttention study mode, pair with a
-    # smooth-calibrated checkpoint (scripts/calibrate_smooth_qk.py).
+    # promote) or "per_token" (K quantized like V along head_dim; qlutattn and
+    # the q4_0/custom per-token modes).
     k_quant_mode: str = "per_channel"
     # ShadowKV sim: pure-torch faithful port of ShadowKV's accuracy cache (SVD
     # low-rank pre-RoPE keys + landmark chunk selection + outlier/local chunks).
@@ -64,12 +72,12 @@ class VariantConfig:
     # promote_ratio_config_path keeps the source JSON path for provenance.
     promote_ratio_per_layer: tuple[tuple[int, float], ...] | None = None
     promote_ratio_config_path: str | None = None
-    # QLUT (sigma^2-binned) K codebook = qlutattn-k1v4. k_codebook='qlut'
-    # uses bin_codebooks (a per-sigma^2-bin codebook list); 'kivi' = default path;
+    # K-cache codebook: 'kivi' = min-max groupwise (default path); 'qlut' = the
+    # canonical qlutattn offline per-channel sign/nf2 mask (per-token);
     # 'q4_0' = llama.cpp Q4_0 (per-token 32-channel symmetric blocks).
     k_codebook: str = "kivi"
-    # V-cache codebook: 'kivi' (configured-group min-max), 'per_token2'
-    # (named whole-head V2), 'q4_0', or rescued 'tile16_rescued'.
+    # V-cache codebook: 'kivi' (configured-group min-max), 'q4_0', or the
+    # rescued 2-bit 'tile16_rescued' (qlutattn).
     v_codebook: str = "kivi"
     # Rescued V tile16cC provenance (None on non-tile variants).
     v_tile_tokens: int | None = None
@@ -77,26 +85,12 @@ class VariantConfig:
     v_tile_algo_version: str | None = None
     v_rht_seed: int | None = None
     v_mse_iters: int | None = None
+    # qlut only: per-channel codebook names, mask value -> codebook. Fixed to
+    # ("sign", "nf2") for the canonical qlutattn variant.
     bin_codebooks: tuple[str, ...] | None = None
-    n_bins: int = 6
-    # per_token dense-and-sparse outlier isolation (the autoresearch per-token
-    # champion): keep top-k peak-|magnitude| channels per head at outlier_bits,
-    # per-token quantize the rest. 0 = off. Pair with a smoothed checkpoint.
-    pertoken_outlier_k: int = 0
-    pertoken_outlier_bits: int = 4
-    # qlutattn-k125v4-pt: per-CHANNEL mean removal (free for attention) + per-token
-    # pure binary on the residual. The confirmed per-token sign recipe.
-    pertoken_pc_submean: bool = False
-    # qlutattn-k1.68v4-pt (legacy ONLINE sigma^2 path): per-channel submean + sigma^2-binned mixed codebook (per-token).
-    pertoken_mixed: bool = False
-    # qlutattn-k168v4-pt (corrected): path to an OFFLINE per-channel sign/tern codebook mask.
+    # qlutattn: path to the OFFLINE per-(layer, kv-head, channel) codebook mask
+    # (scripts/calibrate_qlutattn_mask.py). Required for the qlut K codebook.
     pertoken_cb_mask: Optional[str] = None
-    # qlutattn-rotated-k*v4-pt: Hadamard-rotate the per-channel-centered residual before per-token quant.
-    pertoken_rotate: bool = False
-    # block-shared per-token codebook: # of consecutive tokens that SHARE one per-token
-    # codebook (nf2 absmax scale / sign-mag). 1 = per-token (current); >1 = block-shared
-    # (side-info amortized block x). Only the offline per-token paths honor it.
-    pertoken_block: int = 1
     # nf2 implementation marker: "symnf2-v1" whenever the effective codebooks include
     # "nf2" (static bin_codebooks or the offline mask blob), None otherwise. Purely a
     # run_config_hash version gate -- Lloyd-era nf2 manifests must NOT be resumed or
@@ -117,21 +111,9 @@ class VariantConfig:
             return "fp16"
         ratio = str(self.promote_ratio).replace(".", "p")
         if self.k_codebook == "qlut":
-            h = hashlib.sha256(repr(self.bin_codebooks).encode()).hexdigest()[:6]
-            iso = (f"_iso{self.pertoken_outlier_k}b{self.pertoken_outlier_bits}"
-                   if self.k_quant_mode == "per_token" and self.pertoken_outlier_k > 0 else "")
-            vtile = ""
-            if self.v_codebook == "tile16_rescued":
-                from kitty_sim.v_tile_quant import algo_slug_for_version
-
-                rv = algo_slug_for_version(self.v_tile_algo_version)
-                vtile = f"_vtile16c{self.v_tile_channels}_{rv}"
-            blk = f"_blk{self.pertoken_block}" if self.pertoken_block > 1 else ""
-            quest = (
-                f"_qb{self.quest_token_budget}_qsl{self.quest_skip_layers}_questkernel"
-                if self.quest_kernel else ""
-            )
-            return f"{self.name}_nb{self.n_bins}_v{self.vbits}_cb{h}{iso}{vtile}{blk}{quest}"
+            # The canonical qlutattn variant is fully fixed (sign/nf2 f50 K,
+            # tile16c64 V2), so its tag is just the name.
+            return self.name
         if self.shadowkv:
             return f"{self.name}_sb{self.sparse_budget}_r{self.rank}_c{self.chunk_size}"
         suffix = ""
@@ -166,9 +148,16 @@ def _maybe_enable_quest_kernel(variant: VariantConfig, args: Any) -> VariantConf
     if not requested:
         return variant
     if not variant.use_kitty:
-        raise ValueError("QUEST_KERNEL=1 requires a Kitty/QLUTATTN-style KV-cache variant, not fp16.")
+        raise ValueError("QUEST_KERNEL=1 requires a Kitty-style KV-cache variant, not fp16.")
     if variant.shadowkv:
         raise ValueError("QUEST_KERNEL=1 cannot be combined with shadowkv.")
+    if variant.name == QLUTATTN_VARIANT:
+        raise ValueError(
+            "QUEST_KERNEL/QUEST_TRITON/SIM_QUEST/QUEST_SIM cannot be combined with "
+            "--variant qlutattn: the canonical qlutattn algorithm is fixed and a "
+            "QUEST overlay would silently turn it into a different method. "
+            "Use QUEST with the kitty/kivi variants instead."
+        )
     budget = (
         getattr(args, "quest_token_budget", None)
         or os.environ.get("QUEST_TOKEN_BUDGET")
@@ -230,21 +219,8 @@ def _load_promote_ratio_config(
     )
 
 
-def _resolve_v_tile_channels(args: Any) -> int | None:
-    """CLI > env V_TILE_CHANNELS. Empty string is an explicit unset sentinel."""
-    cli = getattr(args, "v_tile_channels", None)
-    if cli is not None:
-        return int(cli)
-    if "V_TILE_CHANNELS" in os.environ:
-        raw = os.environ["V_TILE_CHANNELS"]
-        if raw.strip() == "":
-            return None
-        return int(raw)
-    return None
-
-
 def _reject_conflicting_vbits(args: Any, variant_name: str) -> None:
-    """Named V2 variants hard-lock the final parsed vbits value to two.
+    """qlutattn hard-locks the final parsed vbits value to two.
 
     ``scripts/run_exp.sh`` translates ``VBITS`` into ``--vbits``, so checking the
     parsed argument here preserves the repository-wide CLI-over-environment rule.
@@ -259,98 +235,104 @@ def _reject_conflicting_vbits(args: Any, variant_name: str) -> None:
         )
 
 
-def _reject_stale_or_missing_v_tile_channels(
-    args: Any, *, tile: bool, variant_name: str
-) -> int | None:
-    C = _resolve_v_tile_channels(args)
-    if tile:
-        if C is None or C <= 0:
+def _reject_retired_env(variant_name: str, env_names: tuple[str, ...]) -> None:
+    """Retired knobs must never (silently or otherwise) reconfigure a variant.
+
+    The canonical qlutattn algorithm is fixed; a non-empty value in any of
+    these environment variables signals a stale launcher and is a hard error.
+    Empty string is the explicit unset sentinel.
+    """
+    for env_name in env_names:
+        raw = os.environ.get(env_name)
+        if raw is not None and raw.strip() != "":
             raise ValueError(
-                f"{variant_name} requires V_TILE_CHANNELS / --v-tile-channels "
-                f"as a positive integer (no silent default); got {C!r}"
+                f"variant {variant_name}: the retired knob "
+                f"{env_name}={raw!r} must be unset (or empty)."
             )
-        return C
-    if C is not None:
-        raise ValueError(
-            f"{variant_name} is not a V-tile variant; unset V_TILE_CHANNELS "
-            f"(got {C}). Empty string V_TILE_CHANNELS= is the unset sentinel."
-        )
-    return None
 
 
-def _lock_sign_bin_codebooks(variant_name: str) -> tuple[str, ...]:
-    cb = os.environ.get("QLUT_BIN_CODEBOOKS")
-    if cb is None or cb.strip() == "" or cb.strip() == "sign":
-        return ("sign",)
+def _reject_pertoken_block_env() -> None:
+    """PERTOKEN_BLOCK is retired: only unset, empty, or '1' are accepted."""
+    raw = os.environ.get("PERTOKEN_BLOCK")
+    if raw is None or raw.strip() in ("", "1"):
+        return
     raise ValueError(
-        f"{variant_name} hard-locks bin_codebooks=('sign',); "
-        f"got QLUT_BIN_CODEBOOKS={cb!r}"
+        f"PERTOKEN_BLOCK is retired (block-shared per-token codebooks were "
+        f"removed); got PERTOKEN_BLOCK={raw!r}. Unset it or set it to 1."
     )
 
 
-def _reject_sign_pertoken_block(variant_name: str, pt_block: int) -> None:
-    if pt_block > 1:
+def load_qlutattn_mask_blob(mask_path: str) -> dict[str, Any]:
+    """Load and strictly validate the offline qlutattn codebook mask (CPU-only).
+
+    The runtime must not trust the blob's metadata alone: the mask tensor
+    itself is checked (dtype, rank, value set, actual sign fraction). Legacy
+    metadata keys (``target_bits``/``nominal_bits``) are ignored. The shape is
+    validated against the model config separately in
+    ``validate_qlutattn_model_config``.
+    """
+    blob = torch.load(mask_path, map_location="cpu", weights_only=False)
+    if not isinstance(blob, dict):
+        raise ValueError(f"qlutattn mask {mask_path} must be a dict payload")
+    codebooks = tuple(blob.get("codebooks") or ())
+    if codebooks != QLUTATTN_BIN_CODEBOOKS:
         raise ValueError(
-            f"{variant_name} does not support PERTOKEN_BLOCK>1 "
-            f"(got PERTOKEN_BLOCK={pt_block}); use PERTOKEN_BLOCK=1"
+            f"qlutattn requires codebooks={list(QLUTATTN_BIN_CODEBOOKS)} in the "
+            f"mask payload; got {list(codebooks)} in {mask_path}"
         )
+    low_frac = blob.get("low_frac")
+    if low_frac is None or float(low_frac) != QLUTATTN_SIGN_FRACTION:
+        raise ValueError(
+            f"qlutattn requires low_frac={QLUTATTN_SIGN_FRACTION} in the mask "
+            f"payload; got {low_frac!r} in {mask_path}"
+        )
+    mask = blob.get("codebook_mask")
+    if not isinstance(mask, torch.Tensor):
+        raise ValueError(f"qlutattn mask {mask_path} has no codebook_mask tensor")
+    if mask.ndim != 3:
+        raise ValueError(
+            f"qlutattn codebook_mask must be [n_layers, n_kv_heads, head_dim] "
+            f"(ndim=3); got shape {tuple(mask.shape)}"
+        )
+    if mask.dtype != torch.uint8:
+        raise ValueError(
+            f"qlutattn codebook_mask must be torch.uint8; got {mask.dtype}"
+        )
+    values = set(torch.unique(mask).tolist())
+    if values != {0, 1}:
+        raise ValueError(
+            f"qlutattn codebook_mask values must be exactly {{0, 1}} "
+            f"(0=sign, 1=nf2); got {sorted(values)}"
+        )
+    sign_frac = float((mask == 0).float().mean())
+    if sign_frac != QLUTATTN_SIGN_FRACTION:
+        raise ValueError(
+            f"qlutattn requires an exact {QLUTATTN_SIGN_FRACTION:.0%} sign "
+            f"channel fraction; the mask in {mask_path} has {sign_frac:.6f}"
+        )
+    return blob
 
 
-NEW_V2_VARIANTS = frozenset({
-    "qlutattn_k125v2_pt",
-    "qlutattn_k188v2_pt",
-    "qlutattn_k125v2_pt_vtile16",
-    "qlutattn_k188v2_pt_vtile16",
-})
-
-NEW_V2_TILE_VARIANTS = frozenset({
-    "qlutattn_k125v2_pt_vtile16",
-    "qlutattn_k188v2_pt_vtile16",
-})
-
-_PERTOKEN_BLOCK_VARIANTS = frozenset({
-    "qlutattn_k168v4_pt",
-    "qlutattn_k188v4_pt",
-    "qlutattn_rotated_st_pt",
-    "qlutattn_rotated_snf_pt",
-    "qlutattn_k188v2_pt",
-    "qlutattn_k188v2_pt_vtile16",
-})
-
-
-def _variant_supports_pertoken_block(variant_name: str) -> bool:
-    aliases = {
-        "qlutattn-k168v4-pt": "qlutattn_k168v4_pt",
-        "qlutattn-k1.68v4-pt": "qlutattn_k168v4_pt",
-        "qlutattn-k188v4-pt": "qlutattn_k188v4_pt",
-        "qlutattn-rotated-st-pt": "qlutattn_rotated_st_pt",
-        "qlutattn-rotated-snf-pt": "qlutattn_rotated_snf_pt",
-    }
-    return aliases.get(variant_name, variant_name) in _PERTOKEN_BLOCK_VARIANTS
-
-
-def validate_new_v2_model_family(variant: VariantConfig, model_family: str | None) -> None:
+def validate_qlutattn_model_family(variant: VariantConfig, model_family: str | None) -> None:
     """Fail before model loading when a legacy-cache GLM would bypass this path."""
-    if variant.name in NEW_V2_VARIANTS and is_glm_family(model_family):
+    if variant.name == QLUTATTN_VARIANT and is_glm_family(model_family):
         raise ValueError(
             f"GLM parity for {variant.name} is not implemented yet; "
             "refusing to silently fall back to KIVI V. Use a non-GLM model family."
         )
 
 
-def validate_new_v2_model_config(
+def validate_qlutattn_model_config(
     variant: VariantConfig, model_config: Any, model_dtype: torch.dtype
 ) -> None:
-    """Validate model-dependent V2 constraints before any dataset/sample loop."""
-    if variant.name not in NEW_V2_VARIANTS:
+    """Validate model-dependent qlutattn constraints before any sample loop."""
+    if variant.name != QLUTATTN_VARIANT:
         return
     if model_dtype != torch.float16:
         raise ValueError(
-            f"{variant.name} requires an FP16 model for the V2 fake-quant path; "
+            f"{variant.name} requires an FP16 model for the fake-quant path; "
             f"got model dtype={model_dtype}"
         )
-    if variant.name not in NEW_V2_TILE_VARIANTS:
-        return
     head_dim = getattr(model_config, "head_dim", None)
     if head_dim is None:
         hidden_size = getattr(model_config, "hidden_size", None)
@@ -375,6 +357,25 @@ def validate_new_v2_model_config(
         raise ValueError(
             f"Hadamard/RHT requires power-of-two head_dim, got head_dim={head_dim}"
         )
+    # The offline codebook mask must match this exact model geometry.
+    n_layers = getattr(model_config, "num_hidden_layers", None)
+    n_kv = getattr(model_config, "num_key_value_heads", None) or getattr(
+        model_config, "num_attention_heads", None
+    )
+    if n_layers is None or n_kv is None:
+        raise ValueError(
+            "Cannot resolve num_hidden_layers/num_key_value_heads from the "
+            "model config for qlutattn mask shape validation"
+        )
+    blob = load_qlutattn_mask_blob(variant.pertoken_cb_mask)
+    got = tuple(blob["codebook_mask"].shape)
+    expected = (int(n_layers), int(n_kv), head_dim)
+    if got != expected:
+        raise ValueError(
+            f"qlutattn codebook_mask shape {got} does not match the model's "
+            f"[num_layers, num_key_value_heads, head_dim] = {expected}; "
+            f"recalibrate with scripts/calibrate_qlutattn_mask.py"
+        )
 
 
 def _torch_dtype_from_name(name: str) -> torch.dtype:
@@ -388,16 +389,16 @@ def _torch_dtype_from_name(name: str) -> torch.dtype:
     }[str(name).lower()]
 
 
-def validate_new_v2_preload(args: Any, variant: VariantConfig, model_family: str) -> None:
+def validate_qlutattn_preload(args: Any, variant: VariantConfig, model_family: str) -> None:
     """Config-only validation before scheduling or loading model weights.
 
     AutoConfig may read a local config or the normal HF metadata cache/network,
     but it never creates a model or CUDA context.  The same checks run again on
     the loaded model config to guard custom/remote modeling discrepancies.
     """
-    if variant.name not in NEW_V2_VARIANTS:
+    if variant.name != QLUTATTN_VARIANT:
         return
-    validate_new_v2_model_family(variant, model_family)
+    validate_qlutattn_model_family(variant, model_family)
     source = getattr(args, "model_path", None) or getattr(args, "model", None)
     if not source:
         raise ValueError(f"{variant.name} preflight requires model metadata")
@@ -410,34 +411,25 @@ def validate_new_v2_preload(args: Any, variant: VariantConfig, model_family: str
     except Exception as exc:
         raise RuntimeError(
             f"Unable to load model metadata for {variant.name} from {source!r}; "
-            "refusing to schedule before head_dim/dtype validation"
+            "refusing to schedule before head_dim/dtype/mask validation"
         ) from exc
-    validate_new_v2_model_config(
+    validate_qlutattn_model_config(
         variant,
         config,
         _torch_dtype_from_name(getattr(args, "torch_dtype", "float16")),
     )
 
 
-def _mask_blob_codebooks(mask_path: str) -> tuple[str, ...]:
-    """Codebook names carried by an offline QLUT_CB_MASK blob (empty on absence).
-    The runtime cache trusts the blob's `codebooks` over the variant's static
-    bin_codebooks, so the nf2 marker must consult the blob too."""
-    blob = torch.load(mask_path, map_location="cpu", weights_only=False)
-    return tuple(blob.get("codebooks") or ())
-
-
 def _apply_nf2_impl_marker(config: VariantConfig) -> VariantConfig:
-    """Stamp nf2_impl on variants whose effective codebooks include "nf2".
+    """Stamp nf2_impl on variants whose codebooks include "nf2" (qlutattn).
 
     This is a pure run_config_hash version gate for the symmetric-NF2 switch
     (Lloyd-era nf2 results must not be resumed/reused). Variants without nf2
     keep nf2_impl=None, and variant_semantic_payload drops the None key, so
-    their historical hashes stay byte-identical."""
-    effective = set(config.bin_codebooks or ())
-    if config.pertoken_cb_mask:
-        effective.update(_mask_blob_codebooks(config.pertoken_cb_mask))
-    if "nf2" in effective:
+    their historical hashes stay byte-identical. For qlutattn the offline mask
+    blob's codebooks are validated to equal the static ("sign", "nf2") list in
+    load_qlutattn_mask_blob, so the static list is authoritative here."""
+    if "nf2" in (config.bin_codebooks or ()):
         return replace(config, nf2_impl=NF2_IMPL_VERSION)
     return config
 
@@ -448,35 +440,11 @@ def build_variant(args: Any) -> VariantConfig:
 
 def _build_variant_impl(args: Any) -> VariantConfig:
     variant = args.variant.lower()
-    # Normalize hyphen aliases for the new V2 family early.
-    _alias = {
-        "qlutattn-k125v2-pt": "qlutattn_k125v2_pt",
-        "qlutattn-k188v2-pt": "qlutattn_k188v2_pt",
-        "qlutattn-k125v2-pt-vtile16": "qlutattn_k125v2_pt_vtile16",
-        "qlutattn-k188v2-pt-vtile16": "qlutattn_k188v2_pt_vtile16",
-    }
-    variant = _alias.get(variant, variant)
-    # per-token block-shared codebook size (offline per-token variants only). 1 = per-token.
-    pt_block = int(os.environ.get("PERTOKEN_BLOCK", "1"))
-    if pt_block < 1:
-        raise ValueError(f"PERTOKEN_BLOCK must be a positive integer, got {pt_block}")
-    if pt_block > 1 and not _variant_supports_pertoken_block(variant):
-        raise ValueError(
-            f"{variant} does not support PERTOKEN_BLOCK>1 "
-            f"(got PERTOKEN_BLOCK={pt_block}); use PERTOKEN_BLOCK=1"
-        )
-    resolved_v_tile_channels = _resolve_v_tile_channels(args)
-    if variant in NEW_V2_TILE_VARIANTS:
-        if resolved_v_tile_channels is None or resolved_v_tile_channels <= 0:
-            raise ValueError(
-                f"{variant} requires V_TILE_CHANNELS / --v-tile-channels "
-                "as a positive integer (no silent default)"
-            )
-    elif resolved_v_tile_channels is not None:
-        raise ValueError(
-            f"{variant} is not a V-tile variant; unset V_TILE_CHANNELS "
-            f"(got {resolved_v_tile_channels}). Empty V_TILE_CHANNELS= is the unset sentinel."
-        )
+    # Retired knobs are rejected for every variant: no launcher may carry them.
+    _reject_pertoken_block_env()
+    _reject_retired_env(
+        variant, ("QLUT_BIN_CODEBOOKS", "V_TILE_CHANNELS", "PERTOKEN_OUTLIER_K")
+    )
     config_path = getattr(args, "promote_ratio_config", None)
     if config_path and variant != "kitty":
         raise ValueError(
@@ -532,123 +500,23 @@ def _build_variant_impl(args: Any) -> VariantConfig:
             rank=rank,
             chunk_size=chunk,
         )
-    if variant in ("qlutattn_k1v4", "qlutattn-k1v4"):
-        # QLUT-Attn k1v4 winner: per-layer sigma^2-binned K codebooks (6 bins,
-        # low sigma^2 -> sign, high sigma^2 -> nf2). V per-token 4-bit. Effective
-        # K ~1.68 bit (vs uniform tern 1.83); beats iso-tern on LongBench.
-        cb = os.environ.get("QLUT_BIN_CODEBOOKS")
-        bins = tuple(cb.split(",")) if cb else ("sign", "sign", "sign", "tern", "nf2", "nf2")
-        return VariantConfig(
-            name="qlutattn_k1v4", use_kitty=True, k_codebook="qlut", bin_codebooks=bins,
-            n_bins=len(bins), vbits=4, promote_ratio=0.0, channel_selection=0,
-            sink_length=32, buffer_length=128, group_size=128)
-    if variant in ("qlutattn_k184v4", "qlutattn-k184v4"):
-        # Uniform-tern K (all channels tern) + V 4-bit, ~1.84 bit K: the iso-tern
-        # reference the qlutattn-k1v4 winner is compared against. (Formerly
-        # tern_uniform; renamed into the qlutattn-k<bits>v4 family.)
-        return VariantConfig(
-            name="qlutattn_k184v4", use_kitty=True, k_codebook="qlut",
-            bin_codebooks=("tern",) * 6, n_bins=6, vbits=4, promote_ratio=0.0,
-            channel_selection=0, sink_length=32, buffer_length=128, group_size=128)
-    if variant in ("qlutattn_k125v4", "qlutattn-k125v4"):
-        # Uniform-sign K (all channels sign) + V 4-bit, ~1.25 bit K: cheapest
-        # member of the qlutattn-k<bits>v4 family (sign 1.25 < sigma^2-mix 1.68
-        # < tern 1.84). Pure-sign codebook isolated as a named variant so its
-        # method slug is qlutattn-k125v4 (no manual LLAMA32_MODEL_SLUG needed).
-        return VariantConfig(
-            name="qlutattn_k125v4", use_kitty=True, k_codebook="qlut",
-            bin_codebooks=("sign",) * 6, n_bins=6, vbits=4, promote_ratio=0.0,
-            channel_selection=0, sink_length=32, buffer_length=128, group_size=128)
-    if variant in ("qlutattn_k185v4_pt", "qlutattn-k185v4-pt"):
-        # PER-TOKEN tern (k184v4's per-token form) with per-CHANNEL mean removal:
-        # per-channel center (free for attention) then pure ternary on the residual.
-        # ~1.84 bit K (tern 1.585 + per-token mag 0.25; per-channel mu free), V 4-bit.
-        return VariantConfig(
-            name="qlutattn_k185v4_pt", use_kitty=True, k_codebook="qlut",
-            bin_codebooks=("tern",), n_bins=1, vbits=4, promote_ratio=0.0,
-            channel_selection=0, k_quant_mode="per_token", pertoken_pc_submean=True)
-    if variant in ("qlutattn_k168v4_pt", "qlutattn-k168v4-pt", "qlutattn-k1.68v4-pt"):
-        # CORRECTED k168v4-pt: per-token K with an OFFLINE per-channel sign/tern codebook.
-        # Each post-RoPE K channel is assigned sign(1.25b, low sigma^2) or tern(1.85b, high
-        # sigma^2) ONCE offline (scripts/calibrate_k168v4_pt.py on wikitext); the mask is
-        # loaded and used unchanged -- no online sigma^2 binning, no nf2. The per-channel
-        # MEAN is still self-calibrated at prefill (free for attention). Mask path comes
-        # from QLUT_CB_MASK. (The old ONLINE sigma^2+nf2 path is still reachable via
-        # --variant custom with pertoken_mixed; it scored only 14.39 on 1B.)
-        mask = os.environ.get("QLUT_CB_MASK", "")
-        if not mask or not os.path.exists(mask):
-            raise FileNotFoundError(
-                "qlutattn_k168v4_pt requires an OFFLINE codebook mask: set "
-                "QLUT_CB_MASK=/path/to/mask.pt (generate via scripts/calibrate_k168v4_pt.py). "
-                f"Got QLUT_CB_MASK='{mask}'")
-        return VariantConfig(
-            name="qlutattn_k168v4_pt", use_kitty=True, k_codebook="qlut",
-            bin_codebooks=("sign", "tern"), n_bins=2, vbits=4, promote_ratio=0.0,
-            channel_selection=0, k_quant_mode="per_token", pertoken_cb_mask=mask,
-            pertoken_block=pt_block)
-    if variant in ("qlutattn_k188v4_pt", "qlutattn-k188v4-pt"):
-        # Sibling of k168v4-pt: per-token K with an OFFLINE per-channel sign/nf2 codebook.
-        # Each post-RoPE K channel is assigned sign(1.25b, low σ²) or nf2(2.25b, high σ²) once
-        # offline (scripts/calibrate_k168v4_pt.py --codebooks sign,nf2; default ~50/50).
-        # Mask via QLUT_CB_MASK (its codebooks override bin_codebooks at load). Same machinery
-        # as k168v4-pt but the rich codebook is nf2 (symmetric-NF2 LUT, absmax scale on the
-        # per-channel-centered residual -- no second mean) instead of tern.
-        mask = os.environ.get("QLUT_CB_MASK", "")
-        if not mask or not os.path.exists(mask):
-            raise FileNotFoundError(
-                "qlutattn_k188v4_pt requires an OFFLINE codebook mask: set "
-                "QLUT_CB_MASK=/path/to/mask.pt (generate via "
-                "scripts/calibrate_k168v4_pt.py --codebooks sign,nf2). "
-                f"Got QLUT_CB_MASK='{mask}'")
-        return VariantConfig(
-            name="qlutattn_k188v4_pt", use_kitty=True, k_codebook="qlut",
-            bin_codebooks=("sign", "nf2"), n_bins=2, vbits=4, promote_ratio=0.0,
-            channel_selection=0, k_quant_mode="per_token", pertoken_cb_mask=mask,
-            pertoken_block=pt_block)
-    if variant in ("qlutattn_k125v4_pt", "qlutattn-k125v4-pt"):
-        # PER-TOKEN version of qlutattn-k125v4: subtract a per-CHANNEL mean (free
-        # for attention -- q.mu cancels in softmax) then PURE per-token binary
-        # (sign) on the residual. ~1.25 bit K (1-bit + per-token mag; per-channel
-        # mu is amortized/free), V per-token 4-bit. This is the confirmed
-        # per-token sign recipe: per-channel center fixes the broken per-token
-        # submean (+0.26 overlap vs the naive per-token sign). QLUT_BIN_CODEBOOKS
-        # picks sign (default) or tern; empty string = unset sentinel (run_exp.sh
-        # preflight injects "" -- must resolve identically to the worker's unset).
-        cb = os.environ.get("QLUT_BIN_CODEBOOKS") or "sign"
-        return VariantConfig(
-            name="qlutattn_k125v4_pt", use_kitty=True, k_codebook="qlut",
-            bin_codebooks=(cb,), n_bins=1, vbits=4, promote_ratio=0.0,
-            channel_selection=0, k_quant_mode="per_token",
-            pertoken_pc_submean=True)
-    if variant == "qlutattn_k125v2_pt":
-        # sign K (same as k125v4_pt) + per-token V 2-bit.
-        _reject_conflicting_vbits(args, variant)
-        _reject_stale_or_missing_v_tile_channels(args, tile=False, variant_name=variant)
-        _reject_sign_pertoken_block(variant, pt_block)
-        bins = _lock_sign_bin_codebooks(variant)
-        return VariantConfig(
-            name="qlutattn_k125v2_pt", use_kitty=True, k_codebook="qlut",
-            bin_codebooks=bins, n_bins=1, vbits=2, v_codebook="per_token2",
-            promote_ratio=0.0, channel_selection=0, k_quant_mode="per_token",
-            pertoken_pc_submean=True)
-    if variant == "qlutattn_k188v2_pt":
-        # SNF K (same as k188v4_pt) + per-token V 2-bit.
-        _reject_conflicting_vbits(args, variant)
-        _reject_stale_or_missing_v_tile_channels(args, tile=False, variant_name=variant)
-        mask = os.environ.get("QLUT_CB_MASK", "")
-        if not mask or not os.path.exists(mask):
-            raise FileNotFoundError(
-                "qlutattn_k188v2_pt requires an OFFLINE codebook mask: set "
-                "QLUT_CB_MASK=/path/to/mask.pt (generate via "
-                "scripts/calibrate_k168v4_pt.py --codebooks sign,nf2). "
-                f"Got QLUT_CB_MASK='{mask}'")
-        return VariantConfig(
-            name="qlutattn_k188v2_pt", use_kitty=True, k_codebook="qlut",
-            bin_codebooks=("sign", "nf2"), n_bins=2, vbits=2, v_codebook="per_token2",
-            promote_ratio=0.0, channel_selection=0, k_quant_mode="per_token",
-            pertoken_cb_mask=mask, pertoken_block=pt_block)
-    if variant == "qlutattn_k125v2_pt_vtile16":
-        # sign K + rescued tile16cC V 2-bit.
+    if variant == "qlutattn":
+        # The single canonical QLUTATTN variant.
+        #   Q: FP16, untouched.
+        #   K: post-RoPE per-token quant along head_dim. A per-channel mean
+        #      mu_d is self-calibrated from each prompt at prefill (free for
+        #      attention: q.mu is a per-query constant that cancels in softmax)
+        #      and subtracted; the residual is quantized per token with a fixed
+        #      per-channel codebook assignment loaded from an OFFLINE mask
+        #      (scripts/calibrate_qlutattn_mask.py): 50% lowest-sigma^2 channels
+        #      -> sign (1-bit + per-token |r| mean scale), 50% -> fixed
+        #      symmetric NF2 (symnf2-v1 LUT, per-token absmax scale). Nominal
+        #      0.5*1.25 + 0.5*2.25 = 1.75 bit/value. No rotation, no online
+        #      binning, no block sharing.
+        #   V: rescued 2-bit tile16c64 (rht-pcaff-mse1-bias-v1): 16 consecutive
+        #      tokens x 64 channels per tile, RHT + frozen per-channel affine +
+        #      one MSE refit + bias correction.
+        #   Protection: sink=32 + recent-128 FP16 window (group_size=128).
         from kitty_sim.v_tile_quant import (
             V_MSE_ITERS,
             V_RHT_SEED,
@@ -656,118 +524,23 @@ def _build_variant_impl(args: Any) -> VariantConfig:
             V_TILE_TOKENS,
         )
         _reject_conflicting_vbits(args, variant)
-        C = _reject_stale_or_missing_v_tile_channels(args, tile=True, variant_name=variant)
-        _reject_sign_pertoken_block(variant, pt_block)
-        bins = _lock_sign_bin_codebooks(variant)
+        _reject_retired_env(variant, ("PROMOTE_RATIO_CONFIG",))
+        mask = os.environ.get("QLUT_CB_MASK", "")
+        if not mask or not os.path.exists(mask):
+            raise FileNotFoundError(
+                "qlutattn requires an OFFLINE codebook mask: set "
+                "QLUT_CB_MASK=/path/to/mask.pt (generate via "
+                "scripts/calibrate_qlutattn_mask.py). "
+                f"Got QLUT_CB_MASK='{mask}'")
+        load_qlutattn_mask_blob(mask)
         return VariantConfig(
-            name="qlutattn_k125v2_pt_vtile16", use_kitty=True, k_codebook="qlut",
-            bin_codebooks=bins, n_bins=1, vbits=2, v_codebook="tile16_rescued",
-            v_tile_tokens=V_TILE_TOKENS, v_tile_channels=C,
+            name=QLUTATTN_VARIANT, use_kitty=True, k_codebook="qlut",
+            bin_codebooks=QLUTATTN_BIN_CODEBOOKS, vbits=2,
+            v_codebook="tile16_rescued", v_tile_tokens=V_TILE_TOKENS,
+            v_tile_channels=QLUTATTN_V_TILE_CHANNELS,
             v_tile_algo_version=V_TILE_ALGO_VERSION, v_rht_seed=V_RHT_SEED,
             v_mse_iters=V_MSE_ITERS, promote_ratio=0.0, channel_selection=0,
-            k_quant_mode="per_token", pertoken_pc_submean=True)
-    if variant == "qlutattn_k188v2_pt_vtile16":
-        # SNF K + rescued tile16cC V 2-bit.
-        from kitty_sim.v_tile_quant import (
-            V_MSE_ITERS,
-            V_RHT_SEED,
-            V_TILE_ALGO_VERSION,
-            V_TILE_TOKENS,
-        )
-        _reject_conflicting_vbits(args, variant)
-        C = _reject_stale_or_missing_v_tile_channels(args, tile=True, variant_name=variant)
-        mask = os.environ.get("QLUT_CB_MASK", "")
-        if not mask or not os.path.exists(mask):
-            raise FileNotFoundError(
-                "qlutattn_k188v2_pt_vtile16 requires an OFFLINE codebook mask: set "
-                "QLUT_CB_MASK=/path/to/mask.pt (generate via "
-                "scripts/calibrate_k168v4_pt.py --codebooks sign,nf2). "
-                f"Got QLUT_CB_MASK='{mask}'")
-        return VariantConfig(
-            name="qlutattn_k188v2_pt_vtile16", use_kitty=True, k_codebook="qlut",
-            bin_codebooks=("sign", "nf2"), n_bins=2, vbits=2,
-            v_codebook="tile16_rescued", v_tile_tokens=V_TILE_TOKENS,
-            v_tile_channels=C, v_tile_algo_version=V_TILE_ALGO_VERSION,
-            v_rht_seed=V_RHT_SEED, v_mse_iters=V_MSE_ITERS, promote_ratio=0.0,
-            channel_selection=0, k_quant_mode="per_token",
-            pertoken_cb_mask=mask, pertoken_block=pt_block)
-    if variant in ("qlutattn_rotated_k125v4_pt", "qlutattn-rotated-k125v4-pt"):
-        # ROTATED per-token sign (k125v4-pt + Hadamard). Per-channel mean removal,
-        # then FWHT-rotate the residual into an isotropic basis so one per-token
-        # scale fits all channels (spreads post-RoPE K outliers), pure 1-bit sign,
-        # then de-rotate (FWHT self-inverse). ~1.25 bit K, V 4-bit. Rotation is
-        # free for attention (orthogonal). QLUT_BIN_CODEBOOKS picks sign/tern
-        # (empty string = unset sentinel, matches the run_exp.sh preflight).
-        cb = os.environ.get("QLUT_BIN_CODEBOOKS") or "sign"
-        return VariantConfig(
-            name="qlutattn_rotated_k125v4_pt", use_kitty=True, k_codebook="qlut",
-            bin_codebooks=(cb,), n_bins=1, vbits=4, promote_ratio=0.0,
-            channel_selection=0, k_quant_mode="per_token",
-            pertoken_pc_submean=True, pertoken_rotate=True)
-    if variant in ("qlutattn_rotated_k185v4_pt", "qlutattn-rotated-k185v4-pt"):
-        # ROTATED per-token tern (k185v4-pt + Hadamard): ternary codebook on the
-        # rotated per-channel-centered residual. ~1.84 bit K, V 4-bit.
-        # Empty QLUT_BIN_CODEBOOKS = unset sentinel (run_exp.sh preflight).
-        cb = os.environ.get("QLUT_BIN_CODEBOOKS") or "tern"
-        return VariantConfig(
-            name="qlutattn_rotated_k185v4_pt", use_kitty=True, k_codebook="qlut",
-            bin_codebooks=(cb,), n_bins=1, vbits=4, promote_ratio=0.0,
-            channel_selection=0, k_quant_mode="per_token",
-            pertoken_pc_submean=True, pertoken_rotate=True)
-    if variant in ("qlutattn_rotated_st_pt", "qlutattn-rotated-st-pt"):
-        # ROTATED sign/tern offline-MIX (k168v4-pt + online Hadamard). The offline
-        # mask (calibrate_k168v4_pt.py --codebooks sign,tern --sign-frac <f>) sets the
-        # sign:tern ratio -> the effective K bit/value; online FWHT rotates the residual
-        # so the mix is quantized in an isotropic basis (rotation is online, not baked
-        # into the mask). mask carries its codebooks (override bin_codebooks at load).
-        mask = os.environ.get("QLUT_CB_MASK", "")
-        if not mask or not os.path.exists(mask):
-            raise FileNotFoundError(
-                "qlutattn_rotated_st_pt requires QLUT_CB_MASK=/path/to/mask.pt (generate via "
-                "scripts/calibrate_k168v4_pt.py --codebooks sign,tern --sign-frac <f>). "
-                f"Got QLUT_CB_MASK='{mask}'")
-        return VariantConfig(
-            name="qlutattn_rotated_st_pt", use_kitty=True, k_codebook="qlut",
-            bin_codebooks=("sign", "tern"), n_bins=2, vbits=4, promote_ratio=0.0,
-            channel_selection=0, k_quant_mode="per_token",
-            pertoken_cb_mask=mask, pertoken_rotate=True, pertoken_block=pt_block)
-    if variant in ("qlutattn_rotated_snf_pt", "qlutattn-rotated-snf-pt"):
-        # ROTATED sign/nf2 offline-MIX (k188v4-pt + online Hadamard). sign-frac (in the
-        # mask) sets the bit/value; online FWHT rotates the residual before per-bin quant.
-        mask = os.environ.get("QLUT_CB_MASK", "")
-        if not mask or not os.path.exists(mask):
-            raise FileNotFoundError(
-                "qlutattn_rotated_snf_pt requires QLUT_CB_MASK=/path/to/mask.pt (generate via "
-                "scripts/calibrate_k168v4_pt.py --codebooks sign,nf2 --sign-frac <f>). "
-                f"Got QLUT_CB_MASK='{mask}'")
-        return VariantConfig(
-            name="qlutattn_rotated_snf_pt", use_kitty=True, k_codebook="qlut",
-            bin_codebooks=("sign", "nf2"), n_bins=2, vbits=4, promote_ratio=0.0,
-            channel_selection=0, k_quant_mode="per_token",
-            pertoken_cb_mask=mask, pertoken_rotate=True, pertoken_block=pt_block)
-    if variant in ("qlutattn_pertoken", "qlut_pertoken"):
-        # qlutattn-k1v4 turned per-token: a SINGLE codebook applied along head_dim
-        # per token (sigma^2 binning has no per-channel axis in per-token mode, so
-        # QLUT_BIN_CODEBOOKS gives one codebook, default nf2). V per-token 4-bit,
-        # no promote. Since the symnf2 switch this variant centers on the
-        # PER-CHANNEL mean mu_d (pertoken_pc_submean=True, same recipe/axis as
-        # k125v4_pt/k188v4_pt; the old per-token submean was the wrong axis) --
-        # the flag also invalidates every legacy per-token-mean run_config_hash.
-        # Empty QLUT_BIN_CODEBOOKS = unset sentinel (run_exp.sh preflight
-        # injects "").
-        cb = os.environ.get("QLUT_BIN_CODEBOOKS") or "nf2"
-        ok = int(os.environ.get("PERTOKEN_OUTLIER_K", "0") or "0")
-        if ok > 0:
-            raise ValueError(
-                "qlutattn_pertoken now uses per-channel mean removal "
-                "(pertoken_pc_submean); the legacy PERTOKEN_OUTLIER_K "
-                "dense-and-sparse path (per-token mean axis) is no longer wired "
-                f"to this variant. Unset PERTOKEN_OUTLIER_K (got {ok}).")
-        return VariantConfig(
-            name="qlutattn_pertoken", use_kitty=True, k_codebook="qlut",
-            bin_codebooks=(cb,), n_bins=1, vbits=4, promote_ratio=0.0,
-            channel_selection=0, k_quant_mode="per_token",
-            pertoken_pc_submean=True)
+            k_quant_mode="per_token", pertoken_cb_mask=mask)
     if variant in ("llamacpp_q40", "llamacpp-q40"):
         # llama.cpp Q4_0 KV cache, faithful port (sim fake-quant): K and V both
         # per-token with 32-channel symmetric absmax blocks (d = signed_max/-8,
@@ -839,14 +612,7 @@ def _cache_factory(config: VariantConfig):
         k_codebook=config.k_codebook,
         v_codebook=config.v_codebook,
         bin_codebooks=(list(config.bin_codebooks) if config.bin_codebooks else None),
-        n_bins=config.n_bins,
-        pertoken_outlier_k=config.pertoken_outlier_k,
-        pertoken_outlier_bits=config.pertoken_outlier_bits,
-        pertoken_pc_submean=config.pertoken_pc_submean,
-        pertoken_mixed=config.pertoken_mixed,
         pertoken_cb_mask=config.pertoken_cb_mask,
-        pertoken_rotate=config.pertoken_rotate,
-        pertoken_block=config.pertoken_block,
         v_tile_tokens=config.v_tile_tokens,
         v_tile_channels=config.v_tile_channels,
         v_tile_algo_version=config.v_tile_algo_version,
@@ -911,63 +677,31 @@ def model_layout_slug(model: str, model_path: str | None = None) -> str:
 
 def method_layout_slug(variant: VariantConfig | str) -> str:
     name = (variant.name if isinstance(variant, VariantConfig) else str(variant)).lower()
-    if not isinstance(variant, VariantConfig) and name in {
-        "qlutattn_k125v2_pt_vtile16",
-        "qlutattn-k125v2-pt-vtile16",
-        "qlutattn_k188v2_pt_vtile16",
-        "qlutattn-k188v2-pt-vtile16",
-    }:
-        raise ValueError(
-            "A resolved VariantConfig is required to build a V-tile slug because "
-            "the channel block C is runtime-configured"
-        )
     # kivi / kivi_star encode their K/V bit-width into the slug so different bit
     # combinations land in distinct output dirs (kivi-k2v4, kivi-star-k4v4, ...).
     if name in ("kivi", "kivi_star"):
         base = "kivi-star" if name == "kivi_star" else "kivi"
         if isinstance(variant, VariantConfig):
-            return f"{base}-k{variant.kbits}v{variant.vbits}"
-        return base  # str fallback: no bit info available
+            slug = f"{base}-k{variant.kbits}v{variant.vbits}"
+        else:
+            slug = base  # str fallback: no bit info available
     # kitty encodes K base / boost / V / ratio into the slug (subsumes the old
     # kitty / kitty_pro / kitty_k1v4), e.g. kitty-k2b4v2-pr0p125.
-    if name == "kitty":
+    elif name == "kitty":
         if isinstance(variant, VariantConfig):
             pr = str(variant.promote_ratio).replace(".", "p")
-            return f"kitty-k{variant.kbits}b{variant.promote_bit}v{variant.vbits}-pr{pr}"
-        return "kitty"  # str fallback: no bit info available
-    slug = {
-        "qlutattn_pertoken": "qlutattn-pertoken",
-        "fp16": "fp16",
-        "custom": "custom-kitty",
-        "shadowkv": "shadowkv",
-        "qlutattn_k1v4": "qlutattn-k1v4",
-        "qlutattn_k184v4": "qlutattn-k184v4",
-        "qlutattn_k125v4": "qlutattn-k125v4",
-        "qlutattn_k125v4_pt": "qlutattn-k125v4-pt",
-        "qlutattn_k185v4_pt": "qlutattn-k185v4-pt",
-        "qlutattn_k168v4_pt": "qlutattn-k168v4-pt",
-        "qlutattn_k188v4_pt": "qlutattn-k188v4-pt",
-        "qlutattn_k125v2_pt": "qlutattn-k125v2-pt",
-        "qlutattn_k188v2_pt": "qlutattn-k188v2-pt",
-        # Base without C/rv; tile suffix added below as -vtile16c{C}-rv1
-        "qlutattn_k125v2_pt_vtile16": "qlutattn-k125v2-pt",
-        "qlutattn_k188v2_pt_vtile16": "qlutattn-k188v2-pt",
-        "qlutattn_rotated_k125v4_pt": "qlutattn-rotated-k125v4-pt",
-        "qlutattn_rotated_k185v4_pt": "qlutattn-rotated-k185v4-pt",
-        "qlutattn_rotated_st_pt": "qlutattn-rotated-st-pt",
-        "qlutattn_rotated_snf_pt": "qlutattn-rotated-snf-pt",
-    }.get(name, _layout_slug(name))
-    # Rescued V tile: encode C + algo slug before optional K-block / QUEST suffixes.
-    # Order frozen: <base>-vtile16c<C>-rv<V>-blk<N>-quest-<mode>
-    if isinstance(variant, VariantConfig) and variant.v_codebook == "tile16_rescued":
-        from kitty_sim.v_tile_quant import algo_slug_for_version
-        C = variant.v_tile_channels
-        rv = algo_slug_for_version(variant.v_tile_algo_version)
-        slug = f"{slug}-vtile16c{C}-{rv}"
-    # block-shared per-token codebook: distinct output dir per block size (e.g.
-    # qlutattn-k188v4-pt-blk16) so a PERTOKEN_BLOCK sweep never collides with block=1.
-    if isinstance(variant, VariantConfig) and getattr(variant, "pertoken_block", 1) > 1:
-        slug = f"{slug}-blk{variant.pertoken_block}"
+            slug = f"kitty-k{variant.kbits}b{variant.promote_bit}v{variant.vbits}-pr{pr}"
+        else:
+            slug = "kitty"  # str fallback: no bit info available
+    else:
+        # qlutattn is fully fixed, so its slug is exactly the variant name.
+        slug = {
+            "fp16": "fp16",
+            "custom": "custom-kitty",
+            "shadowkv": "shadowkv",
+            "qlutattn": "qlutattn",
+        }.get(name, _layout_slug(name))
+    # A QUEST overlay must never share an output dir with the plain variant.
     if isinstance(variant, VariantConfig) and getattr(variant, "quest_kernel", False):
         slug = f"{slug}-quest-kernel"
     return slug
@@ -1108,7 +842,7 @@ def resolve_longbench_preflight(args: Any) -> dict[str, Any]:
         model_family = getattr(args, "model_family", None) or infer_model_family(
             getattr(args, "model_tag", None) or model, model_path or model
         )
-        validate_new_v2_preload(args, variant, model_family)
+        validate_qlutattn_preload(args, variant, model_family)
         resolved_datasets: dict[str, dict[str, Any]] = {}
         for dataset_name in datasets:
             run_payload = longbench_run_config_payload(args, variant, dataset_name)
@@ -1197,11 +931,6 @@ def load_model_and_tokenizer(
         local_files_only=local_files_only,
     )
     model_obj.eval()
-    # If this is a QK-channel-reordered checkpoint (scripts/preprocess_qlutattn_model.py),
-    # re-apply RoPE inv_freq[pair_perm] (persistent=False, not saved). No-op otherwise.
-    from ..qk_reorder import apply_qk_reorder
-    if apply_qk_reorder(model_obj, resolved):
-        print(f"[qk-reorder] applied RoPE inv_freq permutation from {resolved}")
     return model_obj, tokenizer, resolved
 
 
@@ -1365,7 +1094,7 @@ def generate_dataset(
                     **inputs,
                     **gen_kwargs,
                 )[0]
-            if variant.name in NEW_V2_VARIANTS and kv_cache is not None:
+            if variant.name == QLUTATTN_VARIANT and kv_cache is not None:
                 engagement_evidence["samples_observed"] += 1
                 engagement_evidence["v_quant_calls"] += int(
                     getattr(kv_cache, "v_quant_calls", 0)
@@ -1456,7 +1185,7 @@ def generate_dataset(
                         f"KittyKVCache.get_seq_length()="
                         f"{seqlen}"
                     )
-                    if variant.name in NEW_V2_VARIANTS and kv_cache is not None:
+                    if variant.name == QLUTATTN_VARIANT and kv_cache is not None:
                         mode = getattr(kv_cache, "last_v_quant_mode", None)
                         calls = int(getattr(kv_cache, "v_quant_calls", 0))
                         blocks = int(getattr(kv_cache, "v_tile_blocks", 0))
@@ -1468,18 +1197,13 @@ def generate_dataset(
                             f"last_v_tile_channels={c_seen} context_length={context_length}"
                         )
                         print(f"[vcache-2bit] {dataset} first-sample evidence: {detail}")
-                        if variant.v_codebook == "tile16_rescued":
-                            # Long prompts must engage at least one full tile; short
-                            # prompts may legitimately leave blocks=0 (lazy calib).
-                            ready = max(0, context_length - variant.sink_length - variant.buffer_length)
-                            if ready >= 16:
-                                engaged = engaged and blocks > 0 and mode == "tile16_rescued"
-                                if variant.v_tile_channels is not None:
-                                    engaged = engaged and c_seen == variant.v_tile_channels
-                        else:
-                            # PT2: any settled token past sink+recent should flush.
-                            if context_length > variant.sink_length + variant.buffer_length:
-                                engaged = engaged and calls > 0 and mode == "per_token2"
+                        # Long prompts must engage at least one full tile; short
+                        # prompts may legitimately leave blocks=0 (lazy calib).
+                        ready = max(0, context_length - variant.sink_length - variant.buffer_length)
+                        if ready >= 16:
+                            engaged = engaged and blocks > 0 and mode == "tile16_rescued"
+                            if variant.v_tile_channels is not None:
+                                engaged = engaged and c_seen == variant.v_tile_channels
                     raise_msg = (
                         f"Kitty variant '{variant.name}' was requested but KV quantization "
                         f"never engaged for model_family='{model_family}' ({detail}). The model "
@@ -1561,8 +1285,8 @@ def run_longbench(args: Any) -> dict[str, Any]:
 
     variant = _maybe_enable_quest_kernel(build_variant(args), args)
     model_family = args.model_family or infer_model_family(args.model_tag or args.model, args.model_path or args.model)
-    validate_new_v2_model_family(variant, model_family)
-    validate_new_v2_preload(args, variant, model_family)
+    validate_qlutattn_model_family(variant, model_family)
+    validate_qlutattn_preload(args, variant, model_family)
     model_tag = args.model_tag or model_basename(args.model, args.model_path)
     output_root = args.output_dir
     flat_output_dir = getattr(args, "flat_output_dir", False)
@@ -1627,7 +1351,7 @@ def run_longbench(args: Any) -> dict[str, Any]:
         dtype=args.torch_dtype,
         local_files_only=args.local_files_only,
     )
-    validate_new_v2_model_config(variant, model_obj.config, model_obj.dtype)
+    validate_qlutattn_model_config(variant, model_obj.config, model_obj.dtype)
 
     # Validate a per-layer promote_ratio schedule against the model's real layer
     # count now that the model is loaded (build_variant only checked ratios).

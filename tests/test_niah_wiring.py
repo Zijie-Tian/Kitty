@@ -147,7 +147,6 @@ def _variant_args(**overrides):
         group_size=128,
         channel_selection=0,
         k_quant_mode="per_token",
-        v_tile_channels=None,
         quest_kernel=False,
         quest_token_budget=None,
         quest_skip_layers=0,

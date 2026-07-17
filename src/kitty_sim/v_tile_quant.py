@@ -1,8 +1,7 @@
 """Rescued V-cache tile16cC 2-bit fake-quant (rht-pcaff-mse1-bias-v1).
 
-Production path for qlutattn_*v2_pt_vtile16. Algorithm frozen in
-docs/plan/qlutattn_sign_snf_vcache_2bit_tile16_plan.md §6. Do NOT import
-probe scripts under .claude/.
+Production V path for the canonical qlutattn variant (C=64). Algorithm
+documented in docs/qlutattn.md. Do NOT import probe scripts under .claude/.
 """
 
 from __future__ import annotations
@@ -11,8 +10,6 @@ import math
 from typing import Optional, Tuple
 
 import torch
-
-from .utils_quant import fake_quant_groupwise_lastdim
 
 V_TILE_TOKENS = 16
 V_TILE_ALGO_VERSION = "rht-pcaff-mse1-bias-v1"
@@ -80,19 +77,6 @@ def rht_inverse(y: torch.Tensor, signs: torch.Tensor) -> torch.Tensor:
     return fwht_lastdim(y) * signs
 
 
-def fake_quant_v_pertoken2(value_slice: torch.Tensor) -> torch.Tensor:
-    """Whole-head per-token asymmetric min-max 2-bit (group_size = head_dim)."""
-    return fake_quant_groupwise_lastdim(
-        value_slice, group_size=value_slice.shape[-1], bit=2
-    )
-
-
-def theoretical_v_pt2_bits(D: int) -> float:
-    """Theoretical packed V bit/value in the quantized region (PT2)."""
-    D = _require_positive_int("D", D)
-    return 2.0 + 32.0 / float(D)
-
-
 def theoretical_v_tile_bits(C: int, T_quantized: int) -> float:
     """Theoretical packed V bit/value in the quantized region (tile + metadata)."""
     C = _require_positive_int("C", C)
@@ -157,32 +141,6 @@ def theoretical_v_tile_full_cache_bits(
         "T_fp16": T_fp16,
         "T_quantized": T_quantized,
         "metadata_bits": float(meta),
-    }
-
-
-def theoretical_v_pt2_full_cache_bits(
-    *,
-    D: int,
-    T_total: int,
-    T_quantized: int,
-) -> dict:
-    """Full-cache theoretical packed bits for per-token 2-bit V."""
-    D = _require_positive_int("D", D)
-    T_total = _require_positive_int("T_total", T_total)
-    if isinstance(T_quantized, bool) or not isinstance(T_quantized, int):
-        raise ValueError(f"T_quantized must be an integer, got {T_quantized!r}")
-    if T_quantized < 0 or T_quantized > T_total:
-        raise ValueError(
-            f"T_quantized must be in [0, T_total], got T_quantized={T_quantized}, "
-            f"T_total={T_total}"
-        )
-    T_fp16 = T_total - T_quantized
-    total_bits = 16 * T_fp16 * D + 2 * T_quantized * D + 32 * T_quantized
-    return {
-        "theoretical_packed_bits": total_bits / float(T_total * D),
-        "total_bits": float(total_bits),
-        "T_fp16": T_fp16,
-        "T_quantized": T_quantized,
     }
 
 

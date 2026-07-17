@@ -1,26 +1,16 @@
-"""Unit tests for the per-token K quant mode and SmoothAttention calibration math.
+"""Unit tests for the generic per-token K quant schedule.
 
 CPU-only, no model downloads:
-  PYTHONPATH=src python -m unittest tests.test_kitty_pertoken_smooth -v
+  PYTHONPATH=src python -m unittest tests.test_kitty_pertoken -v
 """
 
-import importlib.util
 import unittest
-from pathlib import Path
 from types import SimpleNamespace
 
 import torch
 
 from kitty_sim.kitty_simulate import KittyKVCacheConfig, get_kvcache_kitty
 from kitty_sim.utils_quant import fake_quant_groupwise_lastdim
-
-REPO_ROOT = Path(__file__).resolve().parents[1]
-
-_spec = importlib.util.spec_from_file_location(
-    "calibrate_smooth_qk", REPO_ROOT / "scripts" / "calibrate_smooth_qk.py"
-)
-calib = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(calib)
 
 
 def _pertoken_cache(sink=4, buffer=8, group=8, kbits=2, vbits=4):
@@ -99,66 +89,6 @@ class TestPerTokenKQuant(unittest.TestCase):
         mask = build_promote_mask(ks, 0.0, 0)
         expected = fake_quant_groupwise_lastdim(ks, 8, 2, mask, 4).transpose(2, 3)
         torch.testing.assert_close(cache.key_cache[0][:, :, 4:12, :], expected)
-
-
-class TestSmoothScales(unittest.TestCase):
-    def test_rope_pair_constraint(self):
-        absmax = torch.rand(2, 16) * 10 + 0.1
-        lam = calib.compute_smooth_scales(absmax, alpha=0.5)
-        self.assertEqual(lam.shape, (2, 16))
-        torch.testing.assert_close(lam[:, :8], lam[:, 8:])
-        expected = torch.maximum(absmax[:, :8], absmax[:, 8:]).pow(0.5)
-        torch.testing.assert_close(lam[:, :8], expected)
-
-    def test_zero_channel_is_noop(self):
-        absmax = torch.zeros(1, 4)
-        lam = calib.compute_smooth_scales(absmax, alpha=0.5)
-        torch.testing.assert_close(lam, torch.ones(1, 4))
-
-
-class TestFoldEquivalence(unittest.TestCase):
-    """End-to-end math check on a tiny fp32 Llama: folding lam into W_q/W_k
-    must leave logits unchanged and divide the post-RoPE K cache by lam."""
-
-    def _tiny_model(self):
-        from transformers import LlamaConfig, LlamaForCausalLM
-
-        cfg = LlamaConfig(
-            hidden_size=64, intermediate_size=128, num_hidden_layers=2,
-            num_attention_heads=4, num_key_value_heads=2, head_dim=16,
-            vocab_size=128, max_position_embeddings=256, tie_word_embeddings=False,
-            attn_implementation="eager",
-        )
-        torch.manual_seed(42)
-        return LlamaForCausalLM(cfg).float().eval()
-
-    def test_fold_preserves_logits_and_scales_keys(self):
-        model = self._tiny_model()
-        ids = torch.randint(0, 128, (1, 24))
-        with torch.no_grad():
-            out0 = model(ids, use_cache=True)
-        k0 = [calib.cache_layer_keys(out0.past_key_values, li).clone() for li in range(2)]
-
-        scales = {}
-        torch.manual_seed(7)
-        for li in range(2):
-            absmax = torch.rand(2, 16) * 8 + 0.2
-            scales[li] = calib.compute_smooth_scales(absmax, alpha=0.5)
-        calib.fold_scales(model, scales)
-
-        with torch.no_grad():
-            out1 = model(ids, use_cache=True)
-        torch.testing.assert_close(out1.logits, out0.logits, atol=1e-4, rtol=1e-4)
-        for li in range(2):
-            k1 = calib.cache_layer_keys(out1.past_key_values, li)
-            lam = scales[li].view(1, 2, 1, 16)
-            torch.testing.assert_close(k1, k0[li] / lam, atol=1e-5, rtol=1e-4)
-
-    def test_fold_rejects_qk_norm_arch(self):
-        model = self._tiny_model()
-        model.model.layers[0].self_attn.k_norm = torch.nn.Identity()
-        with self.assertRaises(RuntimeError):
-            calib.fold_scales(model, {0: torch.ones(2, 16), 1: torch.ones(2, 16)})
 
 
 if __name__ == "__main__":

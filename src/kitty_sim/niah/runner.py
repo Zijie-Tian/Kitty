@@ -26,7 +26,7 @@ import torch
 from tqdm import tqdm
 
 from kitty_sim.longbench.runner import (
-    NEW_V2_VARIANTS,
+    QLUTATTN_VARIANT,
     VariantConfig,
     _cache_factory,
     _sha256_file,
@@ -35,9 +35,9 @@ from kitty_sim.longbench.runner import (
     load_model_and_tokenizer,
     method_layout_slug,
     model_layout_slug,
-    validate_new_v2_model_config,
-    validate_new_v2_model_family,
-    validate_new_v2_preload,
+    validate_qlutattn_model_config,
+    validate_qlutattn_model_family,
+    validate_qlutattn_preload,
     variant_semantic_hash,
     variant_semantic_payload,
 )
@@ -248,7 +248,7 @@ def generate_niah_pair(
                     "dense fp16 mislabelled as quantized. Refusing to proceed."
                 )
             kitty_checked = True
-        if variant.name in NEW_V2_VARIANTS and kv_cache is not None:
+        if variant.name == QLUTATTN_VARIANT and kv_cache is not None:
             engagement["samples_observed"] += 1
             engagement["v_quant_calls"] += int(getattr(kv_cache, "v_quant_calls", 0))
             engagement["v_quantized_tokens"] += int(
@@ -322,8 +322,8 @@ def run_niah(args: Any) -> dict[str, Any]:
         args.model_tag or args.model, args.model_path or args.model
     )
     _reject_unsupported(variant, model_family)
-    validate_new_v2_model_family(variant, model_family)
-    validate_new_v2_preload(args, variant, model_family)
+    validate_qlutattn_model_family(variant, model_family)
+    validate_qlutattn_preload(args, variant, model_family)
 
     tasks = [t.strip() for t in str(args.tasks).split(",") if t.strip()]
     seq_lens = [int(s) for s in str(args.seq_lens).split(",") if str(s).strip()]
@@ -369,7 +369,7 @@ def run_niah(args: Any) -> dict[str, Any]:
         dtype=args.torch_dtype,
         local_files_only=args.local_files_only,
     )
-    validate_new_v2_model_config(variant, model_obj.config, model_obj.dtype)
+    validate_qlutattn_model_config(variant, model_obj.config, model_obj.dtype)
 
     manifests: list[dict[str, Any]] = []
     try:

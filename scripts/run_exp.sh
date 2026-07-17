@@ -13,7 +13,7 @@
 # method_layout_slug), separated by an underscore.
 #
 # Usage:
-#   bash scripts/run_exp.sh [all|llama|qwen|glm|deepseek|llama32] [--gpu GPU | --gpus G0,G1,...] [--max-samples N] [--variant NAME] [--v-tile-channels C]
+#   bash scripts/run_exp.sh [all|llama|qwen|glm|deepseek|llama32] [--gpu GPU | --gpus G0,G1,...] [--max-samples N] [--variant NAME]
 #   SERIAL=1 bash scripts/run_exp.sh all
 #   bash scripts/run_exp.sh llama32 --gpu 1 --max-samples 2
 #   bash scripts/run_exp.sh llama32 --gpus 0,1,2 --max-samples 2   # fan datasets across GPUs (shell-level parallelism)
@@ -48,9 +48,6 @@ GPUS_OVERRIDE="${GPUS_OVERRIDE:-}"
 MAX_SAMPLES="${MAX_SAMPLES:--1}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-32768}"
 RUN_VARIANT="${RUN_VARIANT:-}"        # empty => per-target default; --variant/RUN_VARIANT overrides
-# Empty string is an explicit unset sentinel (blocks .env re-injection of stale C).
-V_TILE_CHANNELS="${V_TILE_CHANNELS-}"
-V_TILE_CHANNELS_CLI=""
 PRINT_METHOD_SLUG=0
 RUN_MODE="${RUN_MODE:-auto}"          # auto|smoke|full -- forces layout independently of MAX_SAMPLES
 
@@ -102,7 +99,7 @@ DEEPSEEK_DEFAULT_VARIANT="${DEEPSEEK_DEFAULT_VARIANT:-kitty}"
 
 usage() {
   cat <<USAGE
-Usage: bash scripts/run_exp.sh [all|llama|qwen|glm|deepseek|llama32] [--gpu GPU | --gpus G0,G1,...] [--max-samples N] [--variant NAME] [--v-tile-channels C]
+Usage: bash scripts/run_exp.sh [all|llama|qwen|glm|deepseek|llama32] [--gpu GPU | --gpus G0,G1,...] [--max-samples N] [--variant NAME]
 
 run_exp.sh is the ONLY supported entry point for LongBench in this repo.
 
@@ -118,7 +115,7 @@ Examples:
   bash scripts/run_exp.sh llama32 --gpu 0 --max-samples 2     # smoke (2 samples)
   bash scripts/run_exp.sh llama32 --gpus 0,1,2 --max-samples 2  # fan datasets across GPUs 0,1,2
   bash scripts/run_exp.sh llama --gpu 1                       # full
-  bash scripts/run_exp.sh qwen --variant qlutattn_k1v4         # full, sigma^2-binned K quant
+  QLUT_CB_MASK=/path/to/mask.pt bash scripts/run_exp.sh llama32 --variant qlutattn   # canonical QLUTATTN
   RUN_MODE=full bash scripts/run_exp.sh llama32 --gpu 1 --max-samples 2   # full layout, few samples
   DATASETS_CSV=trec,samsum bash scripts/run_exp.sh llama32 --gpu 1        # scope datasets
 
@@ -129,14 +126,16 @@ Environment overrides:
   MAX_SAMPLES=${MAX_SAMPLES}    MAX_MODEL_LEN=${MAX_MODEL_LEN}    RUN_MODE=${RUN_MODE}
   RUN_VARIANT=${RUN_VARIANT:-<per-target default>}
   DATASETS_CSV=${DATASETS_CSV:-<full 21>}    FORCE=${FORCE:-0}
-  V_TILE_CHANNELS=${V_TILE_CHANNELS:-<unset>}    PERTOKEN_BLOCK=${PERTOKEN_BLOCK:-1}
+  QLUT_CB_MASK=${QLUT_CB_MASK:-<unset>}
 
-V-cache 2-bit variants:
-  qlutattn_k125v2_pt / qlutattn_k188v2_pt
-      whole-head per-token asymmetric V2 (sign-K / SNF-K respectively)
-  qlutattn_k125v2_pt_vtile16 / qlutattn_k188v2_pt_vtile16
-      rescued tile16cC V2; requires --v-tile-channels C or V_TILE_CHANNELS=C
-      and C must divide the model head_dim. Named V2 variants require VBITS=2.
+QLUTATTN (the single canonical QLUT variant):
+  --variant qlutattn
+      Q FP16; K per-token on the per-channel-mean-centered residual with an
+      OFFLINE sign/nf2 50/50 codebook mask (symnf2-v1, nominal K ~1.75 bit);
+      V rescued 2-bit tile16c64. Fixed algorithm: no codebook/C/block knobs.
+      Requires QLUT_CB_MASK=/path/to/mask.pt from
+      scripts/calibrate_qlutattn_mask.py (head_dim must be a power of two
+      divisible by 64). Output slug: qlutattn.
 USAGE
 }
 
@@ -228,22 +227,6 @@ parse_args() {
         fi
         shift
         ;;
-      --v-tile-channels)
-        if [[ "$#" -lt 2 || -z "${2:-}" || "${2:-}" == -* ]]; then
-          echo "ERROR: --v-tile-channels requires a positive integer" >&2
-          return 2
-        fi
-        V_TILE_CHANNELS_CLI="$2"
-        shift 2
-        ;;
-      --v-tile-channels=*)
-        V_TILE_CHANNELS_CLI="${1#--v-tile-channels=}"
-        if [[ -z "${V_TILE_CHANNELS_CLI}" ]]; then
-          echo "ERROR: --v-tile-channels requires a non-empty integer" >&2
-          return 2
-        fi
-        shift
-        ;;
       --print-method-slug)
         PRINT_METHOD_SLUG=1
         shift
@@ -288,19 +271,15 @@ select_gpus() {
 }
 
 # Resolve the output method slug through the Python canonical resolver.  The
-# shell deliberately owns no variant table: aliases, stale env validation,
-# PERTOKEN_BLOCK support, V-tile C, rv version, and QUEST suffixes all come from
-# the exact same build_variant()/method_layout_slug() path used by workers.
+# shell deliberately owns no variant table: variant names, retired-env
+# validation, and QUEST suffixes all come from the exact same
+# build_variant()/method_layout_slug() path used by workers. The preflight
+# inherits the caller's environment verbatim (QLUT_CB_MASK included), so the
+# shell and the Python worker resolve the identical canonical config.
 method_slug() {
   local variant="${1}"
-  local resolved_c="${V_TILE_CHANNELS_CLI:-${V_TILE_CHANNELS:-}}"
   local -a pf_cmd=(
     env "PYTHONPATH=${REPO_ROOT}/src:${PYTHONPATH:-}"
-    "PERTOKEN_BLOCK=${PERTOKEN_BLOCK:-1}"
-    "QLUT_CB_MASK=${QLUT_CB_MASK:-}"
-    "QLUT_BIN_CODEBOOKS=${QLUT_BIN_CODEBOOKS:-}"
-    "VBITS=${VBITS:-}"
-    "V_TILE_CHANNELS=${resolved_c}"
     "${PYTHON_BIN}" -m kitty_sim.cli.preflight_longbench
     --variant "${variant}" --resolve-config-only --json
   )
@@ -309,7 +288,6 @@ method_slug() {
   [[ -n "${PROMOTE_BIT:-}" ]] && pf_cmd+=(--promote_bit "${PROMOTE_BIT}")
   [[ -n "${PROMOTE_RATIO:-}" ]] && pf_cmd+=(--promote_ratio "${PROMOTE_RATIO}")
   [[ -n "${PROMOTE_RATIO_CONFIG:-}" ]] && pf_cmd+=(--promote-ratio-config "${PROMOTE_RATIO_CONFIG}")
-  [[ -n "${resolved_c}" ]] && pf_cmd+=(--v-tile-channels "${resolved_c}")
   [[ -n "${SHADOWKV_BUDGET:-}" ]] && pf_cmd+=(--shadowkv-budget "${SHADOWKV_BUDGET}")
   [[ -n "${SHADOWKV_RANK:-}" ]] && pf_cmd+=(--shadowkv-rank "${SHADOWKV_RANK}")
   [[ -n "${SHADOWKV_CHUNK:-}" ]] && pf_cmd+=(--shadowkv-chunk-size "${SHADOWKV_CHUNK}")
@@ -335,10 +313,6 @@ longbench_preflight_json() {
   local model_id="$1" model_path="$2" model_family="$3" variant="$4" datasets_csv="$5" max_gen="$6"
   local -a cmd=(
     env "PYTHONPATH=${REPO_ROOT}/src:${PYTHONPATH:-}"
-    "PERTOKEN_BLOCK=${PERTOKEN_BLOCK:-1}"
-    "QLUT_CB_MASK=${QLUT_CB_MASK:-}"
-    "QLUT_BIN_CODEBOOKS=${QLUT_BIN_CODEBOOKS:-}"
-    "VBITS=${VBITS:-}"
     "${PYTHON_BIN}" -m kitty_sim.cli.preflight_longbench "${model_id}"
     --model-path "${model_path}"
     --model-family "${model_family}"
@@ -358,8 +332,6 @@ longbench_preflight_json() {
   [[ -n "${PROMOTE_BIT:-}" ]] && cmd+=(--promote_bit "${PROMOTE_BIT}")
   [[ -n "${PROMOTE_RATIO:-}" ]] && cmd+=(--promote_ratio "${PROMOTE_RATIO}")
   [[ -n "${PROMOTE_RATIO_CONFIG:-}" ]] && cmd+=(--promote-ratio-config "${PROMOTE_RATIO_CONFIG}")
-  local resolved_c="${V_TILE_CHANNELS_CLI:-${V_TILE_CHANNELS:-}}"
-  [[ -n "${resolved_c}" ]] && cmd+=(--v-tile-channels "${resolved_c}")
   [[ -n "${SHADOWKV_BUDGET:-}" ]] && cmd+=(--shadowkv-budget "${SHADOWKV_BUDGET}")
   [[ -n "${SHADOWKV_RANK:-}" ]] && cmd+=(--shadowkv-rank "${SHADOWKV_RANK}")
   [[ -n "${SHADOWKV_CHUNK:-}" ]] && cmd+=(--shadowkv-chunk-size "${SHADOWKV_CHUNK}")
@@ -606,13 +578,6 @@ run_eval_dataset() {
   fi
   if [[ -n "${PROMOTE_RATIO_CONFIG:-}" ]]; then
     cmd+=(--promote-ratio-config "${PROMOTE_RATIO_CONFIG}")
-  fi
-  # Rescued V tile channel block C (CLI > env). Empty string = explicit unset.
-  local resolved_v_tile="${V_TILE_CHANNELS_CLI:-${V_TILE_CHANNELS:-}}"
-  if [[ -n "${V_TILE_CHANNELS_CLI}" ]]; then
-    cmd+=(--v-tile-channels "${V_TILE_CHANNELS_CLI}")
-  elif [[ -n "${resolved_v_tile}" ]]; then
-    cmd+=(--v-tile-channels "${resolved_v_tile}")
   fi
   # ShadowKV sim controls (only meaningful for the shadowkv variant; ignored otherwise).
   if [[ -n "${SHADOWKV_BUDGET:-}" ]]; then

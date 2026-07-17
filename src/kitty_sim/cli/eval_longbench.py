@@ -13,7 +13,7 @@ _VARIANT_CHOICES = [
     "fp16",
     "kitty",
     "shadowkv",
-    "qlutattn_pertoken",
+    "qlutattn",
     "kivi",
     "kivi_star",
     "llamacpp_q40",
@@ -21,37 +21,6 @@ _VARIANT_CHOICES = [
     "llamacpp_q40_star",
     "llamacpp-q40-star",
     "custom",
-    "qlutattn_k1v4",
-    "qlutattn-k1v4",
-    "qlutattn_k184v4",
-    "qlutattn-k184v4",
-    "qlutattn_k125v4",
-    "qlutattn-k125v4",
-    "qlutattn_k125v4_pt",
-    "qlutattn-k125v4-pt",
-    "qlutattn_k185v4_pt",
-    "qlutattn-k185v4-pt",
-    "qlutattn_k168v4_pt",
-    "qlutattn-k168v4-pt",
-    "qlutattn-k1.68v4-pt",
-    "qlutattn_k188v4_pt",
-    "qlutattn-k188v4-pt",
-    "qlutattn_k125v2_pt",
-    "qlutattn-k125v2-pt",
-    "qlutattn_k188v2_pt",
-    "qlutattn-k188v2-pt",
-    "qlutattn_k125v2_pt_vtile16",
-    "qlutattn-k125v2-pt-vtile16",
-    "qlutattn_k188v2_pt_vtile16",
-    "qlutattn-k188v2-pt-vtile16",
-    "qlutattn_rotated_k125v4_pt",
-    "qlutattn-rotated-k125v4-pt",
-    "qlutattn_rotated_k185v4_pt",
-    "qlutattn-rotated-k185v4-pt",
-    "qlutattn_rotated_st_pt",
-    "qlutattn-rotated-st-pt",
-    "qlutattn_rotated_snf_pt",
-    "qlutattn-rotated-snf-pt",
 ]
 
 
@@ -65,12 +34,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--variant",
         default="kitty",
         choices=_VARIANT_CHOICES,
-    )
-    parser.add_argument(
-        "--v-tile-channels",
-        type=int,
-        default=None,
-        help="Channel block C for rescued V tile16cC variants (required for *_vtile16).",
     )
     parser.add_argument(
         "--resolve-config-only",
@@ -109,7 +72,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--quest-kernel",
         action="store_true",
-        help="Overlay Triton QUEST sparse decode on the selected Kitty/QLUTATTN fake-quant variant.",
+        help="Overlay Triton QUEST sparse decode on a Kitty/KIVI fake-quant variant (not qlutattn).",
     )
     parser.add_argument(
         "--quest-token-budget",
