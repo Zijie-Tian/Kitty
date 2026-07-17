@@ -802,11 +802,18 @@ class KittyKVCache(DynamicCache):
                         if getattr(self, "token_tier", False):
                             from . import token_tier as _tt
                             q_full = _tt.take_q()
-                            if q_full is not None and q_full.shape[2] == current_cache_length:
-                                sc = _tt.observation_scores(
-                                    q_full, current_key_cache, k_end_idx,
-                                    self.tier_window, current_key_cache.shape[1])
-                                tier = _tt.tier_from_scores(sc, self.tier_rho)[:, start_idx:k_end_idx]
+                            # Fail fast: a token-tier run must never silently
+                            # degrade to the lo-only mask (mislabeled results).
+                            if q_full is None or q_full.shape[2] != current_cache_length:
+                                got = None if q_full is None else tuple(q_full.shape)
+                                raise RuntimeError(
+                                    f"token-tier prefill scoring unavailable at layer {layer_idx}: "
+                                    f"rope q-tap gave {got}, cache length {current_cache_length}; "
+                                    "is the tap installed for this model family?")
+                            sc = _tt.observation_scores(
+                                q_full, current_key_cache, k_end_idx,
+                                self.tier_window, current_key_cache.shape[1])
+                            tier = _tt.tier_from_scores(sc, self.tier_rho)[:, start_idx:k_end_idx]
                         ks = current_key_cache[:, :, start_idx:k_end_idx, :]
                         ks = self._quant_k_pertoken(ks, layer_idx, tier=tier)
                         current_key_cache[:, :, start_idx:k_end_idx, :] = ks
