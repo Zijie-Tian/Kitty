@@ -57,6 +57,9 @@ def main():
     p.add_argument("--qstats", default=None, help="q_absmean blob for query-aware signals")
     p.add_argument("--layer-fracs", default=None,
                    help="per-layer sign-frac overrides 'L:f,L:f'; other layers rebalance to keep the global budget")
+    p.add_argument("--per-head", action="store_true",
+                   help="rank channels within each kv-head separately (each head gets the same sign fraction) "
+                        "instead of the default layer-global ranking that lets loud heads take more nf2 budget")
     p.add_argument("--output", required=True)
     args = p.parse_args()
 
@@ -98,12 +101,21 @@ def main():
     per_layer_sign = []
     for li in range(nl):
         f_li = overrides.get(li, rest_frac if rest else args.sign_frac)
-        k_sign = int(round(f_li * N))
-        order = torch.argsort(signal[li].reshape(-1))               # ascending
-        m = torch.ones(N, dtype=torch.uint8)                        # default nf2(1)
-        m[order[:k_sign]] = 0                                       # lowest -> sign
-        mask[li] = m.reshape(n_kv, D)
-        per_layer_sign.append(k_sign)
+        if args.per_head:
+            k_sign_h = int(round(f_li * D))
+            m = torch.ones(n_kv, D, dtype=torch.uint8)              # default nf2(1)
+            for hi in range(n_kv):
+                order = torch.argsort(signal[li, hi])               # ascending, within head
+                m[hi, order[:k_sign_h]] = 0
+            mask[li] = m
+            per_layer_sign.append(k_sign_h * n_kv)
+        else:
+            k_sign = int(round(f_li * N))
+            order = torch.argsort(signal[li].reshape(-1))           # ascending, layer-global
+            m = torch.ones(N, dtype=torch.uint8)                    # default nf2(1)
+            m[order[:k_sign]] = 0                                   # lowest -> sign
+            mask[li] = m.reshape(n_kv, D)
+            per_layer_sign.append(k_sign)
 
     fs = sum(per_layer_sign) / (nl * N)
     nominal = fs * BITS["sign"] + (1 - fs) * BITS["nf2"]
