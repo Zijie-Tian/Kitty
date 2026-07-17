@@ -8,7 +8,7 @@
 验证 **KIVI 必须用 per-channel 量化保护的 K "channel outlier",其高能量主要来自
 per-channel 的 μ²(恒定 DC 偏置),而非 σ²(残差方差)**;推论是:减全局 per-channel
 均值(0 bit,`q·μ` 在 softmax 抵消)就能消掉 KIVI per-channel 设计要解决的那个问题,这
-正是 `qlutattn-snf-pt`(per-token sign/nf2)成立的能量依据。
+正是 canonical `qlutattn`(per-token sign/nf2)成立的能量依据。
 
 ## 1. 假设
 
@@ -25,11 +25,11 @@ per-channel 的 μ²(恒定 DC 偏置),而非 σ²(残差方差)**;推论是:减
 autoresearch 的内核是 **modify→verify→keep/discard→repeat**(优化)。本目标是**测量 /
 假设验证**:模型权重固定,没有"可改来推高指标的代码"。因此执行形态 = **一组有限的、
 可证伪的鉴别性实验**,跑完出图/表/JSON,而**不是开环迭代**。唯一能套优化循环的子问题是
-"搜索最便宜的减均值+per-token 码本方案",但那是 snf-pt 调参,不是本问题。
+"搜索最便宜的减均值+per-token 码本方案",但那是 qlutattn 调参,不是本问题。
 
 ## 3. 🔑 决定成败的口径:减的是哪个均值
 
-`kvcache-energy-probe` 默认 `--group 128`(per-128-token **组均值**)。但 snf-pt 减的是
+`kvcache-energy-probe` 默认 `--group 128`(per-128-token **组均值**)。但 qlutattn 减的是
 **全局 per-channel 均值**(over 整段 prompt)。两者本质不同:
 
 | 均值 | 与 token 的关系 | `q·μ` 抵消? | 是否免费 |
@@ -42,7 +42,7 @@ autoresearch 的内核是 **modify→verify→keep/discard→repeat**(优化)。
 
 ## 4. Smoke 锚定结果(本机,Llama-3.2-1B,post-RoPE,2048-token LongBench,全 16 层 pooled)
 
-| 量 | 口径 A `--group 2048`(全局 per-channel,= snf-pt 免费移除) | 口径 B `--group 128`(组均值) |
+| 量 | 口径 A `--group 2048`(全局 per-channel,= qlutattn 免费移除) | 口径 B `--group 128`(组均值) |
 | --- | ---: | ---: |
 | **K** μ² 占比 | **52.81%**(层间 47–58%) | **65.01%** |
 | **K** σ² 占比 | 47.19% | 34.99% |
@@ -56,7 +56,7 @@ autoresearch 的内核是 **modify→verify→keep/discard→repeat**(优化)。
 1. **口径差是真的**:全局 per-channel(52.8%)vs 组均值(65.0%)差 ~12pp;这 12pp 是
    `q·μ_g` 不抵消的"局部慢变",**不免费**。用探针默认 G=128 会高估免费红利 12pp。
 2. **K/V 不对称解释了为什么免费减均值只用在 K**:K μ²=52.8%(DC 重,可免费移除),
-   V μ²=12.5%(σ² 重,减均值拿不到能量)→ snf-pt 减均值用在 K、V 走 per-token 4-bit。
+   V μ²=12.5%(σ² 重,减均值拿不到能量)→ qlutattn 减均值用在 K(V 走 2-bit tile16c64)。
 3. **ρ=0.73–0.78 < 高斯 0.798**:尾部偏重(与另一机器转录的 0.738 一致)→ 高 σ² 通道需
    自适应码本(nf2),固定高斯码本不够。
 4. **⚠️ μ² 占比随上下文长度变**:同一 layer8,口径 A 在 2048-tok=51.2%,而 32512-tok
@@ -103,10 +103,10 @@ per-channel 要解决的那个具体崩溃"(因果)。下游旁证已有:CLAUDE.
 环境:`kitty` env、GPU1-only、LongBench 在 `.env` 的 `LONGBENCH_DATA_ROOT`。
 
 ```bash
-cd /mnt/data/tzj/Code/Kitty
-export LONGBENCH_DATA_ROOT=/mnt/data/tzj/data/LongBench
-PY=/mnt/data/tzj/anaconda3/envs/kitty/bin/python
-M=/mnt/data/tzj/models/Llama-3.2-1B-Instruct
+cd /path/to/Kitty
+export LONGBENCH_DATA_ROOT=$HOME/data/LongBench
+PY=$HOME/anaconda3/envs/kitty/bin/python
+M=$HOME/models/Llama-3.2-1B-Instruct
 SK=.claude/skills/kvcache-energy-probe/scripts
 
 # E1 + E5(普适性):per-(layer,dim/head) μ² 热力图,--group=seq_len 取全局 per-channel 口径
@@ -129,7 +129,7 @@ CUDA_VISIBLE_DEVICES=1 $PY $SK/task_channel_profile.py    --model $M --seq-len 3
 
 - **E3 需我写新探针**(§6),是 headline / 最强单一证据。
 - **E5 的 `calibrate_sigma_channels` 需 wikitext parquet**(本机是否有待确认;另一机器在
-  `/home/zijie/data/wikitext/...`)。
+  `$HOME/data/wikitext/...`)。
 - 对外发布(Notion 研究笔记)前:所有数字在 **full 32k**、**全层**、**per-channel 三类
   粒度**出齐;按 CLAUDE.md 路由到 `📚 研究笔记 | Research Notes`,且写 Notion 属外发,需
   先过目。
@@ -137,11 +137,11 @@ CUDA_VISIBLE_DEVICES=1 $PY $SK/task_channel_profile.py    --model $M --seq-len 3
 ## 附:smoke 复现命令
 
 ```bash
-cd /mnt/data/tzj/Code/Kitty
-export LONGBENCH_DATA_ROOT=/mnt/data/tzj/data/LongBench
-PY=/mnt/data/tzj/anaconda3/envs/kitty/bin/python
+cd /path/to/Kitty
+export LONGBENCH_DATA_ROOT=$HOME/data/LongBench
+PY=$HOME/anaconda3/envs/kitty/bin/python
 S=.claude/skills/kvcache-energy-probe/scripts/submean_energy.py
-M=/mnt/data/tzj/models/Llama-3.2-1B-Instruct
+M=$HOME/models/Llama-3.2-1B-Instruct
 CUDA_VISIBLE_DEVICES=1 $PY $S --model $M --seq-len 2048 --group 2048 --out /tmp/se_A.json  # 口径 A 52.81%
 CUDA_VISIBLE_DEVICES=1 $PY $S --model $M --seq-len 2048 --group 128  --out /tmp/se_B.json  # 口径 B 65.01%
 ```

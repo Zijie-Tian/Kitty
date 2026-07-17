@@ -3,9 +3,9 @@
   "evals": [
     {
       "id": 1,
-      "prompt": "在 Kitty 仓库里画一个合并的 K-cache Pareto 图（要包含 per-token sign/nf2 sweep 和 reference methods），输出到 docs/ 目录。",
-      "expected_output": "生成 docs/kcache_pareto_combined_llama32_1b.png，图中应包含 fp16 ceiling 虚线、per-channel k1v4 参考线、per-token 非旋转/旋转的 sign/tern/nf2 曲线以及默认甜点标注。",
-      "files": ["docs/kcache_pareto_combined_llama32_1b.png"]
+      "prompt": "在 Kitty 仓库里用 kv-cache-viz 画 sign/nf2 codebook 在 μ²-dominant vs σ²-dominant 通道上的示意图（layer 8 的 K dump 已在 probe_out/，tag 用 llama32-1b）。",
+      "expected_output": "生成 probe_out/why_codebook_sign_mu2_vs_sigma2_llama32-1b.png、probe_out/why_codebook_nf2_mu2_vs_sigma2_llama32-1b.png 和 probe_out/why_codebook_mix_mu2_vs_sigma2_llama32-1b.png：sign 图为 2 levels（μ±E|r|），nf2 图为固定 symnf2-v1 LUT 的 4 levels，mix 图展示 qlutattn 的选择规则（低 σ² 通道 → sign，高 σ² 通道 → nf2）。",
+      "files": ["probe_out/why_codebook_sign_mu2_vs_sigma2_llama32-1b.png", "probe_out/why_codebook_nf2_mu2_vs_sigma2_llama32-1b.png", "probe_out/why_codebook_mix_mu2_vs_sigma2_llama32-1b.png"]
     },
     {
       "id": 2,

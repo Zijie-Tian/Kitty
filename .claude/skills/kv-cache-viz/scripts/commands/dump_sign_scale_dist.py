@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Dump the per-token SIGN-group scale (mag) of snf-pt K-quant and test whether it
+"""Dump the per-token SIGN-group scale (mag) of qlutattn K-quant and test whether it
 can be shared across 16-token blocks (a per-tensor scale over each block).
 
-snf-pt's sign scale is, per (head, token):
+qlutattn's sign scale is, per (head, token):
     mag = mean_{ch in sign-group} |r|,   r = K - per_channel_mean
 where the sign-group = the LOW-sigma^2 half of the head_dim channels (the offline
 split: low sigma^2 -> sign). This reproduces kitty_simulate._pt_codebook_masked's
@@ -80,7 +80,7 @@ def run(argv=None):
         K = data["K"][li]  # [nh, Tq, D]
         nh, Tq, _ = K.shape
         mu = K.mean(1, keepdim=True)  # [nh, 1, D] per-channel mean
-        r = K - mu  # residual snf-pt quantizes
+        r = K - mu  # residual qlutattn quantizes
         sig2 = r.var(1)  # [nh, D] per-channel residual var
         k = max(1, int(round(f * D)))
         order = torch.argsort(sig2, dim=1)  # ascending sigma^2
@@ -209,7 +209,7 @@ def run(argv=None):
     axs[1, 1].set_ylabel("NMSE")
     axs[1, 1].tick_params(axis="x", rotation=20)
     fig.suptitle(
-        f"snf-pt sign per-token scale study — {a.tag} "
+        f"qlutattn sign per-token scale study — {a.tag} "
         f"(D={D}, sign-frac={f}, T={T})",
         fontsize=13,
     )

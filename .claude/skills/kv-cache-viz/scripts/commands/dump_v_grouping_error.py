@@ -239,7 +239,7 @@ def quant_v(
 
     Group = N consecutive tokens x M consecutive channels; one (scale, zp) per
     group. Tail tokens (T % N != 0) form one smaller final block, matching the
-    K PERTOKEN_BLOCK block-aligned schedule.
+    K cache's block-aligned tail schedule.
 
     Optional prefixes explore large-tile rescue methods:
       pcmean_ / pcrms_ / pcaff_: prompt-calibrated per-channel normalization;

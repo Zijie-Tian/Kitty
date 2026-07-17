@@ -1,66 +1,0 @@
-[10:44] fp16 ceiling ...
-========== llama32: GPU(s)=1 (1 parallel) variant=fp16 mode=full datasets=21 out=longbench_out/llama32-1b-instruct_fp16/pred ==========
-[skip] narrativeqa: already complete 200/200
-[skip] qasper: already complete 200/200
-[skip] multifieldqa_en: already complete 150/150
-[skip] multifieldqa_zh: already complete 200/200
-[skip] hotpotqa: already complete 200/200
-[skip] 2wikimqa: already complete 200/200
-[skip] musique: already complete 200/200
-[skip] dureader: already complete 200/200
-[skip] gov_report: already complete 200/200
-[skip] qmsum: already complete 200/200
-[skip] multi_news: already complete 200/200
-[skip] vcsum: already complete 200/200
-[skip] trec: already complete 200/200
-[skip] triviaqa: already complete 200/200
-[skip] samsum: already complete 200/200
-[skip] lsht: already complete 200/200
-[skip] passage_retrieval_en: already complete 200/200
-[skip] passage_count: already complete 200/200
-[skip] passage_retrieval_zh: already complete 200/200
-[skip] lcc: already complete 500/500
-[skip] repobench-p: already complete 500/500
-[parallel] nothing to run for llama32 (all datasets already complete)
-[score] strict longbench_out/llama32-1b-instruct_fp16/pred -> result.json
-[score] wrote longbench_out/llama32-1b-instruct_fp16/pred/result.json
-{'2wikimqa': 28.9, 'dureader': 15.0, 'gov_report': 17.09, 'hotpotqa': 36.97, 'lcc': 35.51, 'lsht': 42.75, 'multi_news': 16.0, 'multifieldqa_en': 43.57, 'multifieldqa_zh': 22.84, 'musique': 21.59, 'narrativeqa': 21.31, 'passage_count': 3.5, 'passage_retrieval_en': 4.12, 'passage_retrieval_zh': 3.34, 'qasper': 23.33, 'qmsum': 15.03, 'repobench-p': 40.32, 'samsum': 28.36, 'trec': 65.0, 'triviaqa': 80.85, 'vcsum': 14.1}
-========== llama32: complete -> longbench_out/llama32-1b-instruct_fp16/pred ==========
-[10:44] per-token nf2 baseline ...
-========== llama32: GPU(s)=1 (1 parallel) variant=qlutattn_pertoken mode=full datasets=21 out=longbench_out/llama32-1b-instruct_qlutattn-pertoken/pred ==========
-[run] narrativeqa: missing 0/200
-[run] qasper: missing 0/200
-[run] multifieldqa_en: missing 0/150
-[run] multifieldqa_zh: missing 0/200
-[run] hotpotqa: missing 0/200
-[run] 2wikimqa: missing 0/200
-[run] musique: missing 0/200
-[run] dureader: missing 0/200
-[run] gov_report: missing 0/200
-[run] qmsum: missing 0/200
-[run] multi_news: missing 0/200
-[run] vcsum: missing 0/200
-[run] trec: missing 0/200
-[run] triviaqa: missing 0/200
-[run] samsum: missing 0/200
-[run] lsht: missing 0/200
-[run] passage_retrieval_en: missing 0/200
-[run] passage_count: missing 0/200
-[run] passage_retrieval_zh: missing 0/200
-[run] lcc: missing 0/500
-[run] repobench-p: missing 0/500
-[parallel] dispatch dataset=narrativeqa -> GPU1 (slot 0, pid 1722228)
-[gpu1] [start] GPU1 llama32-1b-instruct_qlutattn-pertoken_full dataset=narrativeqa variant=qlutattn_pertoken max_samples=-1 max_model_len=32768
-[gpu1] `torch_dtype` is deprecated! Use `dtype` instead!
-[gpu1] ================================================================================
-[gpu1] Kitty LongBench evaluation
-[gpu1] model=meta-llama/Llama-3.2-1B-Instruct path=/home/zijie/models/Llama-3.2-1B-Instruct
-[gpu1] model_tag=llama32-1b-instruct_qlutattn-pertoken_full model_family=llama3
-[gpu1] variant=qlutattn_pertoken_nb1_v4_cb194329
-[gpu1] datasets=['narrativeqa']
-[gpu1] max_samples=-1 max_model_len=32768
-[gpu1] CUDA_VISIBLE_DEVICES=1
-[gpu1] output=longbench_out/llama32-1b-instruct_qlutattn-pertoken/pred
-[gpu1] ================================================================================
-[gpu1] narrativeqa:   0%|          | 0/200 [00:00<?, ?it/s]The following generation flags are not valid and may be ignored: ['top_p']. Set `TRANSFORMERS_VERBOSITY=info` for more details.
-[gpu1] narrativeqa:   0%|          | 1/200 [00:06<19:54,  6.00s/it]narrativeqa:   1%|          | 2/200 [00:12<21:10,  6.41s/it]narrativeqa:   2%|▏         | 3/200 [00:14<13:50,  4.22s/it]narrativeqa:   2%|▏         | 4/200 [00:15<10:22,  3.18s/it]narrativeqa:   2%|▎         | 5/200 [00:22<14:16,  4.39s/it]narrativeqa:   3%|▎         | 6/200 [00:24<11:20,  3.51s/it]narrativeqa:   4%|▎         | 7/200 [00:29<13:05,  4.07s/it]narrativeqa:   4%|▍         | 8/200 [00:34<14:25,  4.51s/it]narrativeqa:   4%|▍         | 9/200 [00:39<14:52,  4.67s/it]narrativeqa:   5%|▌         | 10/200 [00:41<11:18,  3.57s/it]narrativeqa:   6%|▌         | 11/200 [00:48<14:34,  4.63s/it]narrativeqa:   6%|▌         | 12/200 [00:50<12:13,  3.90s/it]narrativeqa:   6%|▋         | 13/200 [00:51<09:52,  3.17s/it]narrativeqa:   7%|▋         | 14/200 [00:53<08:34,  2.77s/it]narrativeqa:   8%|▊         | 15/200 [00:55<07:22,  2.39s/it]narrativeqa:   8%|▊         | 16/200 [01:02<11:55,  3.89s/it]narrativeqa:   8%|▊         | 17/200 [01:07<12:38,  4.14s/it]narrativeqa:   9%|▉         | 18/200 [01:14<15:10,  5.00s/it]narrativeqa:  10%|▉         | 19/200 [01:20<16:11,  5.37s/it]narrativeqa:  10%|█         | 20/200 [01:21<12:18,  4.10s/it]narrativeqa:  10%|█         | 21/200 [01:24<10:45,  3.61s/it]narrativeqa:  11%|█         | 22/200 [01:29<12:32,  4.23s/it]narrativeqa:  12%|█▏        | 23/200 [01:37<15:28,  5.25s/it]narrativeqa:  12%|█▏        | 24/200 [01:38<11:53,  4.06s/it]narrativeqa:  12%|█▎        | 25/200 [01:44<13:17,  4.56s/it]narrativeqa:  13%|█▎        | 26/200 [01:49<14:01,  4.83s/it]narrativeqa:  14%|█▎        | 27/200 [01:51<11:12,  3.89s/it]narrativeqa:  14%|█▍        | 28/200 [01:57<13:08,  4.59s/it]narrativeqa:  14%|█▍        | 29/200 [02:04<14:33,  5.11s/it]narrativeqa:  15%|█▌        | 30/200 [02:09<14:52,  5.25s/it]narrativeqa:  16%|█▌        | 31/200 [02:12<13:02,  4.63s/it]narrativeqa:  16%|█▌        | 32/200 [02:18<13:35,  4.85s/it]narrativeqa:  16%|█▋        | 33/200 [02:23<13:33,  4.87s/it]narrativeqa:  17%|█▋        | 34/200 [02:28<13:55,  5.03s/it]narrativeqa:  18%|█▊        | 35/200 [02:31<11:54,  4.33s/it]narrativeqa:  18%|█▊        | 36/200 [02:37<13:06,  4.80s/it]narrativeqa:  18%|█▊        | 37/200 [02:43<14:22,  5.29s/it]narrativeqa:  19%|█▉        | 38/200 [02:57<21:07,  7.83s/it]narrativeqa:  20%|█▉        | 39/200 [03:02<19:07,  7.13s/it]narrativeqa:  20%|██        | 40/200 [03:08<17:52,  6.70s/it]narrativeqa:  20%|██        | 41/200 [03:13<16:46,  6.33s/it]narrativeqa:  21%|██        | 42/200 [03:19<15:57,  6.06s/it]narrativeqa:  22%|██▏       | 43/200 [03:31<20:24,  7.80s/it]narrativeqa:  22%|██▏       | 44/200 [03:36<18:35,  7.15s/it]narrativeqa:  22%|██▎       | 45/200 [03:38<14:19,  5.55s/it]narrativeqa:  23%|██▎       | 46/200 [03:54<22:08,  8.62s/it]narrativeqa:  24%|██▎       | 47/200 [03:59<19:33,  7.67s/it]narrativeqa:  24%|██▍       | 48/200 [04:05<17:54,  7.07s/it]narrativeqa:  24%|██▍       | 49/200 [04:08<14:58,  5.95s/it]narrativeqa:  25%|██▌       | 50/200 [04:11<12:26,  4.98s/it]narrativeqa:  26%|██▌       | 51/200 [04:17<13:17,  5.35s/it]narrativeqa:  26%|██▌       | 52/200 [04:24<13:47,  5.59s/it]narrativeqa:  26%|██▋       | 53/200 [04:29<13:41,  5.59s/it]narrativeqa:  27%|██▋       | 54/200 [04:35<13:32,  5.56s/it]narrativeqa:  28%|██▊       | 55/200 [04:40<13:18,  5.51s/it]narrativeqa:  28%|██▊       | 56/200 [04:47<14:02,  5.85s/it]narrativeqa:  28%|██▊       | 57/200 [04:52<13:35,  5.70s/it]narrativeqa:  29%|██▉       | 58/200 [04:57<13:18,  5.62s/it]narrativeqa:  30%|██▉       | 59/200 [04:59<10:19,  4.40s/it]narrativeqa:  30%|███       | 60/200 [05:05<11:09,  4.78s/it]narrativeqa:  30%|███       | 61/200 [05:06<08:35,  3.71s/it]narrativeqa:  31%|███       | 62/200 [05:07<07:01,  3.05s/it]narrativeqa:  32%|███▏      | 63/200 [05:13<08:42,  3.81s/it]narrativeqa:  32%|███▏      | 64/200 [05:16<08:19,  3.68s/it]narrativeqa:  32%|███▎      | 65/200 [05:18<07:07,  3.16s/it]narrativeqa:  33%|███▎      | 66/200 [05:24<08:40,  3.88s/it]narrativeqa:  34%|███▎      | 67/200 [05:25<07:03,  3.19s/it]narrativeqa:  34%|███▍      | 68/200 [05:31<08:30,  3.86s/it]narrativeqa:  34%|███▍      | 69/200 [05:34<07:48,  3.58s/it]

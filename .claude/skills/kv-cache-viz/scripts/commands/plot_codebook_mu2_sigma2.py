@@ -2,8 +2,12 @@
 # -*- coding: utf-8 -*-
 """Two figures (sign / nf2): how each K-cache codebook's levels sit on a
 mu^2-dominant (low sigma^2, high dc_share) channel vs a sigma^2-dominant
-(high sigma^2, low dc_share) channel, on REAL post-RoPE K.
-Levels + reconstruction error come from the method's own qlut_quant.apply_codebook.
+(high sigma^2, low dc_share) channel, on REAL post-RoPE K. This illustrates
+exactly the canonical qlutattn K design (offline mask: low sigma^2 -> sign,
+high sigma^2 -> nf2).
+Reconstructions are inlined from the current qlutattn primitives:
+  sign = mu + sign(r) * mean|r|            (r = x - group mean, 1-bit)
+  nf2  = mu + nf2_symmetric_lastdim(x-mu)  (fixed symnf2-v1 LUT, absmax scale)
 Style follows probe_out/sign_scale/why_minmax_a_residual_levels_llama32-1b.png."""
 import argparse
 import sys
@@ -19,7 +23,7 @@ from lib.common import (
 )
 
 sys.path.insert(0, "src")
-from kitty_sim.qlut_quant import apply_codebook
+from kitty_sim.qlut_quant import nf2_symmetric_lastdim
 
 
 def run(argv=None):
@@ -43,11 +47,11 @@ def run(argv=None):
     print(f"K {tuple(K.shape)}  region={Treg} tokens", flush=True)
 
     def info(h, c):
-        v = Kr[h, :, c].contiguous().reshape(1, 1, -1)  # one group = all region tokens
-        Lt = v.shape[-1]
-        rs = apply_codebook(v, Lt, "sign").reshape(-1)  # method's real sign reconstruction
-        rn = apply_codebook(v, Lt, "nf2").reshape(-1)  # method's real nf2 (Lloyd-4) reconstruction
-        vv = v.reshape(-1)
+        vv = Kr[h, :, c].contiguous().reshape(-1)  # one group = all region tokens
+        mu_g = vv.mean()                           # group mean (plays the role of mu_d)
+        r = vv - mu_g                              # centered residual, qlutattn quantizes this
+        rs = mu_g + torch.sign(r) * r.abs().mean()  # sign: 1-bit, mean-|r| scale
+        rn = mu_g + nf2_symmetric_lastdim(r)        # nf2: fixed symnf2-v1 LUT, absmax scale
         s2 = vv.var().item()
         return dict(
             h=h,
@@ -130,7 +134,7 @@ def run(argv=None):
         "mse_sign",
         "sign",
         f"{a.outdir}/why_codebook_nf2_mu2_vs_sigma2_{a.tag}.png",
-        r"nf2 (2-bit, 4-level Lloyd): error $\approx0.12\,\sigma^2$ "
+        r"nf2 (2-bit, fixed symnf2-v1 LUT $\{-1,-c,+c,+1\}$): lower error than sign "
         r"— overkill on $\mu^2$-dominant, necessary on $\sigma^2$-dominant to cut the large absolute error",
     )
 
@@ -214,25 +218,25 @@ bold/solid, the other faint/dashed; a formula band documents both codebooks."""
         axt.text(0.02, 0.55, r"$\mu=\frac{1}{G}\sum_i x_i,\qquad m=\frac{1}{G}\sum_i|x_i-\mu|$", fontsize=13, va="top")
         axt.text(0.02, 0.27, r"$\hat x_i=\mu+m\,\mathrm{sign}(x_i-\mu)\in\{\mu-m,\ \mu+m\}$", fontsize=13, va="top")
         axt.text(0.02, 0.04, r"$\Rightarrow\ 1+32/G=1.25$ bit @ $G{=}128$", fontsize=9.5, color="#555", va="top")
-        axt.text(0.53, 0.78, "nf2  (2-bit, 4-level Lloyd-Max):", fontsize=11.5, weight="bold", color=ORANGE, va="top")
+        axt.text(0.53, 0.78, "nf2  (2-bit, fixed symnf2-v1 LUT):", fontsize=11.5, weight="bold", color=ORANGE, va="top")
         axt.text(
             0.53,
             0.57,
-            r"levels $\{\ell_0,\ell_1,\ell_2,\ell_3\}$:  assign $a_i=\mathrm{argmin}_k|x_i-\ell_k|$,",
+            r"fixed levels $s\cdot\{-1,-c,+c,+1\}$,  $c=0.2526$,  $s=\max_i|x_i-\mu|$ (absmax),",
             fontsize=11.5,
             va="top",
         )
         axt.text(
             0.53,
             0.37,
-            r"update $\ell_k=\mathrm{mean}\{x_i:a_i{=}k\}$  (iterate);   $\hat x_i=\ell_{a_i}$",
+            r"$\hat x_i=\mu+s\,\mathrm{sign}(x_i{-}\mu)\cdot(1$ if $|x_i{-}\mu|>\frac{1+c}{2}s$ else $c)$",
             fontsize=11.5,
             va="top",
         )
         axt.text(
             0.53,
             0.10,
-            r"init $\ell_k=\min x+\frac{k+0.5}{4}(\max x-\min x)$;   $\approx 2+32/G=2.25$ bit",
+            r"LUT is fixed (no fitting); only $s$ is data-dependent;   $\approx 2+32/G=2.25$ bit",
             fontsize=9.5,
             color="#555",
             va="top",

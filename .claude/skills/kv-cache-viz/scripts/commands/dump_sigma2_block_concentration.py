@@ -4,7 +4,8 @@
 
 Split the quantized region into consecutive 128-token blocks. For each
 (layer, head, block, channel) compute the in-block residual variance (var over
-the 128 tokens, i.e. submean-then-var = the snf-pt/calibrate sigma^2 at G=128).
+the 128 tokens, i.e. submean-then-var = the qlutattn calibration sigma^2 at
+G=128, cf. scripts/calibrate_qlutattn_mask.py).
 Then two concentration metrics:
 
   (A) within-block, across channels: for each (head, block), CV of sigma^2 over

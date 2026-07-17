@@ -5,11 +5,17 @@ Token x Channel x value), coolwarm colormap:
   1) K (original)
   2) mu_K (per-channel mean)
   3) K - mu_K (residual)
-  4) K_hat after qlutattn-sign-pt quant = mu_K + sign(K-mu_K)*mag
-All share one symmetric z-limit."""
+  4) K_hat = qlutattn sign-channel reconstruction = mu_K + sign(K-mu_K)*mag
+All share one symmetric z-limit.
+
+Panel 4 uses the real runtime primitive KittyKVCache._pt_codebook_masked
+(cb='sign': 1-bit, per-token masked-mean |r| scale) applied to every channel of
+the selected head — i.e. it illustrates what the canonical qlutattn K path does
+on its sign channels (in the deployed variant the offline mask sends only the
+50% lowest-sigma^2 channels to sign; the rest go to the fixed symmetric NF2
+LUT)."""
 import argparse
 import sys
-from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -41,26 +47,22 @@ def run(argv=None):
     T, D = K.shape
     muK = K.mean(0)  # [D]
 
-    # real qlutattn-sign-pt quant (per-channel submean + per-token 1-bit sign)
-    mock = SimpleNamespace(
-        k_codebook="qlut",
-        bin_codebooks=["sign"],
-        pertoken_offline=False,
-        pertoken_mixed=False,
-        pertoken_pc_submean=True,
-        pertoken_rotate=False,
-        k_pc_mean={},
-    )
-    Khat = KittyKVCache._quant_k_pertoken(mock, K[None, None].to(a.device), 0)[0, 0].float().cpu()  # [T, D]
+    # qlutattn sign-channel reconstruction via the runtime primitive:
+    # r = K - mu_d, then the 'sign' codebook (per-token masked-mean |r| scale)
+    # over all channels of this head (all-True mask).
+    r = (K - muK)[None, None].to(a.device)                    # [1, 1, T, D]
+    m = torch.ones(1, D, dtype=torch.bool, device=r.device)   # [nh=1, D]
+    rec = KittyKVCache._pt_codebook_masked(r, m, "sign")[0, 0].float().cpu()  # [T, D]
+    Khat = muK + rec
     nmse = (((K - Khat) ** 2).sum() / (K ** 2).sum()).item()
-    print(f"sign-pt dequant NMSE={nmse:.4f}")
+    print(f"qlutattn (sign channels) dequant NMSE={nmse:.4f}")
 
     seg = slice(0, a.ntok)
     panels = [
         ("1_value", "K  (original value)", K[seg].numpy()),
         ("2_mu", "mu_K  (per-channel mean)", muK[None, :].repeat(a.ntok, 1).numpy()),
         ("3_residual", "K - mu_K  (residual)", (K[seg] - muK).numpy()),
-        ("4_signquant", "K_hat  (after sign-pt quant: mu + sign(r)*mag)", Khat[seg].numpy()),
+        ("4_signquant", "K_hat  (qlutattn sign channels: mu + sign(r)*mag)", Khat[seg].numpy()),
     ]
     zmax = float(max(abs(M).max() for _, _, M in panels))
     norm = Normalize(-zmax, zmax)

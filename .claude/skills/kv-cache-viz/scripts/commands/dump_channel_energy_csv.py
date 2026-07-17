@@ -10,9 +10,9 @@ For each (layer, head, channel) over the quantized region [sink, T-recent):
   dc_share = mu2 / energy        (how DC-dominated the channel is)
   class    = 1 DC-dominated (dc_share>0.5) | 2 sigma2-low | 3 sigma2-high
              (2/3 split at the per-(layer,head) sigma2 median among non-DC channels,
-              matching snf-pt's per-head sigma2 ranking)
+              matching qlutattn's per-head sigma2 ranking)
 
-This is the per-channel detail behind the snf-pt "energy view" 3-way split.
+This is the per-channel detail behind the qlutattn "energy view" 3-way split.
 """
 import argparse
 import collections

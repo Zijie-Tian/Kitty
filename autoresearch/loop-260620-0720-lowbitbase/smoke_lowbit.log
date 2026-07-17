@@ -1,161 +1,0 @@
-========== llama32: GPU(s)=2 (1 parallel) variant=qlutattn_pertoken mode=smoke25 datasets=2 out=longbench_out/smoke/smooth-signbase_qlutattn-pertoken/pred ==========
-========== llama32: GPU(s)=3 (1 parallel) variant=qlutattn_pertoken mode=smoke25 datasets=2 out=longbench_out/smoke/smooth-out3bit_qlutattn-pertoken/pred ==========
-========== llama32: GPU(s)=1 (1 parallel) variant=qlutattn_pertoken mode=smoke25 datasets=2 out=longbench_out/smoke/smooth-ternbase_qlutattn-pertoken/pred ==========
-[run] multifieldqa_en: missing 0/25
-[run] multifieldqa_en: missing 0/25
-[run] multifieldqa_en: missing 0/25
-[run] hotpotqa: missing 0/25
-[parallel] dispatch dataset=multifieldqa_en -> GPU3 (slot 0, pid 2493387)
-[run] hotpotqa: missing 0/25
-[gpu3] [start] GPU3 smooth-out3bit_qlutattn-pertoken_smoke25 dataset=multifieldqa_en variant=qlutattn_pertoken max_samples=25 max_model_len=32768
-[parallel] dispatch dataset=multifieldqa_en -> GPU1 (slot 0, pid 2493393)
-[run] hotpotqa: missing 0/25
-[gpu1] [start] GPU1 smooth-ternbase_qlutattn-pertoken_smoke25 dataset=multifieldqa_en variant=qlutattn_pertoken max_samples=25 max_model_len=32768
-[parallel] dispatch dataset=multifieldqa_en -> GPU2 (slot 0, pid 2493400)
-[gpu2] [start] GPU2 smooth-signbase_qlutattn-pertoken_smoke25 dataset=multifieldqa_en variant=qlutattn_pertoken max_samples=25 max_model_len=32768
-[gpu3] The tokenizer you are loading from '/home/zijie/models/Llama-3.2-1B-Instruct-smooth' with an incorrect regex pattern: https://huggingface.co/mistralai/Mistral-Small-3.1-24B-Instruct-2503/discussions/84#69121093e8b480e709447d5e. This will lead to incorrect tokenization. You should set the `fix_mistral_regex=True` flag when loading this tokenizer to fix this issue.
-[gpu3] `torch_dtype` is deprecated! Use `dtype` instead!
-[gpu2] The tokenizer you are loading from '/home/zijie/models/Llama-3.2-1B-Instruct-smooth' with an incorrect regex pattern: https://huggingface.co/mistralai/Mistral-Small-3.1-24B-Instruct-2503/discussions/84#69121093e8b480e709447d5e. This will lead to incorrect tokenization. You should set the `fix_mistral_regex=True` flag when loading this tokenizer to fix this issue.
-[gpu2] `torch_dtype` is deprecated! Use `dtype` instead!
-[gpu1] The tokenizer you are loading from '/home/zijie/models/Llama-3.2-1B-Instruct-smooth' with an incorrect regex pattern: https://huggingface.co/mistralai/Mistral-Small-3.1-24B-Instruct-2503/discussions/84#69121093e8b480e709447d5e. This will lead to incorrect tokenization. You should set the `fix_mistral_regex=True` flag when loading this tokenizer to fix this issue.
-[gpu1] `torch_dtype` is deprecated! Use `dtype` instead!
-[gpu3] ================================================================================
-[gpu3] Kitty LongBench evaluation
-[gpu3] model=meta-llama/Llama-3.2-1B-Instruct path=/home/zijie/models/Llama-3.2-1B-Instruct-smooth
-[gpu3] model_tag=smooth-out3bit_qlutattn-pertoken_smoke25 model_family=llama3
-[gpu3] variant=qlutattn_pertoken_nb1_v4_cb194329_iso8b3
-[gpu3] datasets=['multifieldqa_en']
-[gpu3] max_samples=25 max_model_len=32768
-[gpu3] CUDA_VISIBLE_DEVICES=3
-[gpu3] output=longbench_out/smoke/smooth-out3bit_qlutattn-pertoken/pred
-[gpu3] ================================================================================
-[gpu2] ================================================================================
-[gpu2] Kitty LongBench evaluation
-[gpu2] model=meta-llama/Llama-3.2-1B-Instruct path=/home/zijie/models/Llama-3.2-1B-Instruct-smooth
-[gpu2] model_tag=smooth-signbase_qlutattn-pertoken_smoke25 model_family=llama3
-[gpu2] variant=qlutattn_pertoken_nb1_v4_cb953ba8_iso8b4
-[gpu2] datasets=['multifieldqa_en']
-[gpu2] max_samples=25 max_model_len=32768
-[gpu2] CUDA_VISIBLE_DEVICES=2
-[gpu2] output=longbench_out/smoke/smooth-signbase_qlutattn-pertoken/pred
-[gpu2] ================================================================================
-[gpu3] multifieldqa_en:   0%|          | 0/25 [00:00<?, ?it/s]The following generation flags are not valid and may be ignored: ['top_p']. Set `TRANSFORMERS_VERBOSITY=info` for more details.
-[gpu2] multifieldqa_en:   0%|          | 0/25 [00:00<?, ?it/s]The following generation flags are not valid and may be ignored: ['top_p']. Set `TRANSFORMERS_VERBOSITY=info` for more details.
-[gpu1] ================================================================================
-[gpu1] Kitty LongBench evaluation
-[gpu1] model=meta-llama/Llama-3.2-1B-Instruct path=/home/zijie/models/Llama-3.2-1B-Instruct-smooth
-[gpu1] model_tag=smooth-ternbase_qlutattn-pertoken_smoke25 model_family=llama3
-[gpu1] variant=qlutattn_pertoken_nb1_v4_cb892b2b_iso8b4
-[gpu1] datasets=['multifieldqa_en']
-[gpu1] max_samples=25 max_model_len=32768
-[gpu1] CUDA_VISIBLE_DEVICES=1
-[gpu1] output=longbench_out/smoke/smooth-ternbase_qlutattn-pertoken/pred
-[gpu1] ================================================================================
-[gpu1] multifieldqa_en:   0%|          | 0/25 [00:00<?, ?it/s]The following generation flags are not valid and may be ignored: ['top_p']. Set `TRANSFORMERS_VERBOSITY=info` for more details.
-[gpu1] multifieldqa_en:   4%|▍         | 1/25 [00:01<00:29,  1.23s/it]multifieldqa_en:   8%|▊         | 2/25 [00:05<01:06,  2.90s/it]multifieldqa_en:  12%|█▏        | 3/25 [00:09<01:14,  3.40s/it]multifieldqa_en:  16%|█▌        | 4/25 [00:12<01:12,  3.44s/it]multifieldqa_en:  20%|██        | 5/25 [00:17<01:15,  3.77s/it]multifieldqa_en:  24%|██▍       | 6/25 [00:21<01:18,  4.12s/it]multifieldqa_en:  28%|██▊       | 7/25 [00:26<01:15,  4.18s/it]multifieldqa_en:  32%|███▏      | 8/25 [00:27<00:53,  3.17s/it]multifieldqa_en:  36%|███▌      | 9/25 [00:28<00:39,  2.47s/it]multifieldqa_en:  40%|████      | 10/25 [00:32<00:43,  2.93s/it]multifieldqa_en:  44%|████▍     | 11/25 [00:36<00:46,  3.32s/it]multifieldqa_en:  48%|████▊     | 12/25 [00:38<00:40,  3.10s/it]multifieldqa_en:  52%|█████▏    | 13/25 [00:42<00:38,  3.19s/it]multifieldqa_en:  56%|█████▌    | 14/25 [00:44<00:31,  2.82s/it]multifieldqa_en:  60%|██████    | 15/25 [00:46<00:26,  2.68s/it]multifieldqa_en:  64%|██████▍   | 16/25 [00:47<00:19,  2.19s/it]multifieldqa_en:  68%|██████▊   | 17/25 [00:49<00:17,  2.18s/it]multifieldqa_en:  72%|███████▏  | 18/25 [00:53<00:18,  2.69s/it]multifieldqa_en:  76%|███████▌  | 19/25 [00:56<00:15,  2.63s/it]multifieldqa_en:  80%|████████  | 20/25 [00:59<00:13,  2.69s/it]multifieldqa_en:  84%|████████▍ | 21/25 [01:00<00:09,  2.33s/it]multifieldqa_en:  88%|████████▊ | 22/25 [01:02<00:06,  2.25s/it]multifieldqa_en:  92%|█████████▏| 23/25 [01:03<00:03,  1.81s/it]multifieldqa_en:  96%|█████████▌| 24/25 [01:05<00:01,  1.89s/it]multifieldqa_en: 100%|██████████| 25/25 [01:08<00:00,  2.33s/it]multifieldqa_en: 100%|██████████| 25/25 [01:08<00:00,  2.75s/it]
-[gpu1] {
-[gpu1]   "prediction_dir": "longbench_out/smoke/smooth-ternbase_qlutattn-pertoken/pred",
-[gpu1]   "status": "ok"
-[gpu1] }
-[gpu1] [done]  GPU1 smooth-ternbase_qlutattn-pertoken_smoke25 dataset=multifieldqa_en
-[parallel] dispatch dataset=hotpotqa -> GPU1 (slot 0, pid 2499730)
-[gpu1] [start] GPU1 smooth-ternbase_qlutattn-pertoken_smoke25 dataset=hotpotqa variant=qlutattn_pertoken max_samples=25 max_model_len=32768
-[gpu1] The tokenizer you are loading from '/home/zijie/models/Llama-3.2-1B-Instruct-smooth' with an incorrect regex pattern: https://huggingface.co/mistralai/Mistral-Small-3.1-24B-Instruct-2503/discussions/84#69121093e8b480e709447d5e. This will lead to incorrect tokenization. You should set the `fix_mistral_regex=True` flag when loading this tokenizer to fix this issue.
-[gpu1] `torch_dtype` is deprecated! Use `dtype` instead!
-[gpu1] ================================================================================
-[gpu1] Kitty LongBench evaluation
-[gpu1] model=meta-llama/Llama-3.2-1B-Instruct path=/home/zijie/models/Llama-3.2-1B-Instruct-smooth
-[gpu1] model_tag=smooth-ternbase_qlutattn-pertoken_smoke25 model_family=llama3
-[gpu1] variant=qlutattn_pertoken_nb1_v4_cb892b2b_iso8b4
-[gpu1] datasets=['hotpotqa']
-[gpu1] max_samples=25 max_model_len=32768
-[gpu1] CUDA_VISIBLE_DEVICES=1
-[gpu1] output=longbench_out/smoke/smooth-ternbase_qlutattn-pertoken/pred
-[gpu1] ================================================================================
-[gpu1] hotpotqa:   0%|          | 0/25 [00:00<?, ?it/s]The following generation flags are not valid and may be ignored: ['top_p']. Set `TRANSFORMERS_VERBOSITY=info` for more details.
-[gpu2] multifieldqa_en:   4%|▍         | 1/25 [00:01<00:26,  1.12s/it]multifieldqa_en:   8%|▊         | 2/25 [00:05<01:07,  2.92s/it]multifieldqa_en:  12%|█▏        | 3/25 [00:09<01:14,  3.36s/it]multifieldqa_en:  16%|█▌        | 4/25 [00:12<01:13,  3.48s/it]multifieldqa_en:  20%|██        | 5/25 [00:15<01:07,  3.35s/it]multifieldqa_en:  24%|██▍       | 6/25 [00:22<01:23,  4.38s/it]multifieldqa_en:  28%|██▊       | 7/25 [00:26<01:15,  4.21s/it]multifieldqa_en:  32%|███▏      | 8/25 [00:27<00:54,  3.19s/it]multifieldqa_en:  36%|███▌      | 9/25 [00:28<00:39,  2.49s/it]multifieldqa_en:  40%|████      | 10/25 [00:32<00:44,  2.98s/it]multifieldqa_en:  44%|████▍     | 11/25 [00:35<00:43,  3.13s/it]multifieldqa_en:  48%|████▊     | 12/25 [00:38<00:38,  2.97s/it]multifieldqa_en:  52%|█████▏    | 13/25 [00:43<00:41,  3.49s/it]multifieldqa_en:  56%|█████▌    | 14/25 [00:45<00:33,  3.04s/it]multifieldqa_en:  60%|██████    | 15/25 [00:47<00:29,  2.94s/it]multifieldqa_en:  64%|██████▍   | 16/25 [00:48<00:21,  2.42s/it]multifieldqa_en:  68%|██████▊   | 17/25 [00:51<00:18,  2.37s/it]multifieldqa_en:  72%|███████▏  | 18/25 [00:56<00:21,  3.12s/it]multifieldqa_en:  76%|███████▌  | 19/25 [00:58<00:17,  2.94s/it]multifieldqa_en:  80%|████████  | 20/25 [01:18<00:39,  7.94s/it]multifieldqa_en:  84%|████████▍ | 21/25 [01:19<00:23,  5.98s/it]multifieldqa_en:  88%|████████▊ | 22/25 [01:21<00:14,  4.81s/it]multifieldqa_en:  92%|█████████▏| 23/25 [01:22<00:07,  3.61s/it]multifieldqa_en:  96%|█████████▌| 24/25 [01:24<00:03,  3.14s/it]multifieldqa_en: 100%|██████████| 25/25 [01:28<00:00,  3.36s/it]multifieldqa_en: 100%|██████████| 25/25 [01:28<00:00,  3.54s/it]
-[gpu2] {
-[gpu2]   "prediction_dir": "longbench_out/smoke/smooth-signbase_qlutattn-pertoken/pred",
-[gpu2]   "status": "ok"
-[gpu2] }
-[gpu2] [done]  GPU2 smooth-signbase_qlutattn-pertoken_smoke25 dataset=multifieldqa_en
-[parallel] dispatch dataset=hotpotqa -> GPU2 (slot 0, pid 2501403)
-[gpu2] [start] GPU2 smooth-signbase_qlutattn-pertoken_smoke25 dataset=hotpotqa variant=qlutattn_pertoken max_samples=25 max_model_len=32768
-[gpu2] The tokenizer you are loading from '/home/zijie/models/Llama-3.2-1B-Instruct-smooth' with an incorrect regex pattern: https://huggingface.co/mistralai/Mistral-Small-3.1-24B-Instruct-2503/discussions/84#69121093e8b480e709447d5e. This will lead to incorrect tokenization. You should set the `fix_mistral_regex=True` flag when loading this tokenizer to fix this issue.
-[gpu2] `torch_dtype` is deprecated! Use `dtype` instead!
-[gpu2] ================================================================================
-[gpu2] Kitty LongBench evaluation
-[gpu2] model=meta-llama/Llama-3.2-1B-Instruct path=/home/zijie/models/Llama-3.2-1B-Instruct-smooth
-[gpu2] model_tag=smooth-signbase_qlutattn-pertoken_smoke25 model_family=llama3
-[gpu2] variant=qlutattn_pertoken_nb1_v4_cb953ba8_iso8b4
-[gpu2] datasets=['hotpotqa']
-[gpu2] max_samples=25 max_model_len=32768
-[gpu2] CUDA_VISIBLE_DEVICES=2
-[gpu2] output=longbench_out/smoke/smooth-signbase_qlutattn-pertoken/pred
-[gpu2] ================================================================================
-[gpu2] hotpotqa:   0%|          | 0/25 [00:00<?, ?it/s]The following generation flags are not valid and may be ignored: ['top_p']. Set `TRANSFORMERS_VERBOSITY=info` for more details.
-[gpu3] multifieldqa_en:   4%|▍         | 1/25 [00:02<00:56,  2.33s/it]multifieldqa_en:   8%|▊         | 2/25 [00:10<02:17,  5.98s/it]multifieldqa_en:  12%|█▏        | 3/25 [00:21<02:53,  7.91s/it]multifieldqa_en:  16%|█▌        | 4/25 [00:26<02:28,  7.07s/it]multifieldqa_en:  20%|██        | 5/25 [00:43<03:33, 10.69s/it]multifieldqa_en:  24%|██▍       | 6/25 [00:55<03:25, 10.83s/it]multifieldqa_en:  28%|██▊       | 7/25 [01:03<03:00, 10.00s/it]multifieldqa_en:  32%|███▏      | 8/25 [01:05<02:05,  7.39s/it]multifieldqa_en:  36%|███▌      | 9/25 [01:07<01:31,  5.72s/it]multifieldqa_en:  40%|████      | 10/25 [01:13<01:30,  6.05s/it]multifieldqa_en:  44%|████▍     | 11/25 [01:23<01:39,  7.10s/it]multifieldqa_en:  48%|████▊     | 12/25 [01:28<01:23,  6.43s/it]multifieldqa_en:  52%|█████▏    | 13/25 [01:33<01:12,  6.04s/it]multifieldqa_en:  56%|█████▌    | 14/25 [01:36<00:55,  5.07s/it]multifieldqa_en:  60%|██████    | 15/25 [01:39<00:45,  4.60s/it]multifieldqa_en:  64%|██████▍   | 16/25 [01:42<00:35,  3.97s/it]multifieldqa_en:  68%|██████▊   | 17/25 [01:46<00:32,  4.00s/it]multifieldqa_en:  72%|███████▏  | 18/25 [01:50<00:28,  4.03s/it]multifieldqa_en:  76%|███████▌  | 19/25 [01:54<00:24,  4.10s/it]multifieldqa_en:  80%|████████  | 20/25 [01:57<00:17,  3.53s/it]multifieldqa_en:  84%|████████▍ | 21/25 [01:59<00:13,  3.33s/it]multifieldqa_en:  88%|████████▊ | 22/25 [02:04<00:11,  3.70s/it]multifieldqa_en:  92%|█████████▏| 23/25 [02:05<00:06,  3.05s/it]multifieldqa_en:  96%|█████████▌| 24/25 [02:10<00:03,  3.48s/it]multifieldqa_en: 100%|██████████| 25/25 [02:21<00:00,  5.78s/it]multifieldqa_en: 100%|██████████| 25/25 [02:21<00:00,  5.66s/it]
-[gpu3] {
-[gpu3]   "prediction_dir": "longbench_out/smoke/smooth-out3bit_qlutattn-pertoken/pred",
-[gpu3]   "status": "ok"
-[gpu3] }
-[gpu3] [done]  GPU3 smooth-out3bit_qlutattn-pertoken_smoke25 dataset=multifieldqa_en
-[parallel] dispatch dataset=hotpotqa -> GPU3 (slot 0, pid 2505019)
-[gpu3] [start] GPU3 smooth-out3bit_qlutattn-pertoken_smoke25 dataset=hotpotqa variant=qlutattn_pertoken max_samples=25 max_model_len=32768
-[gpu3] The tokenizer you are loading from '/home/zijie/models/Llama-3.2-1B-Instruct-smooth' with an incorrect regex pattern: https://huggingface.co/mistralai/Mistral-Small-3.1-24B-Instruct-2503/discussions/84#69121093e8b480e709447d5e. This will lead to incorrect tokenization. You should set the `fix_mistral_regex=True` flag when loading this tokenizer to fix this issue.
-[gpu3] `torch_dtype` is deprecated! Use `dtype` instead!
-[gpu3] ================================================================================
-[gpu3] Kitty LongBench evaluation
-[gpu3] model=meta-llama/Llama-3.2-1B-Instruct path=/home/zijie/models/Llama-3.2-1B-Instruct-smooth
-[gpu3] model_tag=smooth-out3bit_qlutattn-pertoken_smoke25 model_family=llama3
-[gpu3] variant=qlutattn_pertoken_nb1_v4_cb194329_iso8b3
-[gpu3] datasets=['hotpotqa']
-[gpu3] max_samples=25 max_model_len=32768
-[gpu3] CUDA_VISIBLE_DEVICES=3
-[gpu3] output=longbench_out/smoke/smooth-out3bit_qlutattn-pertoken/pred
-[gpu3] ================================================================================
-[gpu3] hotpotqa:   0%|          | 0/25 [00:00<?, ?it/s]The following generation flags are not valid and may be ignored: ['top_p']. Set `TRANSFORMERS_VERBOSITY=info` for more details.
-[gpu1] hotpotqa:   4%|▍         | 1/25 [00:03<01:20,  3.37s/it]hotpotqa:   8%|▊         | 2/25 [00:07<01:30,  3.94s/it]hotpotqa:  12%|█▏        | 3/25 [00:11<01:28,  4.04s/it]hotpotqa:  16%|█▌        | 4/25 [00:15<01:25,  4.05s/it]hotpotqa:  20%|██        | 5/25 [00:19<01:18,  3.94s/it]hotpotqa:  24%|██▍       | 6/25 [00:23<01:12,  3.80s/it]hotpotqa:  28%|██▊       | 7/25 [00:27<01:10,  3.93s/it]hotpotqa:  32%|███▏      | 8/25 [00:28<00:51,  3.04s/it]hotpotqa:  36%|███▌      | 9/25 [00:31<00:48,  3.05s/it]hotpotqa:  40%|████      | 10/25 [00:34<00:43,  2.91s/it]hotpotqa:  44%|████▍     | 11/25 [00:38<00:48,  3.48s/it]hotpotqa:  48%|████▊     | 12/25 [00:43<00:48,  3.70s/it]hotpotqa:  52%|█████▏    | 13/25 [00:47<00:47,  3.92s/it]hotpotqa:  56%|█████▌    | 14/25 [00:50<00:39,  3.58s/it]hotpotqa:  60%|██████    | 15/25 [00:54<00:37,  3.74s/it]hotpotqa:  64%|██████▍   | 16/25 [00:58<00:32,  3.66s/it]hotpotqa:  68%|██████▊   | 17/25 [00:59<00:24,  3.12s/it]hotpotqa:  72%|███████▏  | 18/25 [01:04<00:24,  3.47s/it]hotpotqa:  76%|███████▌  | 19/25 [01:08<00:22,  3.71s/it]hotpotqa:  80%|████████  | 20/25 [01:12<00:19,  3.85s/it]hotpotqa:  84%|████████▍ | 21/25 [01:15<00:14,  3.60s/it]hotpotqa:  88%|████████▊ | 22/25 [01:19<00:11,  3.82s/it]hotpotqa:  92%|█████████▏| 23/25 [01:21<00:06,  3.14s/it]hotpotqa:  96%|█████████▌| 24/25 [01:24<00:03,  3.14s/it]hotpotqa: 100%|██████████| 25/25 [01:28<00:00,  3.44s/it]hotpotqa: 100%|██████████| 25/25 [01:28<00:00,  3.55s/it]
-[gpu1] {
-[gpu1]   "prediction_dir": "longbench_out/smoke/smooth-ternbase_qlutattn-pertoken/pred",
-[gpu1]   "status": "ok"
-[gpu1] }
-[gpu1] [done]  GPU1 smooth-ternbase_qlutattn-pertoken_smoke25 dataset=hotpotqa
-[score] strict longbench_out/smoke/smooth-ternbase_qlutattn-pertoken/pred -> result.json
-[score] wrote longbench_out/smoke/smooth-ternbase_qlutattn-pertoken/pred/result.json
-{'hotpotqa': 35.35, 'multifieldqa_en': 49.54}
-========== llama32: complete -> longbench_out/smoke/smooth-ternbase_qlutattn-pertoken/pred ==========
-[gpu2] hotpotqa:   4%|▍         | 1/25 [00:03<01:21,  3.39s/it]hotpotqa:   8%|▊         | 2/25 [00:08<01:37,  4.25s/it]hotpotqa:  12%|█▏        | 3/25 [00:12<01:32,  4.22s/it]hotpotqa:  16%|█▌        | 4/25 [00:16<01:27,  4.15s/it]hotpotqa:  20%|██        | 5/25 [00:20<01:18,  3.95s/it]hotpotqa:  24%|██▍       | 6/25 [00:23<01:12,  3.80s/it]hotpotqa:  28%|██▊       | 7/25 [00:27<01:09,  3.88s/it]hotpotqa:  32%|███▏      | 8/25 [00:28<00:51,  3.02s/it]hotpotqa:  36%|███▌      | 9/25 [00:31<00:48,  3.05s/it]hotpotqa:  40%|████      | 10/25 [00:34<00:42,  2.83s/it]hotpotqa:  44%|████▍     | 11/25 [00:38<00:45,  3.25s/it]hotpotqa:  48%|████▊     | 12/25 [00:42<00:45,  3.47s/it]hotpotqa:  52%|█████▏    | 13/25 [00:46<00:43,  3.66s/it]hotpotqa:  56%|█████▌    | 14/25 [01:11<01:49,  9.98s/it]hotpotqa:  60%|██████    | 15/25 [01:15<01:23,  8.37s/it]hotpotqa:  64%|██████▍   | 16/25 [01:18<01:01,  6.81s/it]hotpotqa:  68%|██████▊   | 17/25 [01:20<00:42,  5.28s/it]hotpotqa:  72%|███████▏  | 18/25 [01:24<00:34,  4.90s/it]hotpotqa:  76%|███████▌  | 19/25 [01:28<00:27,  4.65s/it]hotpotqa:  80%|████████  | 20/25 [01:32<00:22,  4.41s/it]hotpotqa:  84%|████████▍ | 21/25 [01:35<00:15,  3.91s/it]hotpotqa:  88%|████████▊ | 22/25 [01:39<00:11,  3.88s/it]hotpotqa:  92%|█████████▏| 23/25 [01:40<00:06,  3.15s/it]hotpotqa:  96%|█████████▌| 24/25 [01:43<00:03,  3.08s/it]hotpotqa: 100%|██████████| 25/25 [01:47<00:00,  3.39s/it]hotpotqa: 100%|██████████| 25/25 [01:47<00:00,  4.31s/it]
-[gpu2] {
-[gpu2]   "prediction_dir": "longbench_out/smoke/smooth-signbase_qlutattn-pertoken/pred",
-[gpu2]   "status": "ok"
-[gpu2] }
-[gpu2] [done]  GPU2 smooth-signbase_qlutattn-pertoken_smoke25 dataset=hotpotqa
-[score] strict longbench_out/smoke/smooth-signbase_qlutattn-pertoken/pred -> result.json
-[score] wrote longbench_out/smoke/smooth-signbase_qlutattn-pertoken/pred/result.json
-{'hotpotqa': 27.03, 'multifieldqa_en': 37.75}
-========== llama32: complete -> longbench_out/smoke/smooth-signbase_qlutattn-pertoken/pred ==========
-[gpu3] hotpotqa:   4%|▍         | 1/25 [00:04<01:49,  4.55s/it]hotpotqa:   8%|▊         | 2/25 [00:10<01:58,  5.16s/it]hotpotqa:  12%|█▏        | 3/25 [00:15<01:55,  5.25s/it]hotpotqa:  16%|█▌        | 4/25 [00:20<01:47,  5.12s/it]hotpotqa:  20%|██        | 5/25 [00:25<01:39,  4.98s/it]hotpotqa:  24%|██▍       | 6/25 [00:29<01:30,  4.78s/it]hotpotqa:  28%|██▊       | 7/25 [00:35<01:31,  5.08s/it]hotpotqa:  32%|███▏      | 8/25 [00:37<01:12,  4.25s/it]hotpotqa:  36%|███▌      | 9/25 [00:41<01:07,  4.23s/it]hotpotqa:  40%|████      | 10/25 [00:45<00:58,  3.93s/it]hotpotqa:  44%|████▍     | 11/25 [00:51<01:05,  4.70s/it]hotpotqa:  48%|████▊     | 12/25 [00:56<01:02,  4.81s/it]hotpotqa:  52%|█████▏    | 13/25 [01:02<01:01,  5.10s/it]hotpotqa:  56%|█████▌    | 14/25 [01:06<00:51,  4.68s/it]hotpotqa:  60%|██████    | 15/25 [01:10<00:47,  4.71s/it]hotpotqa:  64%|██████▍   | 16/25 [01:15<00:42,  4.69s/it]hotpotqa:  68%|██████▊   | 17/25 [01:18<00:32,  4.07s/it]hotpotqa:  72%|███████▏  | 18/25 [01:23<00:30,  4.41s/it]hotpotqa:  76%|███████▌  | 19/25 [01:30<00:31,  5.18s/it]hotpotqa:  80%|████████  | 20/25 [01:35<00:25,  5.09s/it]hotpotqa:  84%|████████▍ | 21/25 [01:39<00:18,  4.72s/it]hotpotqa:  88%|████████▊ | 22/25 [01:45<00:15,  5.12s/it]hotpotqa:  92%|█████████▏| 23/25 [01:47<00:08,  4.21s/it]hotpotqa:  96%|█████████▌| 24/25 [01:51<00:04,  4.12s/it]hotpotqa: 100%|██████████| 25/25 [01:56<00:00,  4.53s/it]hotpotqa: 100%|██████████| 25/25 [01:56<00:00,  4.67s/it]
-[gpu3] {
-[gpu3]   "prediction_dir": "longbench_out/smoke/smooth-out3bit_qlutattn-pertoken/pred",
-[gpu3]   "status": "ok"
-[gpu3] }
-[gpu3] [done]  GPU3 smooth-out3bit_qlutattn-pertoken_smoke25 dataset=hotpotqa
-[score] strict longbench_out/smoke/smooth-out3bit_qlutattn-pertoken/pred -> result.json
-[score] wrote longbench_out/smoke/smooth-out3bit_qlutattn-pertoken/pred/result.json
-{'hotpotqa': 45.35, 'multifieldqa_en': 55.43}
-========== llama32: complete -> longbench_out/smoke/smooth-out3bit_qlutattn-pertoken/pred ==========
-ALL_SMOKE_DONE
-== smooth-ternbase ==
-{
-    "hotpotqa": 35.35,
-    "multifieldqa_en": 49.54
-}== smooth-signbase ==
-{
-    "hotpotqa": 27.03,
-    "multifieldqa_en": 37.75
-}== smooth-out3bit ==
-{
-    "hotpotqa": 45.35,
-    "multifieldqa_en": 55.43
-}

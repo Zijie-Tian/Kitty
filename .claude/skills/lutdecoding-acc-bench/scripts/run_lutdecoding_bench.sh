@@ -8,11 +8,12 @@
 #   3. kitty         Kitty             paper-style k2/b4/v2/pr0.125
 #   4. kivi_star     KIVI*-2           KIVI uniform K2V2 + sink=32
 #   5. kivi          KIVI-2            KIVI uniform K2V2 (no sink)
-#   6. qlutattn      QLUTATTN          snf-pt: per-token sign/nf2 offline sigma^2-mix,
-#                                      sign-frac=0.5 -> ~1.875 bit K, V per-token 4-bit
-#   7. qlutattn_fast QLUTATTN-fast     per-token PURE sign (qlutattn_k125v4_pt): ~1.25 bit
-#                                      K, V per-token 4-bit. NO calibration, fastest decode.
-#   8. q4_0          Q4_0              llama.cpp/ggml Q4_0 KV (K=V=4.5 bit/value,
+#   6. qlutattn      QLUTATTN          canonical qlutattn: per-token K on the per-channel-
+#                                      mean-centered residual, OFFLINE sign/nf2 50/50 mask
+#                                      (symnf2-v1) -> nominal K ~1.75 bit; V rescued 2-bit
+#                                      tile16c64. head_dim must be a power of two divisible
+#                                      by 64.
+#   7. q4_0          Q4_0              llama.cpp/ggml Q4_0 KV (K=V=4.5 bit/value,
 #                                      per-token 32-ch blocks, quantize-on-write,
 #                                      sink=0 buffer=0). NO calibration. head_dim % 32 == 0.
 #
@@ -25,15 +26,15 @@
 #
 # Usage (cd into the Kitty repo, conda activate kitty, then):
 #   TARGET=llama32 \
-#   MODEL_PATH=/home/zijie/models/Llama-3.2-1B-Instruct \
+#   MODEL_PATH=$HOME/models/Llama-3.2-1B-Instruct \
 #   MODEL_SLUG=llama32-1b-instruct \
 #   MAX_GEN=256 GPUS=0,0,0,1,1,1,2,2,2 \
-#   CALIB_DATA=/home/zijie/data/wikitext/wikitext-2-raw-v1/train-00000-of-00001.parquet \
+#   CALIB_DATA=$HOME/data/wikitext/wikitext-2-raw-v1/train-00000-of-00001.parquet \
 #   bash run_lutdecoding_bench.sh [smoke|full] [method ...]
 #
 # Positional:
 #   $1   mode: smoke (2 samples/dataset, subset, smoke/ layout) | full (all 21, full layout). default full
-#   $2.. optional method subset (names from column 1 above); empty = all 8
+#   $2.. optional method subset (names from column 1 above); empty = all 7
 #
 # Env:
 #   TARGET         run_exp.sh target -> decides model family + per-target env prefix:
@@ -44,7 +45,6 @@
 #   GPUS           run_exp.sh --gpus layout, list a card N times for N workers (default 0)
 #   CALIB_DATA     wikitext parquet for the QLUTATTN offline calibration (required if qlutattn runs)
 #   MAX_MODEL_LEN  context cap (default 32768; keep 32768 for real full runs)
-#   SIGN_FRAC      QLUTATTN sign fraction -> K bit = f*1.25+(1-f)*2.5 (default 0.5 -> 1.875)
 #   REPO           Kitty repo root (default: current dir; must contain scripts/run_exp.sh)
 #
 # IMPORTANT: this launches GPU work. Per the project rule, confirm the GPU
@@ -63,7 +63,6 @@ MAX_GEN="${MAX_GEN:-256}"
 GPUS="${GPUS:-0}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-32768}"
 CALIB_DATA="${CALIB_DATA:-}"
-SIGN_FRAC="${SIGN_FRAC:-0.5}"
 MODEL_ID="${MODEL_ID:-}"           # model-id/display label; defaults to MODEL_PATH below
 
 # ---- validate -------------------------------------------------------------- #
@@ -105,25 +104,23 @@ echo "[bench] model_path=$MODEL_PATH"
 # is a method selected? (empty subset = all)
 want() { [ ${#SEL_METHODS[@]} -eq 0 ] && return 0; for m in "${SEL_METHODS[@]}"; do [ "$m" = "$1" ] && return 0; done; return 1; }
 
-# ---- QLUTATTN offline calibration (sign/nf2 sigma^2-mix; sign-frac -> bit) -- #
+# ---- QLUTATTN offline calibration (fixed sign/nf2 50/50 mask) --------------- #
 # Each post-RoPE K channel is fixed OFFLINE to sign (low sigma^2, 1.25b) or nf2
-# (high sigma^2, 2.5b) by its wikitext residual variance; sign-frac sets HOW MANY
-# go to sign -> the effective K bit. The per-channel mean is still self-calibrated
-# at prefill at runtime (free for attention). The mask is model-intrinsic, so it
-# is cached next to the model and reused.
+# (high sigma^2, symnf2-v1, 2.25b) by its wikitext residual variance; the split
+# is FIXED at 50/50 -> nominal K ~1.75 bit. The per-channel mean is still
+# self-calibrated at prefill at runtime (free for attention). The mask is
+# model-intrinsic, so it is cached next to the model and reused.
 MASK=""
 if want qlutattn; then
   { [ -n "$CALIB_DATA" ] && [ -f "$CALIB_DATA" ]; } || { echo "[err] qlutattn needs CALIB_DATA=<wikitext parquet>; got '$CALIB_DATA'" >&2; exit 1; }
-  fpct=$(awk "BEGIN{printf \"%02d\", $SIGN_FRAC*100}")
-  MASK="${MODEL_PATH%/}.lutbench_snf_f${fpct}.pt"
+  MASK="${MODEL_PATH%/}.qlutattn_mask.pt"
   if [ -f "$MASK" ]; then
     echo "[calib] reuse existing mask: $MASK"
   else
     first_gpu="${GPUS%%,*}"
-    echo "[calib] calibrating sign/nf2 (sign-frac=$SIGN_FRAC) on GPU$first_gpu -> $MASK"
-    CUDA_VISIBLE_DEVICES="$first_gpu" PYTHONPATH=src python scripts/calibrate_k168v4_pt.py \
-      --model "$MODEL_PATH" --calib-data "$CALIB_DATA" \
-      --codebooks sign,nf2 --sign-frac "$SIGN_FRAC" --output "$MASK"
+    echo "[calib] calibrating the qlutattn sign/nf2 f0.5 mask on GPU$first_gpu -> $MASK"
+    CUDA_VISIBLE_DEVICES="$first_gpu" PYTHONPATH=src python scripts/calibrate_qlutattn_mask.py \
+      --model "$MODEL_PATH" --calib-data "$CALIB_DATA" --output "$MASK"
   fi
 fi
 
@@ -134,8 +131,7 @@ ALL_METHODS=(
   "kitty|kitty|kitty-k2b4v2-pr0p125|"
   "kivi_star|kivi_star|kivi-star-k2v2|KBITS=2 VBITS=2"
   "kivi|kivi|kivi-k2v2|KBITS=2 VBITS=2"
-  "qlutattn|qlutattn_k188v4_pt|qlutattn-k188v4-pt|QLUT_CB_MASK=$MASK"
-  "qlutattn_fast|qlutattn_k125v4_pt|qlutattn-k125v4-pt|"
+  "qlutattn|qlutattn|qlutattn|QLUT_CB_MASK=$MASK"
   "q4_0|llamacpp_q40|llamacpp-q40|"
 )
 
