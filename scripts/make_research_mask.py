@@ -64,8 +64,12 @@ def main():
                    help="bind RoPE rotation pairs (d, d+D/2): rank pairs by their mean signal and assign both "
                         "members the same codebook (structural prior: q.k error couples within a pair)")
     p.add_argument("--tier-hi-frac", type=float, default=None,
-                   help="token-tier: fraction rho of tokens per head promoted to the all-nf2 HIGH mask at "
+                   help="token-tier: fraction rho of tokens per head promoted to the HIGH mask at "
                         "prefill (observation-window attention scoring; runtime needs QLUT_TOKEN_TIER=1)")
+    p.add_argument("--tier-hi-sign-frac", type=float, default=None,
+                   help="token-tier: build the HIGH mask with this sign fraction under the same ranking "
+                        "signal (default: all-nf2). Lets the hi tier use the OPTIMAL channel mix instead "
+                        "of pure nf2.")
     p.add_argument("--tier-window", type=int, default=64,
                    help="token-tier: number of trailing prompt queries in the observation window")
     p.add_argument("--output", required=True)
@@ -155,16 +159,34 @@ def main():
         rho = args.tier_hi_frac
         if not (0.0 < rho < 1.0):
             raise ValueError("--tier-hi-frac must be in (0, 1)")
+        if args.tier_hi_sign_frac is None:
+            hi_mask = torch.ones(nl, n_kv, D, dtype=torch.uint8)    # all-nf2 HIGH mask
+            hi_bits = BITS["nf2"]
+            hi_desc = "all-nf2"
+        else:
+            fh = args.tier_hi_sign_frac
+            if not (0.0 <= fh < 1.0):
+                raise ValueError("--tier-hi-sign-frac must be in [0, 1)")
+            k_sign_hi = int(round(fh * N))
+            hi_mask = torch.empty(nl, n_kv, D, dtype=torch.uint8)
+            for li in range(nl):
+                order = torch.argsort(signal[li].reshape(-1))
+                mh = torch.ones(N, dtype=torch.uint8)
+                mh[order[:k_sign_hi]] = 0
+                hi_mask[li] = mh.reshape(n_kv, D)
+            fh_act = k_sign_hi / N
+            hi_bits = fh_act * BITS["sign"] + (1 - fh_act) * BITS["nf2"]
+            hi_desc = f"sign{fh_act:.2f}({hi_bits:.2f}b)"
         out.update({
-            "tier_hi_mask": torch.ones(nl, n_kv, D, dtype=torch.uint8),  # all-nf2 HIGH mask
+            "tier_hi_mask": hi_mask,
             "tier_rho": rho,
             "tier_window": args.tier_window,
         })
-        # rho of tokens at 2.25b, rest at the LOW mask width, + 1 tier bit per
-        # (head, token) amortized over D channels.
-        nominal = (1 - rho) * nominal + rho * BITS["nf2"] + 1.0 / D
+        # rho of tokens at the HIGH width, rest at the LOW width, + 1 tier bit
+        # per (head, token) amortized over D channels.
+        nominal = (1 - rho) * nominal + rho * hi_bits + 1.0 / D
         out["nominal_bits"] = nominal
-        tier_note = f" tier(rho={rho}, W={args.tier_window}, hi=all-nf2)"
+        tier_note = f" tier(rho={rho}, W={args.tier_window}, hi={hi_desc})"
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     torch.save(out, args.output)
     print(f"[research-mask] {args.output}")
