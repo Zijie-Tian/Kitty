@@ -55,7 +55,6 @@ def main():
     torch.manual_seed(args.seed)
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
-    import transformers.models.llama.modeling_llama as ml
 
     t0 = time.time()
     tok = AutoTokenizer.from_pretrained(args.model, local_files_only=True)
@@ -63,6 +62,14 @@ def main():
         args.model, torch_dtype=torch.bfloat16, local_files_only=True,
         attn_implementation="eager").to(args.device).eval()
     cfg = model.config
+    # Patch the rope helper of the actual architecture (same signature across
+    # these families; qwen3 applies q_norm before rope, capture stays post-RoPE).
+    if cfg.model_type == "qwen3":
+        import transformers.models.qwen3.modeling_qwen3 as ml
+    elif cfg.model_type == "llama":
+        import transformers.models.llama.modeling_llama as ml
+    else:
+        raise ValueError(f"unsupported model_type for q-probe: {cfg.model_type}")
     nl = cfg.num_hidden_layers
     n_q = cfg.num_attention_heads
     n_kv = cfg.num_key_value_heads
