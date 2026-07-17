@@ -398,11 +398,9 @@ class KittyKVCache(DynamicCache):
         """Per-token codebook on r:[B,nh,T,D] over the channels flagged by m:[nh,D],
         VECTORIZED across heads. Returns a reconstruction that is ZERO outside the
         bin's channels so callers can sum across bins. The masked reductions use
-        exactly the bin's channels, head by head. Canonical qlutattn codebooks:
-        'sign' (1-bit, per-token masked-mean |r| scale) and 'nf2' (fixed
-        symmetric-NF2 LUT, per-token masked absmax scale). 'int4' (4-bit
-        symmetric absmax, per-token step s/7) is research-only and reachable
-        exclusively through a QLUT_RESEARCH=1 mask."""
+        exactly the bin's channels, head by head. Only the canonical qlutattn
+        codebooks remain: 'sign' (1-bit, per-token masked-mean |r| scale) and
+        'nf2' (fixed symmetric-NF2 LUT, per-token masked absmax scale)."""
         mb = m[None, :, None, :]                                      # [1,nh,1,D] bool
         if cb == "sign":
             cnt = m.sum(-1).clamp(min=1)[None, :, None, None].to(r.dtype)  # [1,nh,1,1]
@@ -410,13 +408,6 @@ class KittyKVCache(DynamicCache):
             return torch.sign(r) * mag * mb
         if cb == "nf2":
             return KittyKVCache._masked_nf2sym_lastdim(r, mb) * mb
-        if cb == "int4":
-            neg = (~mb).expand_as(r)
-            s = r.abs().masked_fill(neg, float("-inf")).amax(-1, keepdim=True)  # [B,nh,T,1]
-            s = torch.where(s.isinf(), torch.zeros_like(s), s)        # all-False row -> 0
-            step = s / 7.0
-            q = torch.round(r / step.clamp(min=torch.finfo(r.dtype).tiny)).clamp(-7.0, 7.0)
-            return q * step * mb                                      # step==0 rows reconstruct 0
         raise ValueError(cb)
 
     def _quant_k_pertoken(self, ks, layer_idx=0):

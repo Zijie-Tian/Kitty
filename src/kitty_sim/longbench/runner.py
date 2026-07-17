@@ -275,17 +275,16 @@ def load_qlutattn_mask_blob(mask_path: str) -> dict[str, Any]:
     if not isinstance(blob, dict):
         raise ValueError(f"qlutattn mask {mask_path} must be a dict payload")
     # QLUT_RESEARCH=1 relaxes the canonical-mask contract for controlled
-    # experiments (extra 'int4' tier, arbitrary tier fractions). The K/V quant
-    # mechanisms themselves are unchanged; only the per-channel codebook
-    # assignment carried by the mask may differ from canonical. Default (unset)
+    # experiments: the codebook pair stays EXACTLY sign/nf2, but the sign
+    # fraction may differ from the canonical 50% (including pure-sign and
+    # pure-nf2 masks) and the assignment signal may differ from sigma^2. The
+    # K/V quant mechanisms themselves are unchanged. Default (env unset)
     # keeps the strict canonical validation bit-for-bit.
     research = os.environ.get("QLUT_RESEARCH", "").strip() == "1"
     codebooks = tuple(blob.get("codebooks") or ())
-    allowed = ((QLUTATTN_BIN_CODEBOOKS, ("sign", "nf2", "int4"))
-               if research else (QLUTATTN_BIN_CODEBOOKS,))
-    if codebooks not in allowed:
+    if codebooks != QLUTATTN_BIN_CODEBOOKS:
         raise ValueError(
-            f"qlutattn requires codebooks in {[list(a) for a in allowed]} in the "
+            f"qlutattn requires codebooks={list(QLUTATTN_BIN_CODEBOOKS)} in the "
             f"mask payload; got {list(codebooks)} in {mask_path}"
         )
     low_frac = blob.get("low_frac")
@@ -307,11 +306,12 @@ def load_qlutattn_mask_blob(mask_path: str) -> dict[str, Any]:
             f"qlutattn codebook_mask must be torch.uint8; got {mask.dtype}"
         )
     values = set(torch.unique(mask).tolist())
-    allowed_values = set(range(len(codebooks))) if research else {0, 1}
-    if (values != {0, 1}) if not research else (not values <= allowed_values):
+    # Research masks may be single-tier (pure sign {0} / pure nf2 {1}).
+    values_ok = (values <= {0, 1} and values) if research else (values == {0, 1})
+    if not values_ok:
         raise ValueError(
-            f"qlutattn codebook_mask values must be within {sorted(allowed_values)} "
-            f"(0=sign, 1=nf2{', 2=int4' if research else ''}); got {sorted(values)}"
+            f"qlutattn codebook_mask values must be exactly {{0, 1}} "
+            f"(0=sign, 1=nf2); got {sorted(values)}"
         )
     sign_frac = float((mask == 0).float().mean())
     if not research and sign_frac != QLUTATTN_SIGN_FRACTION:
