@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import re
+import sys
 import time
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
@@ -320,8 +321,9 @@ def load_qlutattn_mask_blob(mask_path: str) -> dict[str, Any]:
             f"channel fraction; the mask in {mask_path} has {sign_frac:.6f}"
         )
     if research:
+        # stderr: run_exp.sh preflight parses this process's stdout as JSON.
         fracs = {cb: float((mask == ci).float().mean()) for ci, cb in enumerate(codebooks)}
-        print(f"[qlutattn-research] mask {mask_path}: tier fractions {fracs}")
+        print(f"[qlutattn-research] mask {mask_path}: tier fractions {fracs}", file=sys.stderr)
     return blob
 
 
