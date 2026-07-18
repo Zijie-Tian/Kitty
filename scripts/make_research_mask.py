@@ -58,6 +58,11 @@ def main():
     p.add_argument("--q-power", type=float, default=1.0,
                    help="temper the |q| factor: signal = sigma2 * E|q|^alpha (alpha<1 pulls the "
                         "ranking toward the domain-neutral sigma2; mitigates calib-domain bias)")
+    p.add_argument("--nf2-exclude-top", type=float, default=0.0,
+                   help="BAND assignment: exclude the top fraction of channels (by signal) from nf2 "
+                        "and give them sign instead; nf2 keeps its budget on the band just below. "
+                        "Fixes symnf2 absmax poisoning by extreme channels (Qwen3 QK-norm outliers): "
+                        "sign shrinks outliers (survivable), symnf2 inflates typical values (fatal).")
     p.add_argument("--layer-fracs", default=None,
                    help="per-layer sign-frac overrides 'L:f,L:f'; other layers rebalance to keep the global budget")
     p.add_argument("--per-head", action="store_true",
@@ -140,7 +145,17 @@ def main():
             k_sign = int(round(f_li * N))
             order = torch.argsort(signal[li].reshape(-1))           # ascending, layer-global
             m = torch.ones(N, dtype=torch.uint8)                    # default nf2(1)
-            m[order[:k_sign]] = 0                                   # lowest -> sign
+            k_top = int(round(args.nf2_exclude_top * N))
+            if k_top > 0:
+                # BAND: nf2 = the (N - k_sign) budget just below the excluded
+                # top; sign = the low tail PLUS the extreme top.
+                k_nf2 = N - k_sign
+                if k_top + k_nf2 > N:
+                    raise ValueError("--nf2-exclude-top leaves no room for the nf2 band")
+                m[:] = 0                                            # default sign
+                m[order[N - k_top - k_nf2:N - k_top]] = 1           # nf2 band
+            else:
+                m[order[:k_sign]] = 0                               # lowest -> sign
             mask[li] = m.reshape(n_kv, D)
             per_layer_sign.append(k_sign)
 
