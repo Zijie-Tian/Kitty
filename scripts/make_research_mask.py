@@ -63,6 +63,11 @@ def main():
                         "and give them sign instead; nf2 keeps its budget on the band just below. "
                         "Fixes symnf2 absmax poisoning by extreme channels (Qwen3 QK-norm outliers): "
                         "sign shrinks outliers (survivable), symnf2 inflates typical values (fatal).")
+    p.add_argument("--nf2-exclude-ratio", type=float, default=0.0,
+                   help="per-HEAD threshold exclusion: within each (layer, kv-head), channels whose "
+                        "amplitude sqrt(sigma2) exceeds R x the head's median amplitude are barred "
+                        "from nf2 (sent to sign); the nf2 budget refills with the next-ranked eligible "
+                        "channels. Targets pathological heads without global over-eviction.")
     p.add_argument("--layer-fracs", default=None,
                    help="per-layer sign-frac overrides 'L:f,L:f'; other layers rebalance to keep the global budget")
     p.add_argument("--per-head", action="store_true",
@@ -146,6 +151,22 @@ def main():
             order = torch.argsort(signal[li].reshape(-1))           # ascending, layer-global
             m = torch.ones(N, dtype=torch.uint8)                    # default nf2(1)
             k_top = int(round(args.nf2_exclude_top * N))
+            if args.nf2_exclude_ratio > 0:
+                # Per-head threshold: bar channels louder than R x the head's
+                # median amplitude from nf2, then fill the nf2 budget with the
+                # highest-signal ELIGIBLE channels (layer-global ranking).
+                amp = sigma2[li].sqrt()                             # [n_kv, D]
+                barred = (amp > args.nf2_exclude_ratio * amp.median(dim=-1, keepdim=True).values)
+                eligible = (~barred).reshape(-1)
+                k_nf2 = N - k_sign
+                elig_idx = [i.item() for i in order if eligible[i]]
+                if len(elig_idx) < k_nf2:
+                    k_nf2 = len(elig_idx)                           # rare: shrink nf2, note in stats
+                m[:] = 0                                            # default sign
+                m[torch.tensor(elig_idx[-k_nf2:], dtype=torch.long)] = 1  # top eligible -> nf2
+                mask[li] = m.reshape(n_kv, D)
+                per_layer_sign.append(N - k_nf2)
+                continue
             if k_top > 0:
                 # BAND: nf2 = the (N - k_sign) budget just below the excluded
                 # top; sign = the low tail PLUS the extreme top.
