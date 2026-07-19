@@ -16,7 +16,7 @@ variant name / method slug / output slug:  qlutattn
 
 Queries stay FP16. QLUTATTN never quantizes Q.
 
-### K-cache — per-token sign/nf2 on the mean-centered residual (nominal ~1.75 bit)
+### K-cache — per-token sign/nf2 on the mean-centered residual (nominal ~1.60 bit)
 
 Post-RoPE keys are quantized **per token** along `head_dim`:
 
@@ -27,21 +27,31 @@ Post-RoPE keys are quantized **per token** along `head_dim`:
    softmax.
 2. **Offline per-channel codebook mask.** Each channel is assigned ONE of two
    codebooks by an offline calibration
-   (`scripts/calibrate_qlutattn_mask.py`, wikitext residual sigma^2 ranking):
-   - the 50% lowest-sigma^2 channels → **sign**: 1-bit codeword, one
+   (`scripts/calibrate_qlutattn_mask.py`, one wikitext pass collecting both
+   statistics). The ranking signal is **`sigma^2 × E|q|`** — residual variance
+   (how hard the channel is to quantize) times mean absolute post-RoPE query
+   activation, query heads averaged per GQA group (how much attention actually
+   reads it). Channels are ranked per layer across all kv heads jointly:
+   - the 65% lowest-ranked channels → **sign**: 1-bit codeword, one
      per-token scale = mean |residual| over the sign channels (~1.25
      bit/value nominal);
-   - the 50% highest-sigma^2 channels → **nf2** (`symnf2-v1`): fixed
+   - the 35% highest-ranked channels → **nf2** (`symnf2-v1`): fixed
      symmetric NF2 LUT `{-1, -c, +c, +1}`, `c = 0.25256848...` (IR-QLoRA
      appendix B.2), one per-token absmax scale, **no second mean** (~2.25
      bit/value nominal).
    The mask is loaded once and used unchanged — never recomputed per prompt.
-3. **Nominal K width:** `0.5 × 1.25 + 0.5 × 2.25 = 1.75 bit/value`.
+   The 65/35 split is the measured accuracy optimum: nf2 beyond ~35% LOSES
+   accuracy because sign + mean-|r| fits low-difficulty channels better than
+   the absmax-scaled fixed LUT (mixing is a better quantizer, not merely a
+   bit saving).
+3. **Nominal K width:** `0.65 × 1.25 + 0.35 × 2.25 = 1.60 bit/value`.
 
 Explicitly **not** part of the algorithm: Hadamard/FWHT rotation,
 SmoothAttention, online sigma^2 binning, per-token Lloyd fitting, outlier
 dense-and-sparse side paths, block-shared per-token codebooks (the block size
-is fixed at 1).
+is fixed at 1), per-head fraction equalization, RoPE-pair binding, per-layer
+fraction schedules, and token-level tiering (all measured non-positive under
+this signal).
 
 ### V-cache — rescued 2-bit tile16c64 (`rht-pcaff-mse1-bias-v1`)
 
@@ -85,14 +95,15 @@ refuses to run otherwise:
 | field | requirement |
 | --- | --- |
 | `codebooks` | exactly `["sign", "nf2"]` |
-| `low_frac` | exactly `0.5` |
 | `codebook_mask` | `torch.uint8`, `ndim == 3`, values exactly `{0, 1}` (0=sign, 1=nf2) |
-| actual sign fraction | exactly `0.5` |
+| per-layer sign count | exactly `round(0.65 × n_kv × head_dim)` in every layer |
+| `low_frac` | equal to the mask's ACTUAL sign fraction (±1e-6; integer rounding puts it near but not exactly on 0.65) |
 | shape | `[num_layers, num_key_value_heads, head_dim]` of the target model |
 
-Legacy metadata keys (`target_bits`, `nominal_bits`) are ignored — the mask
-content, not its historical labels, is what is validated. The mask file's
-SHA-256 is embedded in the variant semantic hash and every run manifest.
+Legacy metadata keys (`target_bits`, `nominal_bits`, research-era keys) are
+ignored — the mask content, not its historical labels, is what is validated.
+The mask file's SHA-256 is embedded in the variant semantic hash and every
+run manifest.
 
 ## 3. Running it
 

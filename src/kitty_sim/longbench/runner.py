@@ -36,11 +36,12 @@ NF2_IMPL_VERSION = "symnf2-v1"
 
 # The single public QLUTATTN variant. K: post-RoPE per-token quant on the
 # per-channel-mean-centered residual, per-channel codebook fixed by an OFFLINE
-# sign/nf2 mask (50/50 split -> nominal 0.5*1.25 + 0.5*2.25 = 1.75 bit/value);
-# Q stays FP16. V: rescued 2-bit tile16c64 (rht-pcaff-mse1-bias-v1).
+# sign/nf2 mask ranked by sigma^2 x E|q| (difficulty x query usage), 65% sign /
+# 35% nf2 -> nominal 0.65*1.25 + 0.35*2.25 = 1.60 bit/value; Q stays FP16.
+# V: rescued 2-bit tile16c64 (rht-pcaff-mse1-bias-v1).
 QLUTATTN_VARIANT = "qlutattn"
 QLUTATTN_BIN_CODEBOOKS = ("sign", "nf2")
-QLUTATTN_SIGN_FRACTION = 0.5
+QLUTATTN_SIGN_FRACTION = 0.65
 QLUTATTN_V_TILE_CHANNELS = 64
 
 
@@ -275,24 +276,11 @@ def load_qlutattn_mask_blob(mask_path: str) -> dict[str, Any]:
     blob = torch.load(mask_path, map_location="cpu", weights_only=False)
     if not isinstance(blob, dict):
         raise ValueError(f"qlutattn mask {mask_path} must be a dict payload")
-    # QLUT_RESEARCH=1 relaxes the canonical-mask contract for controlled
-    # experiments: the codebook pair stays EXACTLY sign/nf2, but the sign
-    # fraction may differ from the canonical 50% (including pure-sign and
-    # pure-nf2 masks) and the assignment signal may differ from sigma^2. The
-    # K/V quant mechanisms themselves are unchanged. Default (env unset)
-    # keeps the strict canonical validation bit-for-bit.
-    research = os.environ.get("QLUT_RESEARCH", "").strip() == "1"
     codebooks = tuple(blob.get("codebooks") or ())
     if codebooks != QLUTATTN_BIN_CODEBOOKS:
         raise ValueError(
             f"qlutattn requires codebooks={list(QLUTATTN_BIN_CODEBOOKS)} in the "
             f"mask payload; got {list(codebooks)} in {mask_path}"
-        )
-    low_frac = blob.get("low_frac")
-    if low_frac is None or (not research and float(low_frac) != QLUTATTN_SIGN_FRACTION):
-        raise ValueError(
-            f"qlutattn requires low_frac={QLUTATTN_SIGN_FRACTION} in the mask "
-            f"payload; got {low_frac!r} in {mask_path}"
         )
     mask = blob.get("codebook_mask")
     if not isinstance(mask, torch.Tensor):
@@ -307,43 +295,33 @@ def load_qlutattn_mask_blob(mask_path: str) -> dict[str, Any]:
             f"qlutattn codebook_mask must be torch.uint8; got {mask.dtype}"
         )
     values = set(torch.unique(mask).tolist())
-    # Research masks may be single-tier (pure sign {0} / pure nf2 {1}).
-    values_ok = (values <= {0, 1} and values) if research else (values == {0, 1})
-    if not values_ok:
+    if values != {0, 1}:
         raise ValueError(
             f"qlutattn codebook_mask values must be exactly {{0, 1}} "
             f"(0=sign, 1=nf2); got {sorted(values)}"
         )
-    sign_frac = float((mask == 0).float().mean())
-    if not research and sign_frac != QLUTATTN_SIGN_FRACTION:
+    # Canonical 65/35 split: the per-layer sign count must equal
+    # round(0.65 * n_kv * head_dim) exactly (integer rounding makes the global
+    # fraction land near but not exactly on 0.65; the metadata must state the
+    # ACTUAL fraction). Legacy/research metadata keys are ignored — the mask
+    # content is what is validated.
+    n_per_layer = mask.shape[1] * mask.shape[2]
+    expected_sign = int(round(QLUTATTN_SIGN_FRACTION * n_per_layer))
+    per_layer_sign = (mask == 0).reshape(mask.shape[0], -1).sum(dim=1)
+    if not bool((per_layer_sign == expected_sign).all()):
+        bad = {int(i): int(c) for i, c in enumerate(per_layer_sign.tolist()) if c != expected_sign}
         raise ValueError(
-            f"qlutattn requires an exact {QLUTATTN_SIGN_FRACTION:.0%} sign "
-            f"channel fraction; the mask in {mask_path} has {sign_frac:.6f}"
+            f"qlutattn requires exactly {expected_sign}/{n_per_layer} sign channels "
+            f"per layer (= round({QLUTATTN_SIGN_FRACTION} * n_kv * head_dim)); "
+            f"mask in {mask_path} deviates at layers {bad}"
         )
-    # Token-tier fields: blob and QLUT_TOKEN_TIER env must agree (fail-fast
-    # before any GPU work; kitty_simulate re-checks at cache init).
-    tier_env = os.environ.get("QLUT_TOKEN_TIER", "").strip() == "1"
-    tier_blob = "tier_hi_mask" in blob
-    if tier_env != tier_blob:
+    sign_frac = float((mask == 0).float().mean())
+    low_frac = blob.get("low_frac")
+    if low_frac is None or abs(float(low_frac) - sign_frac) > 1e-6:
         raise ValueError(
-            f"QLUT_TOKEN_TIER={'1' if tier_env else '<unset>'} but the mask blob "
-            f"{'has' if tier_blob else 'lacks'} tier_hi_mask ({mask_path})")
-    if tier_blob:
-        if not research:
-            raise ValueError(f"token-tier masks require QLUT_RESEARCH=1 ({mask_path})")
-        hm = blob["tier_hi_mask"]
-        if not isinstance(hm, torch.Tensor) or hm.shape != mask.shape or hm.dtype != torch.uint8:
-            raise ValueError(f"tier_hi_mask must be uint8 with shape {tuple(mask.shape)} ({mask_path})")
-        if not set(torch.unique(hm).tolist()) <= {0, 1}:
-            raise ValueError(f"tier_hi_mask values must be within {{0,1}} ({mask_path})")
-        rho = float(blob.get("tier_rho", -1.0))
-        win = int(blob.get("tier_window", 0))
-        if not (0.0 < rho < 1.0) or win <= 0:
-            raise ValueError(f"tier_rho in (0,1) and tier_window > 0 required ({mask_path})")
-    if research:
-        # stderr: run_exp.sh preflight parses this process's stdout as JSON.
-        fracs = {cb: float((mask == ci).float().mean()) for ci, cb in enumerate(codebooks)}
-        print(f"[qlutattn-research] mask {mask_path}: tier fractions {fracs}", file=sys.stderr)
+            f"qlutattn requires low_frac metadata equal to the actual sign "
+            f"fraction {sign_frac:.6f}; got {low_frac!r} in {mask_path}"
+        )
     return blob
 
 
@@ -542,11 +520,11 @@ def _build_variant_impl(args: Any) -> VariantConfig:
         #      attention: q.mu is a per-query constant that cancels in softmax)
         #      and subtracted; the residual is quantized per token with a fixed
         #      per-channel codebook assignment loaded from an OFFLINE mask
-        #      (scripts/calibrate_qlutattn_mask.py): 50% lowest-sigma^2 channels
-        #      -> sign (1-bit + per-token |r| mean scale), 50% -> fixed
-        #      symmetric NF2 (symnf2-v1 LUT, per-token absmax scale). Nominal
-        #      0.5*1.25 + 0.5*2.25 = 1.75 bit/value. No rotation, no online
-        #      binning, no block sharing.
+        #      (scripts/calibrate_qlutattn_mask.py, ranking = sigma^2 x E|q|):
+        #      65% lowest-ranked channels -> sign (1-bit + per-token |r| mean
+        #      scale), 35% highest -> fixed symmetric NF2 (symnf2-v1 LUT,
+        #      per-token absmax scale). Nominal 0.65*1.25 + 0.35*2.25 = 1.60
+        #      bit/value. No rotation, no online binning, no block sharing.
         #   V: rescued 2-bit tile16c64 (rht-pcaff-mse1-bias-v1): 16 consecutive
         #      tokens x 64 channels per tile, RHT + frozen per-channel affine +
         #      one MSE refit + bias correction.
@@ -965,15 +943,6 @@ def load_model_and_tokenizer(
         local_files_only=local_files_only,
     )
     model_obj.eval()
-    # Research token-tier needs this layer's post-RoPE queries at cache.update
-    # time; the tap wraps the llama rope helper (llama family only).
-    if os.environ.get("QLUT_TOKEN_TIER", "").strip() == "1":
-        if "llama" not in model_family:
-            raise ValueError(
-                f"QLUT_TOKEN_TIER=1 supports the llama rope path only; got model_family={model_family}")
-        from kitty_sim.token_tier import install_rope_q_tap
-        install_rope_q_tap()
-        print("[qlutattn-token-tier] rope q-tap installed", file=sys.stderr)
     return model_obj, tokenizer, resolved
 
 

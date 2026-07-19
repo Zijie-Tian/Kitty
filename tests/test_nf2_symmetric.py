@@ -144,15 +144,19 @@ class TestNF2ImplHashMarker(unittest.TestCase):
         return ns
 
     def _write_mask(self) -> str:
-        """A valid canonical qlutattn mask: sign/nf2, exact 50/50 split."""
+        """A valid canonical qlutattn mask: sign/nf2, round(0.65*N) sign per layer."""
         path = tempfile.NamedTemporaryFile(suffix=".pt", delete=False).name
         self.addCleanup(Path(path).unlink, missing_ok=True)
-        mask = torch.zeros(2, 2, 64, dtype=torch.uint8)
-        mask[..., 32:] = 1
+        n_layers, n_kv, head_dim = 2, 2, 64
+        n = n_kv * head_dim
+        k_sign = int(round(0.65 * n))
+        mask = torch.zeros(n_layers, n_kv, head_dim, dtype=torch.uint8)
+        flat = mask.reshape(n_layers, -1)
+        flat[:, k_sign:] = 1
         torch.save({
             "codebook_mask": mask,
             "codebooks": ["sign", "nf2"],
-            "low_frac": 0.5,
+            "low_frac": k_sign / n,
         }, path)
         return path
 

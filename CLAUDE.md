@@ -249,7 +249,7 @@ datasets across GPUs, use a single target, e.g. `run_exp.sh llama32 --gpus 0,1,2
 | Variant | Method slug | What it is |
 | --- | --- | --- |
 | `kitty` | `kitty-k{kbits}b{promote_bit}v{vbits}-pr{ratio}` | Kitty machinery (magnitude channel-select + sink=32) with tunable K base (`KBITS`), boost bit (`PROMOTE_BIT`), boost fraction (`PROMOTE_RATIO`, or `--promote-ratio-config` for per-layer), V (`VBITS`). Defaults = paper Kitty (k2/b4/v2/pr0.125 → `kitty-k2b4v2-pr0p125`). Subsumes the removed `kitty_pro` (`PROMOTE_RATIO=0.25`) and `kitty_k1v4` (`KBITS=1 PROMOTE_BIT=2 VBITS=4 PROMOTE_RATIO=0.25`). |
-| `qlutattn` | `qlutattn` | The single canonical QLUTATTN variant (pure-torch sim fake-quant accuracy proxy; see the dedicated section below and `docs/qlutattn.md`). Q stays FP16 — never quantized. K: post-RoPE **per-token** quant along head_dim — a per-channel mean `μ_d` is self-calibrated at prefill and subtracted (free for attention: `q·μ` cancels in softmax); the residual is quantized under an OFFLINE per-channel codebook mask (`scripts/calibrate_qlutattn_mask.py`, wikitext): the 50% lowest-σ² channels → sign (1-bit + per-token mean-|r| scale, ~1.25b), the other 50% → the fixed symmetric NF2 LUT `symnf2-v1` (`{-1, -c, +c, +1}`, `c = 0.25256848`, per-token absmax scale, ~2.25b); nominal K = **1.75 bit/value**. V: rescued 2-bit tile16c64, algo `rht-pcaff-mse1-bias-v1`. sink=32, recent-128 fp16 window, group=128. Fixed algorithm — `QLUT_CB_MASK` is the ONLY runtime input; FP16 model only, head_dim a power of two divisible by 64, GLM family fail-fast. |
+| `qlutattn` | `qlutattn` | The single canonical QLUTATTN variant (pure-torch sim fake-quant accuracy proxy; see the dedicated section below and `docs/qlutattn.md`). Q stays FP16 — never quantized. K: post-RoPE **per-token** quant along head_dim — a per-channel mean `μ_d` is self-calibrated at prefill and subtracted (free for attention: `q·μ` cancels in softmax); the residual is quantized under an OFFLINE per-channel codebook mask (`scripts/calibrate_qlutattn_mask.py`, one wikitext pass, ranking = **σ² × E\|q\|** = residual variance × mean abs post-RoPE query activation per GQA group): the 65% lowest-ranked channels → sign (1-bit + per-token mean-|r| scale, ~1.25b), the 35% highest → the fixed symmetric NF2 LUT `symnf2-v1` (`{-1, -c, +c, +1}`, `c = 0.25256848`, per-token absmax scale, ~2.25b); nominal K = **1.60 bit/value** (65/35 is the measured accuracy optimum — more nf2 loses). V: rescued 2-bit tile16c64, algo `rht-pcaff-mse1-bias-v1`. sink=32, recent-128 fp16 window, group=128. Fixed algorithm — `QLUT_CB_MASK` is the ONLY runtime input; FP16 model only, head_dim a power of two divisible by 64, GLM family fail-fast. |
 | `fp16` | `fp16` | Full-precision baseline — no Kitty cache, HF dense fp16 KV. |
 | `kivi` | `kivi-k{kbits}v{vbits}` | KIVI-style uniform quant (no promote, no channel-select, no sink). K/V bit-width is set via `KBITS`/`VBITS` (default 2/2 = the old `kivi_2`); the slug encodes the bits so each combo gets its own dir (e.g. `kivi-k2v4`). |
 | `kivi_star` | `kivi-star-k{kbits}v{vbits}` | Same as `kivi` but `sink_length=32` (the old `kivi_star_2`). |
@@ -513,16 +513,21 @@ kitty/kivi)。历史 QLUTATTN 调参环境变量已全部退役:任何残留非�
 - **K**:post-RoPE **per-token**(沿 head_dim)量化。prefill 时自标定 per-channel
   均值 `μ_d` 并减去(对 attention 免费:`q·μ` 是 per-query 常数,在 softmax 中
   抵消);残差按**离线 per-channel 码本掩码**量化
-  (`scripts/calibrate_qlutattn_mask.py`,wikitext 残差 σ² 排序):
-  - 50% 最低 σ² 通道 → **sign**:1-bit 码字 + per-token mean-|r| scale
+  (`scripts/calibrate_qlutattn_mask.py`,wikitext 单趟同时采集两个统计量,
+  排序信号 = **σ² × E|q|**:残差方差(量化难度)× post-RoPE query 通道平均绝对
+  激活(GQA 组内平均;attention 真正读它的程度);每层跨全部 kv-head 联合排序):
+  - 65% 最低排序通道 → **sign**:1-bit 码字 + per-token mean-|r| scale
     (~1.25 bit/value);
-  - 50% 最高 σ² 通道 → **nf2(`symnf2-v1`)**:固定对称 NF2 LUT
+  - 35% 最高排序通道 → **nf2(`symnf2-v1`)**:固定对称 NF2 LUT
     `{-1, -c, +c, +1}`,`c = 0.25256848`,per-token absmax scale,无二次均值
     (~2.25 bit/value)。
-  - 名义 K 位宽 = `0.5×1.25 + 0.5×2.25` = **1.75 bit/value**。
+  - 名义 K 位宽 = `0.65×1.25 + 0.35×2.25` = **1.60 bit/value**。65/35 是实测
+    精度最优:nf2 超过 ~35% 反而掉分(sign+mean-|r| 在低难度通道上优于
+    absmax 固定 LUT——混合本身是更优量化器,不只是省 bit)。
   - 明确**不包含**:Hadamard/FWHT 旋转、SmoothAttention、在线 σ² 分箱、per-token
     自适应码本拟合、outlier 稠密-稀疏侧路、跨 token 的 block 共享码本(block 固定
-    为 1)。
+    为 1)、per-head 占比均衡、RoPE 对偶绑定、逐层占比调度、token 级分档
+    (以上在该信号下实测均无正收益)。
 - **V**:rescued 2-bit **tile16c64**,算法 `rht-pcaff-mse1-bias-v1`(固定 RHT,
   seed 20260711;1 轮 MSE 迭代):每 tile = 16 个连续 token × 64 通道;码字 2-bit,
   per-tile scale 与 per-channel side-info 使理论有效位宽略高于 2;sink / recent
@@ -539,18 +544,18 @@ kitty/kivi)。历史 QLUTATTN 调参环境变量已全部退役:任何残留非�
 | 字段 | 要求 |
 | --- | --- |
 | `codebooks` | 恰为 `["sign", "nf2"]` |
-| `low_frac` | 恰为 `0.5` |
 | `codebook_mask` | `uint8`,`ndim == 3`,取值恰为 `{0, 1}`(0=sign,1=nf2) |
-| 实际 sign 占比 | 恰为 `0.5` |
+| 每层 sign 计数 | 每层恰为 `round(0.65 × n_kv × head_dim)` |
+| `low_frac` | 等于掩码**实际** sign 占比(±1e-6;整数取整使其接近但不必恰为 0.65) |
 | shape | `[num_layers, num_key_value_heads, head_dim]`(目标模型) |
 
-legacy 的 `target_bits` / `nominal_bits` 元数据一律忽略。掩码文件的 SHA-256 进入
-变体语义哈希与每个 run manifest。
+legacy 的 `target_bits` / `nominal_bits` 及研究期元数据一律忽略。掩码文件的
+SHA-256 进入变体语义哈希与每个 run manifest。
 
 ### 标定 → smoke → full
 
 ```bash
-# 1) 离线标定(每模型一次,~1min/卡;固定 sign/nf2 50/50,无可调参数)
+# 1) 离线标定(每模型一次,单趟采集 σ²+E|q|;固定 sign/nf2 65/35,无可调参数)
 cd "$(git rev-parse --show-toplevel)"
 CUDA_VISIBLE_DEVICES=0 PYTHONPATH=src python scripts/calibrate_qlutattn_mask.py \
   --model /path/to/Llama-3.2-1B-Instruct \

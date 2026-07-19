@@ -99,13 +99,17 @@ def _args(variant: str = "qlutattn", **kwargs):
 
 
 def _mask_payload(n_layers=1, n_kv=1, head_dim=64):
-    """A valid canonical mask payload: sign/nf2, exact 50/50 per channel row."""
+    """A valid canonical mask payload: sign/nf2, exactly round(0.65*N) sign
+    channels per layer, low_frac = the ACTUAL fraction."""
+    n = n_kv * head_dim
+    k_sign = int(round(0.65 * n))
     mask = torch.zeros(n_layers, n_kv, head_dim, dtype=torch.uint8)
-    mask[..., head_dim // 2:] = 1
+    flat = mask.reshape(n_layers, -1)
+    flat[:, k_sign:] = 1
     return {
         "codebook_mask": mask,
         "codebooks": ["sign", "nf2"],
-        "low_frac": 0.5,
+        "low_frac": k_sign / n,
     }
 
 
@@ -389,9 +393,11 @@ class TestHashesAndPreflight(_EnvIsolation):
                 data_root=str(root / "longbench"),
             )
             h1 = longbench_run_config_hash(args, build_variant(args), "narrativeqa")
-            flipped = _mask_payload(1, 1, 64)
-            flipped["codebook_mask"] = 1 - flipped["codebook_mask"]
-            torch.save(flipped, mask)
+            # Different mask CONTENT with the same valid per-layer sign count:
+            # rotate the channel assignment by one position.
+            rolled = _mask_payload(1, 1, 64)
+            rolled["codebook_mask"] = torch.roll(rolled["codebook_mask"], 1, dims=-1)
+            torch.save(rolled, mask)
             h2 = longbench_run_config_hash(args, build_variant(args), "narrativeqa")
             self.assertNotEqual(h1, h2)
 
@@ -517,11 +523,18 @@ class TestMaskedKNumerics(_EnvIsolation):
         expected = torch.zeros_like(r)
         for h in range(nh):
             sel = m_sign[h]
-            sub = r[:, h, :, sel]
-            expected[:, h, :, sel] = torch.sign(sub) * sub.abs().mean(-1, keepdim=True)
+            if sel.any():
+                sub = r[:, h, :, sel]
+                expected[:, h, :, sel] = torch.sign(sub) * sub.abs().mean(-1, keepdim=True)
             sel = m_nf2[h]
-            expected[:, h, :, sel] = nf2_symmetric_lastdim(r[:, h, :, sel])
-        torch.testing.assert_close(out, (muB + expected).to(out.dtype), atol=0.0, rtol=0.0)
+            if sel.any():
+                # A head may hold zero nf2 channels under the layer-global 65/35
+                # ranking; the runtime reconstructs those rows as 0.
+                expected[:, h, :, sel] = nf2_symmetric_lastdim(r[:, h, :, sel])
+        # fp32 tolerance: the runtime's masked reductions sum zero-padded full
+        # rows (vectorized across heads) while this reference sums the selected
+        # slice — same math, different fp32 summation order (~2e-7).
+        torch.testing.assert_close(out, (muB + expected).to(out.dtype), atol=1e-6, rtol=0.0)
 
     def test_decode_reuses_cached_pc_mean(self):
         os.environ["QLUT_CB_MASK"] = self._write_mask(_mask_payload(1, 2, 16))
