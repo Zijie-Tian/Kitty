@@ -1,0 +1,23 @@
+{
+  "version": "2.1.0",
+  "source": "loop",
+  "timestamp": "2026-07-19T02:30:00+08:00",
+  "status": "COMPLETE",
+  "results_tsv": "autoresearch/loop-260717-1200/results.tsv",
+  "findings": [
+    "FINAL RECIPE q65: sign-frac 0.65 + sigma2*E|q| offline ranking (wikitext probe) = 1.60b nominal K; scripts/make_research_mask.py + scripts/probe_q_magnitude.py; QLUT_RESEARCH=1",
+    "Full-21 at -0.15 bit beats-or-matches canonical on all llama-family models (1B 24.53/+0.30, MiniCPM 18.23/+0.17, 3B 34.30/+0.06)",
+    "2D variant ttm150 (token tiering, QLUT_TOKEN_TIER=1) holds parity at 1.50b on all three (24.52/18.10/34.18) = -0.25 bit",
+    "Interior optimum ~35% nf2; product signal both-factors-necessary; all structural priors negative (per-head, rope-pairs, layer schedules, all-nf2 hi tier)",
+    "Screening->full dilution 12x; wikitext |q| domain bias regresses code/zh; mixed-corpus calibration = top future work",
+    "Qwen3-4B symnf2 collapse mechanism: extreme QK-norm channels poison per-token absmax (ratio 52x vs 3x llama); exclusion response 12.18->24.42(band05)->25.83(R3)->26.88(band10), band20 in flight; structural fixed-LUT misfit remains vs Lloyd 43.92 - open problem",
+    "Band exclusion harms healthy models (-0.89 on llama-1B): conditional patch, diagnose nf2-bin amplitude ratio first (0-GPU)"
+  ],
+  "config": {
+    "goal": "sign/nf2-only K-cache mixed-precision Pareto (per-token mechanism and V-cache fixed), minimize bits at preserved accuracy",
+    "scope": "src/kitty_sim/ scripts/ (worktree research_mixed)",
+    "metric": "screening mean(qasper,multifieldqa_en) full-sample; final full LongBench-21 average",
+    "direction": "higher_is_better",
+    "verify": "autoresearch/loop-260717-1200/run_config.sh + metric.py"
+  }
+}
