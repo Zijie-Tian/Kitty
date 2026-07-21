@@ -40,3 +40,4 @@ autoresearch/pareto-rotated
 *.log
 .planning
 docs/figures
+.sisyphus/run-continuation
