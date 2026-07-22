@@ -15,6 +15,8 @@ def infer_model_family(model_name: str | None, model_path: str | None = None) ->
         return "llama3.2"
     if "llama-3" in source or "llama3" in source:
         return "llama3"
+    if "minicpm" in source:
+        return "minicpm"
     if "qwen" in source:
         return "qwen"
     if "glm-4" in source or "glm4" in source:
@@ -40,8 +42,25 @@ def infer_model_family(model_name: str | None, model_path: str | None = None) ->
     return "default"
 
 
-def build_chat(tokenizer: Any, prompt: str, model_family: str) -> str:
-    """Apply the same chat wrapping policy as LUTAttn, with Qwen support."""
+def use_fast_tokenizer(model_family: str) -> bool:
+    """Return the shared tokenizer implementation policy for model loading."""
+
+    family = model_family.lower()
+    return "llama3" in family or "qwen" in family or "phi" in family
+
+
+def build_chat(
+    tokenizer: Any,
+    prompt: str,
+    model_family: str,
+    *,
+    template_date: str | None = None,
+) -> str:
+    """Apply the same chat wrapping policy as LUTAttn.
+
+    ``template_date`` pins date-sensitive model templates for reproducible
+    benchmark prompts. LongBench leaves it unset to preserve existing behavior.
+    """
     family = model_family.lower()
     if family == "chatglm3":
         return tokenizer.build_chat_input(prompt)
@@ -62,9 +81,18 @@ def build_chat(tokenizer: Any, prompt: str, model_family: str) -> str:
         return conv.get_prompt()
     if family == "llama2-7b-80k":
         return f"<|im_start|> {prompt}"
-    if family in {"llama3.2", "qwen", "phi"}:
+    if family in {"llama3.2", "qwen", "phi", "minicpm"}:
         messages = [{"role": "user", "content": prompt}]
-        return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        if template_date is not None:
+            return tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                date_string=template_date,
+            )
+        return tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
     if family == "llama2" or family == "mistral-instruct":
         return f"[INST]{prompt}[/INST]"
     if family == "xgen":

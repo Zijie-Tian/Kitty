@@ -20,7 +20,7 @@ build/
 !/.claude/skills/
 /.claude/skills/*-workspace/
 /longbench_out
-/niah_out
+/ruler_out
 /archieve
 # KV-cache 能量探针产物（图/JSON/PT），可再生，不跟踪
 /probe_out

@@ -129,8 +129,8 @@ bash scripts/run_exp.sh llama32 --gpus <ids> --variant qlutattn
 
 Model constraints (validated config-only, before weights load): FP16 model;
 `head_dim` a power of two divisible by 64; GLM-family models are rejected
-(fail-fast — no silent KIVI fallback). RULER-NIAH uses the same variant via
-`bash scripts/run_niah.sh --variants fp16,qlutattn`.
+(fail-fast — no silent KIVI fallback). NVIDIA RULER uses the same canonical
+variant via `bash scripts/run_ruler.sh --variants fp16,qlutattn`.
 
 ### Output layout
 

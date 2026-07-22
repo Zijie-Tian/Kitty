@@ -27,7 +27,12 @@ from kitty_sim.glm_kitty_patch import (
 
 from .config import LONG_BENCH_DATASETS, LONG_BENCH_E_DATASETS, load_json_config
 from .data import default_data_root, load_longbench_dataset
-from .templates import format_longbench_prompt, infer_model_family, post_process
+from .templates import (
+    format_longbench_prompt,
+    infer_model_family,
+    post_process,
+    use_fast_tokenizer,
+)
 
 # nf2 algorithm generation stamped into run_config_hash via VariantConfig.nf2_impl.
 # "symnf2-v1" = fixed symmetric NF2 LUT (IR-QLoRA), replacing the unversioned
@@ -929,7 +934,7 @@ def load_model_and_tokenizer(
     tokenizer = AutoTokenizer.from_pretrained(
         resolved,
         trust_remote_code=True,
-        use_fast=("llama3" in model_family or "qwen" in model_family or "phi" in model_family),
+        use_fast=use_fast_tokenizer(model_family),
         local_files_only=local_files_only,
     )
     if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:

@@ -957,97 +957,140 @@ python3 aggregate.py pb2_pr6875_8b   # full-LB avg per config
 `GPUS`); prefer >=40GB cards for headroom / 2-per-card. `head_dim=128` so pr0.6875 =
 88/128 channels @2-bit.
 
-## RULER-NIAH (捞针) evaluation
+## NVIDIA RULER evaluation
 
-Standalone needle-in-a-haystack harness following the RULER protocol (NVIDIA,
-arXiv 2404.06654): needles are "One of the special magic numbers/uuids for
-{key} is: {value}", scoring is `string_match_all` (case-insensitive substring
-of each gold value in the greedy 128-token continuation). It complements the
-LongBench accuracy studies with an exact-retrieval stress test.
-`scripts/run_niah.sh` is the sole NIAH entry point; do not launch
-`kitty_sim.cli.eval_niah` by hand for real runs.
+Kitty has one canonical RULER path covering the complete 13-task NVIDIA
+synthetic suite. `scripts/run_ruler.sh` is the sole evaluation entry point;
+`scripts/prepare_ruler_data.sh` is the sole data-preparation entry point. Do not
+launch `kitty_sim.cli.eval_ruler` directly for real runs.
 
-### Data generation (offline, one-time per tokenizer family)
+### Tasks and metrics
 
-`scripts/prepare_niah_data.sh` shells into a RULER checkout
-(`RULER_REPO_ROOT`, default `~/Code/RULER` — the local fork whose `niah.py`
-emits `answer_prefix` and `token_position_answer`) and writes
-`${NIAH_DATA_ROOT}/<LEN>/<task>/validation.jsonl` (default
-`~/data/ruler_niah/llama3`). Generation needs `pip install wonderwords nltk`
-(+ `NLTK_DATA=$RULER_REPO_ROOT/nltk_data`) — pure-Python, only for datagen.
-Data is generated at `LEN - 256` tokens so the eval-time chat template can
-never overflow `max_model_len`: the NIAH runner hard-errors instead of
-truncating (a middle-truncate could silently delete the needle). Llama-3.2
-1B/3B share one llama3-tokenizer dataset; seed 42 makes all arms see identical
-samples.
+The immutable registry is `src/kitty_sim/ruler/tasks.py`:
+
+- NIAH, `string_match_all`, 128 generated tokens:
+  `niah_single_1/2/3`, `niah_multikey_1/2/3`, `niah_multivalue`,
+  `niah_multiquery`.
+- Aggregation, `string_match_all`: `vt` (30), `cwe` (120), `fwe` (50).
+- QA, `string_match_part`: `qa_1`, `qa_2` (32 each).
+
+Default nominal lengths are `4096,8192,16384,32768`. Data generation reserves
+256 tokens for chat-template overhead. Evaluation never truncates an overlong
+prompt; it fails and requires regenerating data with a larger margin.
+
+### Data preparation
+
+Generation uses the vendored NVIDIA generators under
+`third_party/lm-evaluation-harness/lm_eval/tasks/ruler/`. Essay/QA fixtures are
+offline inputs under `RULER_SOURCE_ROOT`: `PaulGrahamEssays.json`, `squad.json`,
+and `hotpotqa.json`. No network download or package installation happens unless
+the caller explicitly enables source downloads.
+
+RULER data is model/tokenizer-specific. Use a separate data root for each model.
+Every `<length>/<task>/validation.jsonl` has a
+`validation.manifest.json` containing source/generator hashes, tokenizer file
+hashes, tokenizer implementation class, requested/actual fast-tokenizer mode,
+seed, task cap, and JSONL checksum. Preflight rejects a data tokenizer that does
+not match the target checkpoint; the GPU worker also checks the runtime
+tokenizer class and fast/slow mode.
 
 ```bash
+# Llama-3.2-1B: full reusable data, 13 tasks x 4 lengths x 100 samples
 cd "$(git rev-parse --show-toplevel)"
-LLAMA32_MODEL_PATH=/path/to/Llama-3.2-1B-Instruct \
-RULER_REPO_ROOT=/path/to/RULER \
-NIAH_DATA_ROOT=/path/to/ruler_niah/llama3 \
-bash scripts/prepare_niah_data.sh
-# TASKS / LENS / NUM_SAMPLES env override the 4-task x 4-len x 50 default.
+bash scripts/prepare_ruler_data.sh \
+  --model-path /path/to/Llama-3.2-1B-Instruct \
+  --model-tag llama32-1b-instruct \
+  --model-family llama3.2 \
+  --data-root /path/to/ruler-data/llama32-1b \
+  --source-root /path/to/ruler-sources \
+  --tasks all --lengths 4096,8192,16384,32768 --num-samples 100
 ```
 
-### Eval + scoring
+```bash
+# MiniCPM5-1B: generate with its own tokenizer and data root
+cd "$(git rev-parse --show-toplevel)"
+bash scripts/prepare_ruler_data.sh \
+  --model-path /path/to/MiniCPM5-1B \
+  --model-tag minicpm5-1b \
+  --model-family minicpm \
+  --data-root /path/to/ruler-data/minicpm5-1b \
+  --source-root /path/to/ruler-sources \
+  --tasks all --lengths 4096,8192,16384,32768 --num-samples 100
+```
 
-First-party modules: `src/kitty_sim/niah/{data,runner,scorer}.py`,
-`kitty_sim.cli.eval_niah`, `kitty_sim.cli.score_niah`,
-`scripts/plot_niah_montage.py`, tests in `tests/test_niah_wiring.py` (0-GPU).
-The runner reuses `build_variant` / `load_model_and_tokenizer` /
-`_cache_factory` from the LongBench runner: fresh `KittyKVCache` per sample via
-`past_key_values`, greedy `max_new_tokens=128`, prompt =
-`build_chat(input) + answer_prefix` (family `llama3` = raw text, matching the
-RULER base template). Manifests carry `run_config_hash` + the `engagement`
-evidence (`last_v_quant_mode`/`v_tile_blocks`); full runs resume, smoke wipes.
-Output: `niah_out/[smoke/]<model>_<method>/{pred,logs}`; scoring writes
-`pred/result.json` and depth x length heatmap PNGs into `logs/`
-(`token_position_answer/length` binned into 10 depth bins — the classic NIAH
-heatmap, no controlled-depth regeneration needed).
+### Evaluation and scheduling
 
-The driver default is `--variants fp16,qlutattn`. The `qlutattn` arm needs the
-model-specific offline mask via `QLUT_CB_MASK` (the same
-`<MODEL_PATH>.qlutattn_mask.pt` used for LongBench, from
-`scripts/calibrate_qlutattn_mask.py`); `llamacpp_q40` / `llamacpp_q40_star`
-are also wired into `run_niah.sh` and need no mask or extra env. GPU default
-is 1 (GPU1-only rule); any other GPU is an explicit user override.
+Supported methods are `fp16`, `kitty`, `shadowkv`, `qlutattn`, `kivi`,
+`kivi_star`, `llamacpp_q40`, `llamacpp_q40_star`, and `custom`. The runner
+reuses LongBench's canonical variant builder and method slugs; there is no
+second RULER-only method table.
+
+One worker owns one method arm and one visible physical GPU. `--gpu N` runs
+methods serially on one GPU. `--gpus G0,G1,...` dynamically dispatches methods
+over those GPU slots; it is method parallelism, not model parallelism. A failed
+method does not stop independent arms, but the aggregate command exits nonzero.
+GPU1 remains the default; listing other GPUs is an explicit hardware override.
+
+Smoke runs (`--max-samples N`, `N > 0`) use
+`ruler_out/smoke/<model>_<method>/{pred,logs}` and clear each selected arm.
+Full runs use `ruler_out/<model>_<method>/{pred,logs}` and resume only
+manifest/hash-matching pairs. Each arm is scored automatically into
+`pred/result.json` and `pred/summary.csv`; NIAH depth heatmaps are written to
+`logs/`.
+
+`qlutattn` requires the model-specific offline `QLUT_CB_MASK`. Other method
+knobs are the same environment variables used by LongBench
+(`KBITS`/`VBITS`/`PROMOTE_BIT`/`PROMOTE_RATIO`,
+`SHADOWKV_BUDGET`/`SHADOWKV_RANK`/`SHADOWKV_CHUNK`, and related canonical
+settings).
 
 ```bash
-# smoke (2 samples, 1 task, 2 lens)
+# Short reproducible smoke: all 13 tasks, 4K, one sample, all methods, GPU1
 cd "$(git rev-parse --show-toplevel)"
 QLUT_CB_MASK=/path/to/Llama-3.2-1B-Instruct.qlutattn_mask.pt \
-LLAMA32_MODEL_PATH=/path/to/Llama-3.2-1B-Instruct \
-NIAH_DATA_ROOT=/path/to/ruler_niah/llama3 \
-bash scripts/run_niah.sh --gpu 1 --variants fp16,qlutattn \
-  --tasks niah_single_2 --lens 4096,32768 --max-samples 2
-# -> niah_out/smoke/llama32-1b-instruct_<method>/{pred,logs}
+bash scripts/run_ruler.sh \
+  --model meta-llama/Llama-3.2-1B-Instruct \
+  --model-path /path/to/Llama-3.2-1B-Instruct \
+  --model-tag llama32-1b-instruct --model-family llama3.2 \
+  --data-root /path/to/ruler-data/llama32-1b \
+  --variants fp16,kitty,shadowkv,qlutattn,kivi,kivi_star,llamacpp_q40,llamacpp_q40_star,custom \
+  --tasks all --lengths 4096 --max-samples 1 --max-model-len 4096 --gpu 1
 ```
 
 ```bash
-# full (4 tasks x 4 lens x 50 samples, both arms serially)
+# Full profile: all 13 tasks x 4 lengths; resumable, 32K model cap
 cd "$(git rev-parse --show-toplevel)"
 QLUT_CB_MASK=/path/to/Llama-3.2-1B-Instruct.qlutattn_mask.pt \
-LLAMA32_MODEL_PATH=/path/to/Llama-3.2-1B-Instruct \
-NIAH_DATA_ROOT=/path/to/ruler_niah/llama3 \
-bash scripts/run_niah.sh --gpu 1 --variants fp16,qlutattn
-# -> niah_out/llama32-1b-instruct_<method>/{pred,logs}; per-arm result.json + heatmaps auto-written
-
-# comparison heatmap montage (shared color scale):
-PYTHONPATH=src python scripts/plot_niah_montage.py \
-  --arms niah_out/llama32-1b-instruct_fp16 \
-         niah_out/llama32-1b-instruct_qlutattn \
-  --labels "fp16" "qlutattn" \
-  --task pooled --output niah_out/niah_heatmap_montage_pooled.png
+bash scripts/run_ruler.sh \
+  --model meta-llama/Llama-3.2-1B-Instruct \
+  --model-path /path/to/Llama-3.2-1B-Instruct \
+  --model-tag llama32-1b-instruct --model-family llama3.2 \
+  --data-root /path/to/ruler-data/llama32-1b \
+  --variants fp16,kitty,shadowkv,qlutattn,kivi,kivi_star,llamacpp_q40,llamacpp_q40_star,custom \
+  --tasks all --lengths 4096,8192,16384,32768 --max-model-len 32768 --gpu 1
 ```
 
-### Reference points (verified 2026-07-12, A100-80GB, Llama-3.2-1B, 50 samples/cell)
+To fan method arms across GPUs after explicitly widening the GPU1-only
+constraint, replace `--gpu 1` with, for example, `--gpus 0,1,2`.
 
-Mean `string_match_all` over niah_single_1/2/3 + niah_multikey_1: fp16 scores
-**97.62** overall (99.0/98.5/96.5/96.5 at 4k/8k/16k/32k) and shows no
-lost-in-the-middle at these lengths; llama.cpp Q4_0 (K=V=4.5b, no sink/no
-recent window) is a near-fp16 reference at **97.00**, its only visible dent
-being multikey_1@32k (78 vs fp16 86) — exact retrieval is essentially intact
-at 4.5 bit even without any protection policy. General lesson: exact retrieval
-degrades long before LongBench averages do, so always pair a LongBench score
-with a NIAH check when evaluating aggressive K-cache quantization.
+### Scoring and comparison figures
+
+`src/kitty_sim/ruler/scorer.py` selects metrics from the task registry only.
+Every requested pair must have a complete sidecar whose task/length/count,
+embedded run-config hash, and prediction JSONL checksum all match. Missing or
+invalid sidecars produce `status: incomplete` and a nonzero scorer exit.
+
+```bash
+# Re-score one completed arm
+PYTHONPATH=src python -m kitty_sim.cli.score_ruler \
+  ruler_out/llama32-1b-instruct_fp16/pred \
+  --tasks all --seq-lens 4096,8192,16384,32768 \
+  --heatmap-dir ruler_out/llama32-1b-instruct_fp16/logs
+
+# Compare NIAH depth matrices with a shared color scale
+PYTHONPATH=src python scripts/plot_ruler_niah_montage.py \
+  --arms ruler_out/llama32-1b-instruct_fp16 \
+         ruler_out/llama32-1b-instruct_qlutattn \
+  --labels fp16 qlutattn --task pooled \
+  --output ruler_out/llama32-1b-instruct_niah_montage.png
+```
