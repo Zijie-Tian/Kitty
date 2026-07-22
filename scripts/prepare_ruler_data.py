@@ -53,9 +53,9 @@ RULER_VENDOR_DIR = (
 )
 
 SCHEMA_VERSION = 2
-GENERATOR_VERSION = "kitty-ruler-prep-v2"
+GENERATOR_VERSION = "kitty-ruler-prep-v3"
 TOKENIZER_HASH_ALGORITHM = "ruler-tokenizer-config-v2"
-FWE_GENERATOR_SLACK = 32
+GENERATOR_NORMALIZATION_SLACK = 64
 
 ESSAY_NIAH_TASKS = frozenset(
     {
@@ -824,6 +824,25 @@ def _load_local_qa(
     return module.read_hotpotqa(str(source_path))
 
 
+def _generator_length(
+    task: str, generated_length: int, max_new_tokens: int
+) -> int:
+    """Return a vendor budget that survives canonical prompt normalization."""
+
+    slack = GENERATOR_NORMALIZATION_SLACK
+    if task == "fwe":
+        # The vendored FWE generator treats max_seq_length as an input budget,
+        # then adds the generation cap when reporting each record's length.
+        slack += max_new_tokens
+    generator_length = generated_length - slack
+    if generator_length <= max_new_tokens:
+        raise PrepError(
+            f"{task} generator target {generator_length} must exceed cap "
+            f"{max_new_tokens}"
+        )
+    return generator_length
+
+
 def _generate_raw_records(
     task: str,
     backend: dict[str, types.ModuleType],
@@ -867,15 +886,9 @@ def _generate_raw_records(
     if task == "fwe":
         module = backend["fwe_utils"]
         module.SEED = seed
-        fwe_length = generated_length - FWE_GENERATOR_SLACK
-        if fwe_length <= max_new_tokens:
-            raise PrepError(
-                f"fwe generation target {fwe_length} must exceed cap "
-                f"{max_new_tokens}"
-            )
         return module.sys_kwext(
             tokenizer=tokenizer,
-            max_seq_length=fwe_length,
+            max_seq_length=generated_length,
             num_samples=num_samples,
             tokens_to_generate=max_new_tokens,
         )
@@ -1113,6 +1126,7 @@ def _worker(args: argparse.Namespace) -> int:
             f"{task}/{nominal_length}: generated length {generated_length} must exceed "
             f"generation cap {max_new_tokens}"
         )
+    generator_length = _generator_length(task, generated_length, max_new_tokens)
 
     source_hashes = _source_hashes(task, args.source_root)
     generator_hashes = _generator_hashes(task)
@@ -1139,6 +1153,7 @@ def _worker(args: argparse.Namespace) -> int:
         "nominal_length": nominal_length,
         "generated_length": generated_length,
         "margin": args.margin,
+        "generator_length": generator_length,
         "max_new_tokens": max_new_tokens,
         "count": args.num_samples,
         "seed": args.seed,
@@ -1185,7 +1200,7 @@ def _worker(args: argparse.Namespace) -> int:
         backend,
         tokenizer,
         args.source_root,
-        generated_length,
+        generator_length,
         args.num_samples,
         args.seed,
         max_new_tokens,

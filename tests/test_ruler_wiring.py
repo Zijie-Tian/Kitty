@@ -399,6 +399,17 @@ class TestRulerRegistry(unittest.TestCase):
         ):
             prep._task_max_new_tokens("vt", mismatched_backend)
 
+        target = 3840
+        self.assertEqual(
+            prep._generator_length("vt", target, canonical_cap),
+            target - prep.GENERATOR_NORMALIZATION_SLACK,
+        )
+        fwe_cap = get_task_spec("fwe").max_new_tokens
+        self.assertEqual(
+            prep._generator_length("fwe", target, fwe_cap),
+            target - prep.GENERATOR_NORMALIZATION_SLACK - fwe_cap,
+        )
+
 
 class TestRulerShellScheduling(unittest.TestCase):
     def test_full_rerun_replaces_worker_evidence_when_gpu_count_changes(self):

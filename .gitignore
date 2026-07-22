@@ -41,3 +41,4 @@ autoresearch/pareto-rotated
 .planning
 docs/figures
 .sisyphus/run-continuation
+.github/hooks/workmux-status
