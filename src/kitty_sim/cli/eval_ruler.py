@@ -40,6 +40,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Shell preflight fingerprint; the worker must recompute it before model loading.",
     )
+    parser.add_argument(
+        "--task-shard-index",
+        type=int,
+        default=None,
+        help="Internal worker shard index; use scripts/run_ruler.sh --gpus.",
+    )
+    parser.add_argument(
+        "--task-shard-count",
+        type=int,
+        default=None,
+        help="Internal worker shard count; use scripts/run_ruler.sh --gpus.",
+    )
     parser.add_argument("--shadowkv-budget", type=int, default=None)
     parser.add_argument("--shadowkv-rank", type=int, default=None)
     parser.add_argument("--shadowkv-chunk-size", type=int, default=None)

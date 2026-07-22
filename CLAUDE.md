@@ -1025,11 +1025,15 @@ Supported methods are `fp16`, `kitty`, `shadowkv`, `qlutattn`, `kivi`,
 reuses LongBench's canonical variant builder and method slugs; there is no
 second RULER-only method table.
 
-One worker owns one method arm and one visible physical GPU. `--gpu N` runs
-methods serially on one GPU. `--gpus G0,G1,...` dynamically dispatches methods
-over those GPU slots; it is method parallelism, not model parallelism. A failed
-method does not stop independent arms, but the aggregate command exits nonzero.
-GPU1 remains the default; listing other GPUs is an explicit hardware override.
+`--gpu N` runs methods serially with one worker on physical GPU N. For
+`--gpus G0,G1,...`, each method uses up to one worker per listed GPU and
+deterministically round-robins the selected RULER tasks across those workers;
+each worker runs every requested length for its task shard. Method arms run
+sequentially so the full GPU pool serves one method at a time. This is task
+parallelism with one model replica per worker, not model parallelism. A failed
+task worker does not stop sibling workers or later methods, but the aggregate
+command exits nonzero. GPU1 remains the default; listing other GPUs is an
+explicit hardware override.
 
 Smoke runs (`--max-samples N`, `N > 0`) use
 `ruler_out/smoke/<model>_<method>/{pred,logs}` and clear each selected arm.
@@ -1037,6 +1041,11 @@ Full runs use `ruler_out/<model>_<method>/{pred,logs}` and resume only
 manifest/hash-matching pairs. Each arm is scored automatically into
 `pred/result.json` and `pred/summary.csv`; NIAH depth heatmaps are written to
 `logs/`.
+Worker assignments and physical CUDA IDs are recorded in
+`logs/worker-<shard>-of-<count>-gpu<id>.report.json`.
+Before each arm launch, prior worker reports/run logs and legacy
+`logs/{report.json,run.log}` are removed so a changed GPU count cannot leave
+stale scheduling evidence; prediction manifests and scored results are untouched.
 
 `qlutattn` requires the model-specific offline `QLUT_CB_MASK`. Other method
 knobs are the same environment variables used by LongBench
@@ -1070,8 +1079,9 @@ bash scripts/run_ruler.sh \
   --tasks all --lengths 4096,8192,16384,32768 --max-model-len 32768 --gpu 1
 ```
 
-To fan method arms across GPUs after explicitly widening the GPU1-only
-constraint, replace `--gpu 1` with, for example, `--gpus 0,1,2`.
+To shard one method's tasks across GPUs after explicitly widening the GPU1-only
+constraint, replace `--gpu 1` with, for example, `--gpus 0,1,2`. With several
+variants, each variant gets the full GPU pool in sequence.
 
 ### Scoring and comparison figures
 

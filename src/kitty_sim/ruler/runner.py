@@ -133,6 +133,31 @@ def pair_name(task: str, seq_len: int) -> str:
     return f"{task}__{int(seq_len)}"
 
 
+def select_task_shard(
+    tasks: tuple[str, ...],
+    shard_index: int | None,
+    shard_count: int | None,
+) -> tuple[str, ...]:
+    """Select one deterministic round-robin task shard."""
+
+    if shard_index is None and shard_count is None:
+        return tasks
+    if shard_index is None or shard_count is None:
+        raise ValueError("--task-shard-index and --task-shard-count must be set together")
+    if shard_count <= 0:
+        raise ValueError("--task-shard-count must be positive")
+    if shard_index < 0 or shard_index >= shard_count:
+        raise ValueError(
+            f"--task-shard-index must be in [0, {shard_count}), got {shard_index}"
+        )
+    shard = tasks[shard_index::shard_count]
+    if not shard:
+        raise ValueError(
+            f"task shard {shard_index}/{shard_count} is empty for {len(tasks)} tasks"
+        )
+    return shard
+
+
 def _prompt_source_sha256() -> str:
     source = inspect.getsource(build_ruler_prompt).encode("utf-8")
     return hashlib.sha256(source).hexdigest()
@@ -878,7 +903,7 @@ def generate_ruler_pair(
 
 
 def run_ruler(args: Any) -> dict[str, Any]:
-    """Load one model and serially evaluate every requested RULER pair."""
+    """Load one model and serially evaluate this worker's RULER task shard."""
 
     required_cvd = getattr(args, "require_cuda_visible_devices", None)
     if required_cvd is not None and os.environ.get("CUDA_VISIBLE_DEVICES") != required_cvd:
@@ -901,7 +926,12 @@ def run_ruler(args: Any) -> dict[str, Any]:
     variant = _maybe_enable_quest_kernel(build_variant(args), args)
     model_family = _model_family(args)
     _reject_unsupported(variant, model_family)
-    tasks = tuple(preflight["tasks"])
+    requested_tasks = tuple(preflight["tasks"])
+    worker_tasks = select_task_shard(
+        requested_tasks,
+        getattr(args, "task_shard_index", None),
+        getattr(args, "task_shard_count", None),
+    )
     seq_lens = tuple(int(length) for length in preflight["seq_lens"])
     max_model_len = int(args.max_model_len)
     model_path = args.model_path or args.model
@@ -920,7 +950,10 @@ def run_ruler(args: Any) -> dict[str, Any]:
     print("Kitty NVIDIA RULER evaluation")
     print(f"model={args.model} path={model_path} family={model_family}")
     print(f"variant={variant.tag}")
-    print(f"tasks={list(tasks)} seq_lens={list(seq_lens)} max_samples={args.max_samples}")
+    print(
+        f"tasks={list(requested_tasks)} worker_tasks={list(worker_tasks)} "
+        f"seq_lens={list(seq_lens)} max_samples={args.max_samples}"
+    )
     print(f"max_model_len={max_model_len} max_new_tokens={args.max_new_tokens}")
     print(f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')}")
     print(f"output={pred_dir}")
@@ -955,7 +988,7 @@ def run_ruler(args: Any) -> dict[str, Any]:
 
     manifests: list[dict[str, Any]] = []
     try:
-        for task in tasks:
+        for task in worker_tasks:
             spec = get_task_spec(task)
             max_new_tokens = _effective_max_new_tokens(args, spec)
             for seq_len in seq_lens:
@@ -1003,7 +1036,12 @@ def run_ruler(args: Any) -> dict[str, Any]:
         "variant": asdict(variant),
         "variant_semantic_hash": preflight["variant_semantic_hash"],
         "preflight_hash": preflight["preflight_hash"],
-        "tasks": list(tasks),
+        "tasks": list(worker_tasks),
+        "requested_tasks": list(requested_tasks),
+        "task_shard": {
+            "index": getattr(args, "task_shard_index", None),
+            "count": getattr(args, "task_shard_count", None),
+        },
         "seq_lens": list(seq_lens),
         "pairs": preflight["pairs"],
         "manifests": manifests,

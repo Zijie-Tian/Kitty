@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Sole RULER evaluation runner for Kitty.
 #
-# One Python worker owns one method arm and one visible physical GPU.  A
-# --gpus list is therefore a pool of method slots, never model parallelism.
+# For each method, one Python worker per GPU owns a disjoint RULER task shard.
+# Methods run sequentially; every worker loads one model on one physical GPU.
 # Python preflight is the source of truth for canonical model/method slugs and
 # run hashes; this shell intentionally contains no variant-to-slug table.
 
@@ -68,8 +68,8 @@ usage() {
 Usage: bash scripts/run_ruler.sh [OPTIONS]
 
 The only supported Kitty RULER evaluation entry point. Every method is
-CPU-preflighted before any GPU worker starts. A worker loads one model on one
-physical GPU and runs all requested task/length pairs.
+CPU-preflighted before any GPU worker starts. With --gpus, workers load one
+model per GPU and automatically split the requested tasks between them.
 
 Model:
   --model ID                 Model alias/Hugging Face id (default Llama-3.2-1B)
@@ -100,17 +100,18 @@ Evaluation:
 GPU scheduling:
   --gpu N                    Run every method serially on physical GPU N
                              (default: physical GPU 1)
-  --gpus CSV                 Dynamically dispatch methods across GPU slots.
-                             This is method parallelism, not a multi-GPU model.
-  --gpu and --gpus are mutually exclusive. A failed method does not stop the
-  remaining methods; the runner exits nonzero after all scheduled work ends.
+  --gpus CSV                 For each method, shard tasks across GPU slots.
+                             Methods run sequentially; each GPU loads one model
+                             and runs all lengths for its assigned tasks.
+  --gpu and --gpus are mutually exclusive. A failed task worker does not stop
+  sibling workers or later methods; the aggregate command exits nonzero.
 
 Output:
   full:  <out-root>/<model>_<method>/{pred,logs}
   smoke: <out-root>/smoke/<model>_<method>/{pred,logs}
-  Smoke clears its complete arm immediately before launch. Full runs resume
+  Smoke clears an arm once before any task worker starts. Full runs resume
   only pairs whose manifests match the CPU-preflight hashes. Every arm is
-  scored automatically and has independent preflight/run/score logs.
+  scored once after all task workers finish and keeps per-worker run reports.
 
 Environment (explicit CLI > process environment > repo .env):
   PYTHON_BIN, MODEL, MODEL_PATH, MODEL_TAG, MODEL_FAMILY
@@ -126,7 +127,7 @@ Examples:
     --tasks all --lengths 4096 --max-samples 2
 
   bash scripts/run_ruler.sh --gpus 0,1,2 \
-    --variants fp16,kitty,kivi,qlutattn --tasks all --max-samples 2
+    --variants qlutattn --tasks all --max-samples 2
 
   bash scripts/run_ruler.sh --model /models/MiniCPM5-1B \
     --model-path /models/MiniCPM5-1B --model-tag minicpm5-1b \
@@ -307,6 +308,7 @@ declare -a PREFLIGHT_LOGS=()
 declare -a METHOD_SLUGS=()
 declare -a MODEL_SLUGS=()
 declare -a PREFLIGHT_HASHES=()
+declare -a TASK_COUNTS=()
 declare -a VALID_INDICES=()
 
 append_variant_args() {
@@ -371,7 +373,7 @@ preflight_variant() {
 import json, sys
 with open(sys.argv[1], encoding="utf-8") as handle:
     payload = json.load(handle)
-values = [payload["method_slug"], payload["model_slug"], payload["preflight_hash"], payload["canonical_variant"]]
+values = [payload["method_slug"], payload["model_slug"], payload["preflight_hash"], payload["canonical_variant"], len(payload["tasks"])]
 if not payload.get("pairs"):
     raise SystemExit("preflight returned no task/length pairs")
 print("\t".join(str(value) for value in values))
@@ -383,17 +385,19 @@ print("\t".join(str(value) for value in values))
     return 1
   fi
 
-  local method_slug model_slug preflight_hash canonical_variant
-  IFS=$'\t' read -r method_slug model_slug preflight_hash canonical_variant <<< "${metadata}"
+  local method_slug model_slug preflight_hash canonical_variant task_count
+  IFS=$'\t' read -r method_slug model_slug preflight_hash canonical_variant task_count <<< "${metadata}"
   [[ "${method_slug}" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]] || die "unsafe method slug from preflight: '${method_slug}'"
   [[ "${model_slug}" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]] || die "unsafe model slug from preflight: '${model_slug}'"
   [[ -n "${preflight_hash}" && -n "${canonical_variant}" ]] || die "preflight omitted canonical variant/hash for '${variant}'"
+  [[ "${task_count}" =~ ^[0-9]+$ && "${task_count}" -gt 0 ]] || die "preflight returned invalid task count '${task_count}'"
 
   PREFLIGHT_FILES[index]="${json_file}"
   PREFLIGHT_LOGS[index]="${log_file}"
   METHOD_SLUGS[index]="${method_slug}"
   MODEL_SLUGS[index]="${model_slug}"
   PREFLIGHT_HASHES[index]="${preflight_hash}"
+  TASK_COUNTS[index]="${task_count}"
   echo "[run-ruler] preflight ok: variant=${variant} canonical=${canonical_variant} arm=${model_slug}_${method_slug}"
 }
 
@@ -415,34 +419,21 @@ for index in "${!VARIANT_ARR[@]}"; do
   VALID_INDICES+=("${index}")
 done
 
-run_arm() {
-  local index="$1" gpu="$2"
+run_task_worker() {
+  local index="$1" slot="$2" shard_count="$3" gpu="$4" pred_dir="$5" logs_dir="$6"
   local variant="${VARIANT_ARR[index]}"
-  local method_slug="${METHOD_SLUGS[index]}"
-  local model_slug="${MODEL_SLUGS[index]}"
   local preflight_hash="${PREFLIGHT_HASHES[index]}"
-  local arm_dir="${LAYOUT_ROOT}/${model_slug}_${method_slug}"
-  local pred_dir="${arm_dir}/pred"
-  local logs_dir="${arm_dir}/logs"
-
-  [[ "${arm_dir}" == "${LAYOUT_ROOT}/"* && "${arm_dir}" != "${LAYOUT_ROOT}/" ]] \
-    || die "refusing unsafe arm path: ${arm_dir}"
-  if [[ "${SMOKE}" == "1" && -d "${arm_dir}" ]]; then
-    echo "[run-ruler] smoke clean slate: ${arm_dir}"
-    rm -rf -- "${arm_dir}"
-  fi
-  mkdir -p "${pred_dir}" "${logs_dir}"
-  cp -- "${PREFLIGHT_FILES[index]}" "${logs_dir}/preflight.json"
-  cp -- "${PREFLIGHT_LOGS[index]}" "${logs_dir}/preflight.log"
-
+  local worker_name="worker-${slot}-of-${shard_count}-gpu${gpu}"
   local -a args=()
   build_common_args "${variant}" args
   local -a eval_cmd=(
     "${PYTHON_BIN}" -m kitty_sim.cli.eval_ruler
     "${args[@]}"
     --output-dir "${pred_dir}"
+    --task-shard-index "${slot}"
+    --task-shard-count "${shard_count}"
     --require-cuda-visible-devices "${gpu}"
-    --report-json "${logs_dir}/report.json"
+    --report-json "${logs_dir}/${worker_name}.report.json"
     --expected-preflight-hash "${preflight_hash}"
   )
   if [[ "${FORCE}" == "1" ]]; then
@@ -458,19 +449,75 @@ run_arm() {
     "PYTHONPATH=${REPO_ROOT}/src:${PYTHONPATH:-}"
   )
 
-  echo "[run-ruler] launch GPU${gpu}: variant=${variant} arm=${arm_dir}"
+  echo "[run-ruler] launch GPU${gpu}: variant=${variant} shard=${slot}/${shard_count}"
   local -a pipe_status=()
-  local eval_rc=0 score_rc=0 status
+  local status
   set +e
   "${env_cmd[@]}" "${eval_cmd[@]}" 2>&1 \
-    | tee "${logs_dir}/run.log" \
-    | sed -u "s/^/[gpu${gpu} ${variant}] /"
+    | tee "${logs_dir}/${worker_name}.run.log" \
+    | sed -u "s/^/[gpu${gpu} shard${slot} ${variant}] /"
   pipe_status=("${PIPESTATUS[@]}")
   set -e
   for status in "${pipe_status[@]}"; do
     if [[ "${status}" -ne 0 ]]; then
-      eval_rc="${status}"
-      break
+      echo "[run-ruler] FAILED GPU${gpu}: variant=${variant} shard=${slot}/${shard_count} rc=${status}" >&2
+      return "${status}"
+    fi
+  done
+  echo "[run-ruler] done GPU${gpu}: variant=${variant} shard=${slot}/${shard_count}"
+}
+
+run_arm() {
+  local index="$1"
+  local variant="${VARIANT_ARR[index]}"
+  local method_slug="${METHOD_SLUGS[index]}"
+  local model_slug="${MODEL_SLUGS[index]}"
+  local task_count="${TASK_COUNTS[index]}"
+  local arm_dir="${LAYOUT_ROOT}/${model_slug}_${method_slug}"
+  local pred_dir="${arm_dir}/pred"
+  local logs_dir="${arm_dir}/logs"
+  local worker_count="${#GPU_ARR[@]}"
+  if (( worker_count > task_count )); then
+    worker_count="${task_count}"
+  fi
+
+  [[ "${arm_dir}" == "${LAYOUT_ROOT}/"* && "${arm_dir}" != "${LAYOUT_ROOT}/" ]] \
+    || die "refusing unsafe arm path: ${arm_dir}"
+  if [[ "${SMOKE}" == "1" && -d "${arm_dir}" ]]; then
+    echo "[run-ruler] smoke clean slate: ${arm_dir}"
+    rm -rf -- "${arm_dir}"
+  fi
+  mkdir -p "${pred_dir}" "${logs_dir}"
+  rm -f -- \
+    "${logs_dir}"/worker-*-of-*-gpu*.report.json \
+    "${logs_dir}"/worker-*-of-*-gpu*.run.log \
+    "${logs_dir}/report.json" \
+    "${logs_dir}/run.log"
+  cp -- "${PREFLIGHT_FILES[index]}" "${logs_dir}/preflight.json"
+  cp -- "${PREFLIGHT_LOGS[index]}" "${logs_dir}/preflight.log"
+
+  echo "[run-ruler] task parallelism: variant=${variant} tasks=${task_count} workers=${worker_count}"
+  local -a worker_pids=()
+  local -A pid_description=()
+  local slot gpu pid status worker_rc=0
+  for ((slot = 0; slot < worker_count; slot++)); do
+    gpu="${GPU_ARR[slot]}"
+    run_task_worker "${index}" "${slot}" "${worker_count}" "${gpu}" "${pred_dir}" "${logs_dir}" &
+    pid=$!
+    ACTIVE_PIDS["${pid}"]=1
+    worker_pids+=("${pid}")
+    pid_description["${pid}"]="GPU${gpu} shard=${slot}/${worker_count}"
+  done
+
+  for pid in "${worker_pids[@]}"; do
+    set +e
+    wait "${pid}"
+    status=$?
+    set -e
+    unset 'ACTIVE_PIDS['"${pid}"']'
+    if [[ "${status}" -ne 0 ]]; then
+      echo "[run-ruler] task worker failed: variant=${variant} ${pid_description[${pid}]} rc=${status}" >&2
+      worker_rc=1
     fi
   done
 
@@ -483,6 +530,8 @@ run_arm() {
     --heatmap-dir "${logs_dir}"
     --title "${model_slug} ${method_slug}"
   )
+  local -a pipe_status=()
+  local score_rc=0
   set +e
   "${score_cmd[@]}" 2>&1 \
     | tee "${logs_dir}/score.log" \
@@ -496,63 +545,18 @@ run_arm() {
     fi
   done
 
-  if [[ "${eval_rc}" -ne 0 || "${score_rc}" -ne 0 ]]; then
-    echo "[run-ruler] FAILED GPU${gpu}: variant=${variant} eval_rc=${eval_rc} score_rc=${score_rc}" >&2
+  if [[ "${worker_rc}" -ne 0 || "${score_rc}" -ne 0 ]]; then
+    echo "[run-ruler] FAILED variant=${variant}: worker_rc=${worker_rc} score_rc=${score_rc}" >&2
     return 1
   fi
-  echo "[run-ruler] done GPU${gpu}: variant=${variant}"
+  echo "[run-ruler] done variant=${variant}"
 }
 
-dispatch_arms() {
-  local next=0 running=0 dispatch_rc=0
-  local -a free_gpus=("${GPU_ARR[@]}")
-  local -A pid_gpu=()
-  local -A pid_variant=()
-  local index gpu pid finished_pid job_rc
-
-  while (( next < ${#VALID_INDICES[@]} || running > 0 )); do
-    while (( next < ${#VALID_INDICES[@]} && ${#free_gpus[@]} > 0 )); do
-      index="${VALID_INDICES[next]}"
-      gpu="${free_gpus[0]}"
-      free_gpus=("${free_gpus[@]:1}")
-      run_arm "${index}" "${gpu}" &
-      pid=$!
-      ACTIVE_PIDS["${pid}"]=1
-      pid_gpu["${pid}"]="${gpu}"
-      pid_variant["${pid}"]="${VARIANT_ARR[index]}"
-      next=$((next + 1))
-      running=$((running + 1))
-    done
-
-    (( running > 0 )) || continue
-    finished_pid=""
-    set +e
-    wait -n -p finished_pid
-    job_rc=$?
-    set -e
-    [[ -n "${finished_pid}" && -n "${pid_gpu[${finished_pid}]:-}" ]] \
-      || die "unable to identify a completed RULER worker"
-    gpu="${pid_gpu[${finished_pid}]}"
-    free_gpus+=("${gpu}")
-    if [[ "${job_rc}" -ne 0 ]]; then
-      echo "[run-ruler] method worker failed: variant=${pid_variant[${finished_pid}]} gpu=${gpu}" >&2
-      dispatch_rc=1
-    fi
-    unset 'ACTIVE_PIDS['"${finished_pid}"']'
-    unset 'pid_gpu['"${finished_pid}"']'
-    unset 'pid_variant['"${finished_pid}"']'
-    running=$((running - 1))
-  done
-  return "${dispatch_rc}"
-}
-
-if (( ${#VALID_INDICES[@]} > 0 )); then
-  DISPATCH_RC=0
-  dispatch_arms || DISPATCH_RC=$?
-  if [[ "${DISPATCH_RC}" -ne 0 ]]; then
+for index in "${VALID_INDICES[@]}"; do
+  if ! run_arm "${index}"; then
     OVERALL_RC=1
   fi
-fi
+done
 
 if [[ "${OVERALL_RC}" -eq 0 ]]; then
   echo "[run-ruler] all requested variants completed successfully"

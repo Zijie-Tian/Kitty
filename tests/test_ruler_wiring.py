@@ -5,7 +5,11 @@ from __future__ import annotations
 import importlib.util
 import hashlib
 import json
+import os
+import subprocess
+import sys
 import tempfile
+import textwrap
 import unittest
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -28,6 +32,7 @@ from kitty_sim.ruler.runner import (
     pair_name,
     resolve_ruler_preflight,
     ruler_run_config_hash,
+    select_task_shard,
     tokenizer_config_hashes,
     tokenizer_identity_sha256,
 )
@@ -325,6 +330,33 @@ class TestRulerRegistry(unittest.TestCase):
     def test_pair_name_is_unambiguous(self):
         self.assertEqual(pair_name("niah_multiquery", 32768), "niah_multiquery__32768")
 
+    def test_task_shards_are_disjoint_complete_and_stable(self):
+        tasks = _EXPECTED_TASKS[:8]
+        shards = tuple(select_task_shard(tasks, index, 3) for index in range(3))
+
+        self.assertEqual(shards[0], tasks[0::3])
+        self.assertEqual(shards[1], tasks[1::3])
+        self.assertEqual(shards[2], tasks[2::3])
+        flattened = tuple(task for shard in shards for task in shard)
+        self.assertCountEqual(flattened, tasks)
+        self.assertEqual(len(flattened), len(set(flattened)))
+        self.assertEqual(select_task_shard(tasks, None, None), tasks)
+
+    def test_invalid_or_empty_task_shards_are_rejected(self):
+        tasks = _EXPECTED_TASKS[:2]
+        invalid = (
+            (0, None, "set together"),
+            (None, 2, "set together"),
+            (0, 0, "must be positive"),
+            (-1, 2, "must be in"),
+            (2, 2, "must be in"),
+            (2, 3, "is empty"),
+        )
+        for shard_index, shard_count, message in invalid:
+            with self.subTest(shard_index=shard_index, shard_count=shard_count):
+                with self.assertRaisesRegex(ValueError, message):
+                    select_task_shard(tasks, shard_index, shard_count)
+
     def test_data_prep_imports_registry_and_uses_its_generation_cap(self):
         script_path = Path(__file__).parents[1] / "scripts" / "prepare_ruler_data.py"
         module_spec = importlib.util.spec_from_file_location(
@@ -366,6 +398,129 @@ class TestRulerRegistry(unittest.TestCase):
             prep.PrepError, rf"canonical registry cap {canonical_cap}"
         ):
             prep._task_max_new_tokens("vt", mismatched_backend)
+
+
+class TestRulerShellScheduling(unittest.TestCase):
+    def test_full_rerun_replaces_worker_evidence_when_gpu_count_changes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake_python = root / "fake-python"
+            fake_python.write_text(
+                textwrap.dedent(
+                    f"""\
+                    #!{sys.executable}
+                    import json
+                    import os
+                    import sys
+                    from pathlib import Path
+
+                    args = sys.argv[1:]
+                    if args and args[0] == "-c":
+                        os.execv(sys.executable, [sys.executable, *args])
+
+                    def value(flag):
+                        return args[args.index(flag) + 1]
+
+                    module = args[1] if len(args) > 1 and args[0] == "-m" else None
+                    if module == "kitty_sim.cli.preflight_ruler":
+                        print(json.dumps({{
+                            "method_slug": "fp16",
+                            "model_slug": "fixture",
+                            "preflight_hash": "preflight-hash",
+                            "canonical_variant": "fp16",
+                            "tasks": ["niah_single_1", "vt", "qa_1"],
+                            "pairs": {{"niah_single_1__4096": {{}}}},
+                        }}))
+                    elif module == "kitty_sim.cli.eval_ruler":
+                        report_path = Path(value("--report-json"))
+                        report_path.write_text(json.dumps({{
+                            "status": "ok",
+                            "cuda_visible_devices": os.environ["CUDA_VISIBLE_DEVICES"],
+                            "task_shard": {{
+                                "index": int(value("--task-shard-index")),
+                                "count": int(value("--task-shard-count")),
+                            }},
+                        }}), encoding="utf-8")
+                        print("fake worker ok")
+                    elif module == "kitty_sim.cli.score_ruler":
+                        print("fake scorer ok")
+                    else:
+                        raise SystemExit(f"unexpected fake-python invocation: {{args}}")
+                    """
+                ),
+                encoding="utf-8",
+            )
+            fake_python.chmod(0o755)
+
+            out_root = root / "out"
+            command = [
+                "bash",
+                str(Path(__file__).parents[1] / "scripts" / "run_ruler.sh"),
+                "--model",
+                "fixture",
+                "--model-path",
+                str(root / "model"),
+                "--model-tag",
+                "fixture",
+                "--model-family",
+                "llama3.2",
+                "--variants",
+                "fp16",
+                "--tasks",
+                "niah_single_1,vt,qa_1",
+                "--lengths",
+                "4096",
+                "--data-root",
+                str(root / "data"),
+                "--out-root",
+                str(out_root),
+                "--max-samples",
+                "-1",
+                "--max-model-len",
+                "4096",
+            ]
+            env = os.environ.copy()
+            env["PYTHON_BIN"] = str(fake_python)
+
+            subprocess.run(
+                [*command, "--gpus", "0,1,2"],
+                check=True,
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=30,
+            )
+            logs_dir = out_root / "fixture_fp16" / "logs"
+            (logs_dir / "report.json").write_text("legacy", encoding="utf-8")
+            (logs_dir / "run.log").write_text("legacy", encoding="utf-8")
+            (logs_dir / "keep.txt").write_text("keep", encoding="utf-8")
+
+            subprocess.run(
+                [*command, "--gpus", "0,1"],
+                check=True,
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=30,
+            )
+
+            self.assertEqual(
+                {path.name for path in logs_dir.glob("worker-*.report.json")},
+                {
+                    "worker-0-of-2-gpu0.report.json",
+                    "worker-1-of-2-gpu1.report.json",
+                },
+            )
+            self.assertEqual(
+                {path.name for path in logs_dir.glob("worker-*.run.log")},
+                {
+                    "worker-0-of-2-gpu0.run.log",
+                    "worker-1-of-2-gpu1.run.log",
+                },
+            )
+            self.assertFalse((logs_dir / "report.json").exists())
+            self.assertFalse((logs_dir / "run.log").exists())
+            self.assertEqual((logs_dir / "keep.txt").read_text(encoding="utf-8"), "keep")
 
 
 class TestRulerData(unittest.TestCase):
