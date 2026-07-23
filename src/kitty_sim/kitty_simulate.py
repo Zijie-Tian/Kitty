@@ -360,6 +360,13 @@ class KittyKVCache(DynamicCache):
         self.v_pc_rms: dict[int, torch.Tensor] = {}
         self.v_error_bias: dict[int, torch.Tensor] = {}
         # Engagement counters (read-only observability for LongBench guards).
+        # Counts are layer-update/layer-token totals, not distinct sequence tokens.
+        # They provide benchmark-side proof that a labeled quantized path executed.
+        self.prefill_updates = 0
+        self.decode_updates = 0
+        self.k_quant_calls = 0
+        self.k_quantized_tokens = 0
+        self.last_k_quant_mode: Optional[str] = None
         self.v_quant_calls = 0
         self.v_quantized_tokens = 0
         self.v_tile_blocks = 0
@@ -423,6 +430,9 @@ class KittyKVCache(DynamicCache):
         (symnf2-v1 LUT, per-token masked absmax scale, no second mean). The
         assignment is fixed by offline sigma^2 calibration, never recomputed
         per prompt. 'kivi' uses uniform min-max; 'q4_0' llama.cpp semantics."""
+        self.k_quant_calls += 1
+        self.k_quantized_tokens += int(ks.shape[-2])
+        self.last_k_quant_mode = f"{self.k_quant_mode}:{self.k_codebook}"
         if self.k_codebook == "q4_0":
             # llama.cpp Q4_0 row semantics: symmetric absmax (d=max/-8) per
             # 32-channel block along head_dim. No submean, no promote, no bins.
@@ -462,6 +472,9 @@ class KittyKVCache(DynamicCache):
         """Quantize a [B,nh,D,buffer] post-RoPE K buffer with the KIVI-style
         min-max groupwise + promote path (per-channel K variants only; the
         canonical qlutattn K path is per-token and never reaches here)."""
+        self.k_quant_calls += 1
+        self.k_quantized_tokens += int(key_slice_t.shape[-1])
+        self.last_k_quant_mode = f"{self.k_quant_mode}:{self.k_codebook}"
         promote_mask = build_promote_mask(key_slice_t, self._layer_pr(layer_idx), self.channel_selection)
         return fake_quant_groupwise_lastdim(
             key_slice_t, self.group_size, self.kbits, promote_mask, self.promote_bit)
@@ -579,13 +592,16 @@ class KittyKVCache(DynamicCache):
 
     def _quant_v(self, layer_idx, value_slice):
         """Quantize a [B,nh,T,D] V slice. Dispatcher for per-token codebooks."""
-        if self.v_codebook == "q4_0":
-            return fake_quant_q4_0_lastdim(value_slice)
         if self.v_codebook == "tile16_rescued":
             raise RuntimeError(
                 "_quant_v must not be called for tile16_rescued; use "
                 "_flush_v_tile_blocks for the strict 16-token schedule"
             )
+        self.v_quant_calls += 1
+        self.v_quantized_tokens += int(value_slice.shape[-2])
+        if self.v_codebook == "q4_0":
+            self.last_v_quant_mode = self.v_codebook
+            return fake_quant_q4_0_lastdim(value_slice)
         return self._quant_v_pertoken(value_slice)
 
     def get_seq_length(self, layer_idx: int = 0) -> int:
@@ -705,6 +721,11 @@ class KittyKVCache(DynamicCache):
         self.v_error_bias.clear()
         self.k_pt_quant_end.clear()
         self.k_pc_mean.clear()
+        self.prefill_updates = 0
+        self.decode_updates = 0
+        self.k_quant_calls = 0
+        self.k_quantized_tokens = 0
+        self.last_k_quant_mode = None
         self.v_quant_calls = 0
         self.v_quantized_tokens = 0
         self.v_tile_blocks = 0
@@ -726,6 +747,7 @@ class KittyKVCache(DynamicCache):
             raise ValueError("QuantizedCache does not support model usage where layers are skipped. Use DynamicCache.")
         ################################################## Prefill Phase ##################################################
         elif len(self.key_cache) == layer_idx:
+            self.prefill_updates += 1
             # Initialize the key and value caches for the layer
             self.key_cache.append(key_states.detach().clone())
             self.value_cache.append(value_states.detach().clone())
@@ -785,6 +807,7 @@ class KittyKVCache(DynamicCache):
                     current_value_cache[:, :, start_idx:end_idx, :] = value_slice
         ################################################## Decoding Phase ##################################################
         else:
+            self.decode_updates += 1
             # update the key and value caches
             self.key_cache[layer_idx] = torch.cat([self.key_cache[layer_idx], key_states], dim=-2)
             self.value_cache[layer_idx] = torch.cat([self.value_cache[layer_idx], value_states], dim=-2)

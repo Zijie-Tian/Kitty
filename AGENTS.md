@@ -957,6 +957,160 @@ python3 aggregate.py pb2_pr6875_8b   # full-LB avg per config
 `GPUS`); prefer >=40GB cards for headroom / 2-per-card. `head_dim=128` so pr0.6875 =
 88/128 channels @2-bit.
 
+## Cache-aware WikiText-2 perplexity evaluation
+
+Kitty has one canonical per-model PPL path: `scripts/run_ppl.sh`.
+`scripts/run_ppl_models.sh` is the multi-model orchestrator and delegates every
+model to that canonical runner; it does not implement a second PPL or variant
+path. Do not use the ordinary `lm_eval --tasks wikitext` path to compare
+KV-cache methods: its batched teacher-forced full-window forwards do not force
+Kitty/ShadowKV/QUEST through their one-token decode paths. This benchmark is
+intentionally a **cache-streaming suffix token-PPL protocol**, not lm-eval's
+whole-corpus word/byte PPL.
+
+### Protocol
+
+- Corpus: local `EleutherAI/wikitext_document_level`,
+  `wikitext-2-raw-v1` test parquet, field `page`; no runtime download.
+- Document-local non-overlapping windows; no cache crosses a window/document
+  boundary. Tokenization uses `add_special_tokens=False` and the pinned lm-eval
+  WikiText detokenizer.
+- Default window: 4096-token dense prefill + one bridge token + 256 scored
+  targets (`4353` input tokens). The prefill loss is never scored.
+- Every scored target is produced by a real `q_len=1` model call. The worker
+  always hands `outputs.past_key_values` to the next call, including mutable
+  custom Cache objects, and requires cache length to grow by exactly one.
+- Aggregate only after summing: `token_ppl = exp(sum(nll_sum) /
+  sum(scored_tokens))`. Never average per-window PPL.
+- FP16 and every quantized method must share one `comparison_config_hash`
+  (model/tokenizer/corpus/window/target policy); each method has its own
+  `run_config_hash` for variant and mask semantics.
+- Quantized manifests must prove K/V and decode engagement. QLUTATTN additionally
+  requires prompt-mean calibration plus rescued tile16c64 V engagement;
+  ShadowKV/QUEST require their prefill/decode hook counters.
+
+The default method list is `fp16,kitty,shadowkv,qlutattn,kivi,kivi_star,`
+`llamacpp_q40,llamacpp_q40_star,custom`. Variant construction, method slugs,
+QLUT mask validation, model loading, and cache factories are imported from the
+LongBench canonical implementation; PPL does not maintain a second method table.
+GLM legacy tuple-cache models currently fail fast because this protocol requires
+the HF Cache handoff contract.
+
+### Data and commands
+
+Download the document-level test parquet once and store its host path in the
+ignored `.env` as `PPL_DATA_PATH` (or `KITTY_WIKITEXT2_TEST_PATH`). The tracked
+`.env.example` remains path-generic. Expected upstream SHA-256:
+`e7fc7d4c385d027e0360f7eb320866df61adb68f385986e5c7f4f3911d62f4eb`.
+
+Pinned dataset revision `647234772b9554e208af6c826f23b99e3cac88c8`:
+
+```bash
+PPL_DATA_PATH=/path/to/wikitext-2-raw-v1-test.parquet
+mkdir -p "$(dirname "${PPL_DATA_PATH}")"
+curl -L --fail --show-error \
+  -o "${PPL_DATA_PATH}" \
+  "https://huggingface.co/datasets/EleutherAI/wikitext_document_level/resolve/647234772b9554e208af6c826f23b99e3cac88c8/wikitext-2-raw-v1/wikitext-2-raw-v1-test.parquet"
+printf '%s  %s\n' \
+  "e7fc7d4c385d027e0360f7eb320866df61adb68f385986e5c7f4f3911d62f4eb" \
+  "${PPL_DATA_PATH}" | sha256sum --check
+```
+
+```bash
+# smoke: two windows, FP16 + canonical QLUTATTN, physical GPU1
+cd "$(git rev-parse --show-toplevel)"
+PPL_DATA_PATH=/path/to/wikitext-2-raw-v1-test.parquet \
+QLUT_CB_MASK=/path/to/Llama-3.2-1B-Instruct.qlutattn_mask.pt \
+LLAMA32_MODEL_PATH=/path/to/Llama-3.2-1B-Instruct \
+bash scripts/run_ppl.sh --gpu 1 --variants fp16,qlutattn --max-samples 2
+```
+
+```bash
+# full selected-window evaluation, all canonical methods, serial on GPU1
+cd "$(git rev-parse --show-toplevel)"
+PPL_DATA_PATH=/path/to/wikitext-2-raw-v1-test.parquet \
+QLUT_CB_MASK=/path/to/Llama-3.2-1B-Instruct.qlutattn_mask.pt \
+LLAMA32_MODEL_PATH=/path/to/Llama-3.2-1B-Instruct \
+bash scripts/run_ppl.sh --gpu 1
+```
+
+```bash
+# three-model smoke: models run concurrently; each gets two physical GPUs
+cd "$(git rev-parse --show-toplevel)"
+PPL_DATA_PATH=/path/to/wikitext-2-raw-v1-test.parquet \
+KITTY_LLAMA32_1B_PATH=/path/to/Llama-3.2-1B-Instruct \
+KITTY_LLAMA32_3B_PATH=/path/to/Llama-3.2-3B-Instruct \
+KITTY_MINICPM5_1B_PATH=/path/to/MiniCPM5-1B \
+KITTY_LLAMA32_1B_QLUTATTN_MASK=/path/to/Llama-3.2-1B-Instruct.qlutattn_mask.pt \
+KITTY_LLAMA32_3B_QLUTATTN_MASK=/path/to/Llama-3.2-3B-Instruct.qlutattn_mask.pt \
+KITTY_MINICPM5_1B_QLUTATTN_MASK=/path/to/MiniCPM5-1B.qlutattn_mask.pt \
+bash scripts/run_ppl_models.sh \
+  --models llama32-1b,llama32-3b,minicpm5-1b \
+  --variants fp16,shadowkv,kivi,qlutattn \
+  --gpus 0,1,2,3,4,5 --max-samples 2
+```
+
+`--gpus 0,1,2,...` runs distinct method arms concurrently, one model replica per
+listed physical GPU, and queues later methods onto the next free GPU. Listing
+anything except GPU1 is an explicit override of the GPU1-only rule.
+
+The multi-model runner requires an explicit unique `--gpus` list and partitions
+it round-robin into disjoint groups. With the command above, the groups are
+`0,3`, `1,4`, and `2,5`; all three models run concurrently, while each model's
+method arms are scheduled by `run_ppl.sh` within its group.
+
+Output layout:
+
+- full: `ppl_out/<model>_<method>/{pred,logs}`
+- smoke: `ppl_out/smoke/<model>_<method>/{pred,logs}`
+- each `pred/`: `wikitext2.jsonl`, `wikitext2.manifest.json`, `result.json`
+- cross-method: `<layout-root>/<model>_ppl_comparison.{json,csv}`
+
+Full runs resume only a hash-matching partial manifest; checksum or row/window
+mismatches fail instead of reusing stale output. Smoke runs clear each selected
+arm.
+
+Implementation map:
+
+- `src/kitty_sim/ppl/data.py`: strict local parquet loading, detokenization,
+  token windows, selected-token hash.
+- `src/kitty_sim/ppl/runner.py`: CPU preflight, cache-streaming scorer,
+  engagement checks, atomic manifests/resume.
+- `src/kitty_sim/ppl/scorer.py`: strict validation, NLL aggregation, FP16 deltas.
+- `src/kitty_sim/cli/{eval_ppl,preflight_ppl,score_ppl}.py`: public CLIs.
+
+CPU contract/regression check:
+
+```bash
+PYTHONPATH=src python -m unittest tests.test_ppl -v
+bash -n scripts/run_ppl.sh scripts/run_ppl_models.sh
+```
+
+Verified 2026-07-23 on six physical RTX 3090 GPUs: three models × four methods,
+two windows / 512 scored tokens per arm. All 12 arm results and all three
+comparison artifacts had `status=ok`; cache/ShadowKV/QLUTATTN engagement checks
+passed.
+
+|Model|FP16 PPL|ShadowKV PPL (ratio)|KIVI K2V2 PPL (ratio)|QLUTATTN PPL (ratio)|
+|---|---:|---:|---:|---:|
+|Llama-3.2-1B-Instruct|14.2074|14.2301 (1.0016x)|20.9360 (1.4736x)|16.1119 (1.1341x)|
+|Llama-3.2-3B-Instruct|10.4655|10.5334 (1.0065x)|13.0529 (1.2472x)|11.5900 (1.1075x)|
+|MiniCPM5-1B|22.3540|22.1622 (0.9914x)|30.3814 (1.3591x)|25.4151 (1.1369x)|
+
+Smoke-run provenance digests:
+
+|Model|Model config|Tokenizer identity|Comparison config|QLUTATTN mask|
+|---|---|---|---|---|
+|Llama-3.2-1B-Instruct|`2febf68cea25bf4611be02b7536f2488a5ba523bb1134986e3610152abe74fdb`|`05314ed975ff07fd4d76d844f1d4f1409993c9ec735f5d1b6d0fd50e13b13e4b`|`b12298878ddfb6d4c767c951b1383d1ddc8aadb48c4cff6ade0ec552a3a2d37b`|`d8a435497743cb484627f515b7cb279af2a14187b1890e221c407d6abacde49a`|
+|Llama-3.2-3B-Instruct|`39fb36dc5416f445ebc4e71cb71fbcf6727e80a35836d8ba1a1474c318467b7a`|`05314ed975ff07fd4d76d844f1d4f1409993c9ec735f5d1b6d0fd50e13b13e4b`|`0a7a7c0c1d52a7ba75ee07c1c46bf2ed553d11707bf7a15e53f595a3cf971d26`|`52558bc50924890bcce09e25890e51a15cd6d1f432c43d00c929d2016d19333f`|
+|MiniCPM5-1B|`6a6509b646cb3169616c5ffc3196e7ccaf9d4d6bc17b266581d241a31c217714`|`55f1c23a77ee2b2ae486af30e9691cdc7b9e7e415a8e70a46e5a2be7aa52165f`|`3683018c45d060769fd194aa8ce7d702a6fc04e7b467c63a32fbb9400f254007`|`9819d379c56ac34700f38db8237d4110c84c402dd6c9b5cde09baa9e3c3d42f9`|
+
+Per-arm `run_config_hash` values remain in each comparison JSON named above.
+
+These are smoke/correctness results, not full-corpus headline scores. In
+particular, the small MiniCPM ShadowKV improvement is within a two-window sample
+and must not be interpreted as a quality gain.
+
 ## NVIDIA RULER evaluation
 
 Kitty has one canonical RULER path covering the complete 13-task NVIDIA
