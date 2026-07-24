@@ -330,12 +330,18 @@ class KittyKVCache(DynamicCache):
         # for the per-channel-center + per-token codebook path. Free for
         # attention (q.mu is a per-query constant that cancels in softmax).
         self.k_pc_mean: dict[int, torch.Tensor] = {}
-        # qlutattn: OFFLINE per-(layer,head,channel) codebook mask (sign/nf2),
-        # loaded once and used unchanged -- NOT recomputed per prompt.
-        # k_cb_mask[layer]=[nh,D].
+        # qlutattn: OFFLINE per-(layer,head,channel) codebook metadata, loaded
+        # once and used unchanged -- never recomputed per prompt. Canonical
+        # artifacts use k_cb_mask directly. Top-p and fixed-top-k control
+        # artifacts additionally carry head-local [NF2 prefix | sign suffix]
+        # permutations and counts.
         self.pertoken_cb_mask_path = getattr(cache_config, "pertoken_cb_mask", None)
         self.pertoken_offline = bool(self.pertoken_cb_mask_path)
         self.k_cb_mask: dict[int, torch.Tensor] = {}
+        self.qlut_selection_method: Optional[str] = None
+        self.k_reorder_index: dict[int, torch.Tensor] = {}
+        self.k_inverse_reorder_index: dict[int, torch.Tensor] = {}
+        self.k_nf2_count_per_head: dict[int, torch.Tensor] = {}
         if self.pertoken_offline:
             _blob = torch.load(self.pertoken_cb_mask_path, map_location="cpu", weights_only=False)
             _m = _blob["codebook_mask"]                        # [nl, n_kv, D] uint8 (0=sign,1=nf2)
@@ -344,8 +350,26 @@ class KittyKVCache(DynamicCache):
             _cbs = _blob.get("codebooks")
             if _cbs:                                           # mask file carries its codebook names
                 self.bin_codebooks = list(_cbs)
+            self.qlut_selection_method = _blob.get("selection_method")
+            if self.qlut_selection_method in (
+                "layer_channel_top_p",
+                "layer_uniform_fixed_top_k_control",
+            ):
+                _reorder = _blob["reorder_index"]
+                _inverse = _blob["inverse_reorder_index"]
+                _counts = _blob["nf2_count_per_head"]
+                for _li in range(_m.shape[0]):
+                    self.k_reorder_index[_li] = _reorder[_li]
+                    self.k_inverse_reorder_index[_li] = _inverse[_li]
+                    self.k_nf2_count_per_head[_li] = _counts[_li]
+            elif self.qlut_selection_method is not None:
+                raise ValueError(
+                    f"unsupported qlutattn selection_method="
+                    f"{self.qlut_selection_method!r}"
+                )
             print(f"[qlutattn-offline] loaded codebook mask {tuple(_m.shape)} from "
-                  f"{self.pertoken_cb_mask_path} codebooks={self.bin_codebooks}")
+                  f"{self.pertoken_cb_mask_path} codebooks={self.bin_codebooks} "
+                  f"selection_method={self.qlut_selection_method}")
         # per-token K settled-token pointer: prefill sets it, decode advances it,
         # so chunked/multi-token decode cannot leave an fp16 gap.
         self.k_pt_quant_end: dict[int, int] = {}
@@ -452,10 +476,16 @@ class KittyKVCache(DynamicCache):
                 f"qlutattn offline codebook mask has no entry for layer {layer_idx}; "
                 "the mask shape must match the model (validated at preflight)"
             )
-        if cb_id.device != ks.device:
-            cb_id = cb_id.to(ks.device)
-            self.k_cb_mask[layer_idx] = cb_id
-        out = self._pt_apply_cb_mask(r, cb_id)
+        if self.qlut_selection_method in (
+            "layer_channel_top_p",
+            "layer_uniform_fixed_top_k_control",
+        ):
+            out = self._pt_apply_reordered_cb_segments(r, layer_idx)
+        else:
+            if cb_id.device != ks.device:
+                cb_id = cb_id.to(ks.device)
+                self.k_cb_mask[layer_idx] = cb_id
+            out = self._pt_apply_cb_mask(r, cb_id)
         return (muB + out).to(ks.dtype)
 
     def _pt_apply_cb_mask(self, r, cb_id):
@@ -467,6 +497,49 @@ class KittyKVCache(DynamicCache):
                 continue
             out = out + self._pt_codebook_masked(r, m, cbk)
         return out
+
+    def _pt_apply_reordered_cb_segments(self, r, layer_idx):
+        """Quantize a research mask after its head-local NF2/sign permutation."""
+        reorder = self.k_reorder_index.get(layer_idx)
+        inverse = self.k_inverse_reorder_index.get(layer_idx)
+        nf2_count = self.k_nf2_count_per_head.get(layer_idx)
+        if reorder is None or inverse is None or nf2_count is None:
+            raise RuntimeError(
+                "qlutattn reordered-selection metadata has no entry for layer "
+                f"{layer_idx}; the artifact shape must match the model"
+            )
+        if reorder.device != r.device:
+            reorder = reorder.to(r.device)
+            inverse = inverse.to(r.device)
+            nf2_count = nf2_count.to(r.device)
+            self.k_reorder_index[layer_idx] = reorder
+            self.k_inverse_reorder_index[layer_idx] = inverse
+            self.k_nf2_count_per_head[layer_idx] = nf2_count
+
+        batch, n_heads, n_tokens, head_dim = r.shape
+        gather_index = reorder[None, :, None, :].expand(
+            batch, n_heads, n_tokens, head_dim
+        )
+        reordered = torch.gather(r, -1, gather_index)
+        nf2_prefix = (
+            torch.arange(head_dim, device=r.device)[None, :]
+            < nf2_count[:, None]
+        )
+        reconstructed = torch.zeros_like(reordered)
+        if nf2_prefix.any():
+            reconstructed = reconstructed + self._pt_codebook_masked(
+                reordered, nf2_prefix, "nf2"
+            )
+        sign_suffix = ~nf2_prefix
+        if sign_suffix.any():
+            reconstructed = reconstructed + self._pt_codebook_masked(
+                reordered, sign_suffix, "sign"
+            )
+
+        inverse_index = inverse[None, :, None, :].expand(
+            batch, n_heads, n_tokens, head_dim
+        )
+        return torch.gather(reconstructed, -1, inverse_index)
 
     def _quant_k_buffer(self, key_slice_t, layer_idx):
         """Quantize a [B,nh,D,buffer] post-RoPE K buffer with the KIVI-style

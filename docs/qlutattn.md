@@ -1,13 +1,22 @@
 # QLUTATTN — the canonical KV-cache quantization variant
 
-`qlutattn` is the single public QLUTATTN variant in this repository. The
-algorithm is **fully fixed**: there are no codebook, sign-ratio, K-block,
-rotation, or V-tile-size knobs, and no QUEST overlay. Anything that needs a
-different algorithm is a different (new) variant, not a configuration of this
-one.
+`qlutattn` is the single public QLUTATTN variant in this repository. Its
+quantizers and runtime schedule are fixed: Q remains FP16, K uses the
+sign/`symnf2-v1` pair, V uses rescued tile16c64, and QUEST is forbidden.
+`QLUT_CB_MASK` is still the only QLUTATTN-specific runtime input.
+
+The default artifact remains the canonical fixed-65/35 mask. Versioned
+research artifacts may instead carry a static layer-channel top-p selector or
+an explicit uniform-top-k control. The artifact is generated offline, loaded
+once, and never rescored or reassigned at inference. Canonical artifacts with
+no research metadata retain their historical behavior, slug, and semantic
+hash.
 
 ```text
-variant name / method slug / output slug:  qlutattn
+variant name: qlutattn
+canonical method slug: qlutattn
+top-p method slug: qlutattn-topp-p<threshold>-m<full-mask-sha256>
+control method slug: qlutattn-control-<kind>-kbpv<bits>of<values>-m<full-mask-sha256>
 ```
 
 ## 1. Algorithm
@@ -16,7 +25,7 @@ variant name / method slug / output slug:  qlutattn
 
 Queries stay FP16. QLUTATTN never quantizes Q.
 
-### K-cache — per-token sign/nf2 on the mean-centered residual (nominal ~1.60 bit)
+### K-cache — per-token sign/nf2 on the mean-centered residual
 
 Post-RoPE keys are quantized **per token** along `head_dim`:
 
@@ -31,7 +40,8 @@ Post-RoPE keys are quantized **per token** along `head_dim`:
    statistics). The ranking signal is **`sigma^2 × E|q|`** — residual variance
    (how hard the channel is to quantize) times mean absolute post-RoPE query
    activation, query heads averaged per GQA group (how much attention actually
-   reads it). Channels are ranked per layer across all kv heads jointly:
+   reads it). The canonical artifact ranks channels per layer across all KV
+   heads jointly:
    - the 65% lowest-ranked channels → **sign**: 1-bit codeword, one
      per-token scale = mean |residual| over the sign channels (~1.25
      bit/value nominal);
@@ -39,12 +49,18 @@ Post-RoPE keys are quantized **per token** along `head_dim`:
      symmetric NF2 LUT `{-1, -c, +c, +1}`, `c = 0.25256848...` (IR-QLoRA
      appendix B.2), one per-token absmax scale, **no second mean** (~2.25
      bit/value nominal).
-   The mask is loaded once and used unchanged — never recomputed per prompt.
-   The 65/35 split is the measured accuracy optimum: nf2 beyond ~35% LOSES
-   accuracy because sign + mean-|r| fits low-difficulty channels better than
-   the absmax-scaled fixed LUT (mixing is a better quantizer, not merely a
-   bit saving).
-3. **Nominal K width:** `0.65 × 1.25 + 0.35 × 2.25 = 1.60 bit/value`.
+   A versioned `layer_channel_top_p` research artifact instead selects, in
+   every layer, the shortest score-descending prefix whose FP64 cumulative
+   score mass reaches the recorded threshold. A deterministic head-local
+   permutation makes each head's NF2/sign segments contiguous; inference
+   gathers, quantizes with the same kernels, and inverse-gathers before
+   attention. Uniform fixed-top-k control artifacts use the same execution
+   path. Every assignment remains frozen per model and prompt-independent.
+3. **K width:** the canonical artifact has nominal width
+   `0.65 × 1.25 + 0.35 × 2.25 = 1.60 bit/value` under its original
+   head-dimension convention. Research artifacts record exact packed
+   codeword-plus-scale cost; sink/recent FP16 windows and `mu_d` are excluded
+   from that selector-only comparison.
 
 Explicitly **not** part of the algorithm: Hadamard/FWHT rotation,
 SmoothAttention, online sigma^2 binning, per-token Lloyd fitting, outlier
@@ -78,32 +94,87 @@ push the theoretical effective width slightly above 2 bit/value
 - V tiles flush strictly in 16-token blocks: a trailing partial tile (fewer
   than 16 settled tokens) stays FP16 until it fills.
 
-## 2. Offline mask: format and validation
+### Exact theoretical K storage accounting
 
-Generate one mask per model (model-intrinsic; recalibrate per model):
+Selector-region cost and full-cache cost are different quantities. For head
+`(l,h)` with `k_lh` NF2 channels and head dimension `D`:
+
+```text
+code_bits_lh/token  = 2*k_lh + (D-k_lh)
+scale_bits_lh/token = 16*I(k_lh>0) + 16*I(k_lh<D)
+B_region            = sum_lh(code_bits_lh + scale_bits_lh)
+```
+
+For total sequence length `T`, `N=L*H_kv*D` K values/token, protected FP16
+tokens `P=sink+recent`, quantized tokens `T_q=T-P`, and packed metadata
+`B_meta`:
+
+```text
+full_cache_K_bpv = (T_q*B_region + P*16N + B_meta) / (T*N)
+```
+
+The 32K Llama-3.2-1B accounting uses `L=16`, `H_kv=8`, `D=64`,
+`N=8192`, `T=32768`, `P=160`, and `T_q=32608`. Packed metadata assumes one
+FP16 prompt mean/channel, a 1-bit mask/channel, and—for reordered research
+artifacts—both permutations at `ceil(log2 64)=6` bits/index. This is 17 KiB
+for canonical and 29 KiB for top-p/control, counted once conservatively for
+one batch-1 cache. Calibration statistics and provenance digests are excluded
+because they are not packed hot-path state.
+
+These figures remain theoretical: the fake-quant implementation stores
+reconstructed K in FP16 and prompt means in FP32. The artifact mask is uint8,
+but cache construction converts it to int64 `k_cb_mask`; reorder/inverse
+indices are int64 and `nf2_count_per_head` is int32. It does not realize the
+packed memory footprint.
+
+## 2. Offline mask: formats and validation
+
+Generate one canonical mask per model (model-intrinsic; recalibrate per model):
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 PYTHONPATH=src python scripts/calibrate_qlutattn_mask.py \
   --model      /path/to/model \
   --calib-data /path/to/wikitext-2-raw-v1/train-00000-of-00001.parquet \
+  --stats-output /path/to/model.qlutattn_stats.pt \
   --output     /path/to/model.qlutattn_mask.pt
 ```
 
-The runtime validates the mask strictly **before any model/GPU work** and
+Generate additional top-p artifacts on CPU from the same saved statistics;
+this performs no second model pass:
+
+```bash
+CUDA_VISIBLE_DEVICES='' PYTHONPATH=src python scripts/calibrate_qlutattn_mask.py \
+  --stats-input /path/to/model.qlutattn_stats.pt \
+  --top-p 0.62 \
+  --output /path/to/model.qlutattn_topp_p62.pt
+```
+
+Generate the two auditable uniform-top-k controls from that exact top-p
+artifact with `--control-kind same_cardinality` or
+`--control-kind exact_packed_bits`:
+
+```bash
+CUDA_VISIBLE_DEVICES='' PYTHONPATH=src python scripts/calibrate_qlutattn_mask.py \
+  --stats-input /path/to/model.qlutattn_stats.pt \
+  --uniform-top-k-control-from /path/to/model.qlutattn_topp_p62.pt \
+  --control-kind exact_packed_bits \
+  --output /path/to/model.qlutattn_topp_p62_exact_bits_control.pt
+```
+
+The runtime validates the artifact strictly **before any model/GPU work** and
 refuses to run otherwise:
 
-| field | requirement |
+| artifact | required invariants |
 | --- | --- |
-| `codebooks` | exactly `["sign", "nf2"]` |
-| `codebook_mask` | `torch.uint8`, `ndim == 3`, values exactly `{0, 1}` (0=sign, 1=nf2) |
-| per-layer sign count | exactly `round(0.65 × n_kv × head_dim)` in every layer |
-| `low_frac` | equal to the mask's ACTUAL sign fraction (±1e-6; integer rounding puts it near but not exactly on 0.65) |
-| shape | `[num_layers, num_key_value_heads, head_dim]` of the target model |
+| common | `codebooks == ["sign", "nf2"]`; `codebook_mask` is CPU `uint8`, rank 3, binary, and matches `[num_layers, num_key_value_heads, head_dim]`; `low_frac` matches the actual mask |
+| canonical | every layer has exactly `round(0.65 × n_kv × head_dim)` sign entries |
+| top-p format v3 | fixed selector/tie/dtype metadata; strictly recomputed FP64 score, per-layer cumulative boundary, mask, per-head reorder/inverse, counts, ratios, exact packed K cost, and calibration provenance |
+| control format v2 | fixed uniform-top-k kind; recomputed referenced top-p mask and control; exact cardinality or packed-bit invariant; full source-file SHA-256 plus independently recomputed `reference_semantic_sha256` |
 
-Legacy metadata keys (`target_bits`, `nominal_bits`, research-era keys) are
-ignored — the mask content, not its historical labels, is what is validated.
-The mask file's SHA-256 is embedded in the variant semantic hash and every
-run manifest.
+The mask file's full SHA-256 is embedded in the variant semantic hash and every
+run manifest. Top-p and control output slugs also use the full digest, so two
+different artifacts cannot share a result directory through a short-prefix
+collision. Legacy metadata on a canonical artifact remains ignored.
 
 ## 3. Running it
 
@@ -135,8 +206,10 @@ variant via `bash scripts/run_ruler.sh --variants fp16,qlutattn`.
 ### Output layout
 
 ```text
-full  -> longbench_out/<model>_qlutattn/{pred,logs}
-smoke -> longbench_out/smoke/<model>_qlutattn/{pred,logs}
+canonical full  -> longbench_out/<model>_qlutattn/{pred,logs}
+top-p full      -> longbench_out/<model>_qlutattn-topp-p<P>-m<SHA256>/{pred,logs}
+control full    -> longbench_out/<model>_qlutattn-control-<kind>-kbpv<B>of<N>-m<SHA256>/{pred,logs}
+smoke           -> the same method-qualified layout under longbench_out/smoke/
 ```
 
 ### Retired knobs
@@ -157,15 +230,18 @@ A qlutattn run is valid only when, for every dataset:
 - `run_config_hash` non-empty (shell preflight and Python worker recompute and
   must agree before model loading);
 - `variant.name == "qlutattn"`, `nf2_impl == "symnf2-v1"`, `mask_sha256`
-  non-empty;
+  non-empty; research artifacts also carry their selector/control metadata;
+- engagement evidence proves the K path actually executed:
+  `k_quant_calls > 0`, `k_quantized_tokens > 0`,
+  `k_prompt_mean_layers > 0`, `last_k_quant_mode == "per_token:qlut"`;
 - engagement evidence proves the V path actually executed:
   `last_v_quant_mode == "tile16_rescued"`, `last_v_tile_channels == 64`,
   `v_tile_blocks > 0`, `v_quantized_tokens > 0`;
 - the worker log shows the offline mask load:
   `[qlutattn-offline] loaded codebook mask ... codebooks=['sign', 'nf2']`.
 
-The runner also hard-fails the first sample if the KV quantization path never
-engaged (no silent dense-FP16 mislabelling).
+The runner hard-fails the first sample if either required cache path did not
+engage; it never accepts dense-FP16 execution mislabeled as QLUTATTN.
 
 ## 5. Limitations
 
@@ -174,7 +250,53 @@ immediately reconstructed to FP16 in the cache. There is no packed KV-cache
 storage, so no real memory savings and no speedup is demonstrated by these
 runs — they measure accuracy only.
 
-## 6. Figures
+The layer-channel top-p and uniform-top-k formats are research selectors, not a
+new packed kernel or a new default. Results must report their artifact digest,
+exact K cost, calibration/model scope, and selector kind. Evidence from one
+`head_dim=64` model is model-specific and is not a cross-model claim.
+
+## 6. Llama-3.2-1B top-p research result
+
+The 2026-07-23 study used Llama-3.2-1B only. Two stable thresholds improved
+held-out PPL and full LongBench averages over exact packed-bit uniform-top-k
+controls:
+
+|selector|quant-region K bpv|full-cache K bpv @32K|full-cache saving|test PPL|full LongBench|matched-control LongBench|
+|---|---:|---:|---:|---:|---:|---:|
+|canonical fixed-65/35|1.849609|1.919222|0%|13.767101|24.529048|--|
+|top-p `p=0.62`|1.741089|1.811597|5.608%|13.742994|24.300476|24.136190|
+|top-p `p=0.60`|1.719238|1.789854|6.741%|13.777823|24.120476|23.982857|
+
+The matched improvements are small: `+0.1643` and `+0.1376` LongBench points,
+and paired 21-dataset bootstrap intervals include zero. Compared with the
+canonical mask, `p=0.62` saves `5.867%` in the quantized region and `5.608%`
+in the theoretical full 32K K cache, while losing `0.229` LongBench points;
+`p=0.60` saves `7.049%` in the region and `6.741%` full-cache, while losing
+`0.409`. Classification:
+**weak single-model Pareto improvement over equal-cost uniform-top-k, but a
+quality/bit tradeoff versus canonical**. It does not justify changing the
+default.
+
+Follow-up robustness probes did not change the selected artifact. Across three
+calibration seeds, focused means were `49.963±0.774` at `p=0.60`,
+`51.027±0.251` at `p=0.62`, and `50.693±0.467` at `p=0.65` (population
+standard deviation). Seed1's slightly higher `p=0.62` focused score did not
+transfer to full PPL (`2.620574766` average NLL versus seed0
+`2.620529133`). Neighbor thresholds `0.618/0.622`, 256-sample calibration,
+4096-token calibration windows, and `skip_first=128` all scored below the
+seed0 `p=0.62` focused result. Seed0 remains fixed; no multi-objective selector
+was introduced.
+
+Detailed evidence:
+
+- `.omx/plans/qlutattn-channel-topp-research.md`, section 11;
+- `longbench_out/qlutattn_topp_research.tsv`;
+- `longbench_out/qlutattn_topp_full_comparison.tsv`;
+- `longbench_out/qlutattn_topp_threshold_curve.tsv`;
+- `longbench_out/qlutattn_topp_bit_accounting_32k.tsv`;
+- `longbench_out/qlutattn_topp_layer_ratios.tsv`.
+
+## 7. Figures
 
 - `docs/figures/vcache_tile16c64_rescue_explainer-v2.png` — the rescued
   tile16c64 V pipeline.

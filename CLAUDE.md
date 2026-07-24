@@ -258,6 +258,12 @@ datasets across GPUs, use a single target, e.g. `run_exp.sh llama32 --gpus 0,1,2
 | `shadowkv` | `shadowkv` | ShadowKV pure-torch sim (accuracy proxy; no memory/speed savings). |
 | `custom` | `custom-kitty` | Custom Kitty config. |
 
+`qlutattn` keeps one public variant and one runtime input (`QLUT_CB_MASK`), but
+the mask artifact may be canonical fixed-65/35 or a versioned research
+`layer_channel_top_p` / uniform-top-k-control artifact. Research artifacts get
+artifact-qualified method slugs with the full mask SHA-256; the canonical
+artifact remains plain `qlutattn`. See the dedicated section below.
+
 All LongBench variants here run on the pure-torch sim fake-quant path (accuracy
 proxy, no real KV-memory savings); `fp16`/`kivi`/`kivi_star` keep dense fp16 KV.
 
@@ -499,13 +505,14 @@ overrides; never hardcode host paths in tracked files.
 
 ## QLUTATTN(唯一 canonical 变体)
 
-`qlutattn` 是本仓库**唯一**的公开 QLUTATTN 变体(variant 名 = method slug = 输出
-slug = `qlutattn`)。算法**完全固定**:不支持码本选择、sign 比例、K-block、旋转、
-V-tile 尺寸等任何旋钮,也不支持 QUEST 叠加 —— `QUEST_KERNEL` / `QUEST_TRITON` /
-`SIM_QUEST` / `QUEST_SIM` 与 `--variant qlutattn` 组合会直接硬报错(QUEST 仍可用于
-kitty/kivi)。历史 QLUTATTN 调参环境变量已全部退役:任何残留非空值都会硬报错
-(空串视为未设置);`VBITS` 对 qlutattn 只接受 unset/空串/`2`。唯一的 QLUTATTN
-运行时输入是 `QLUT_CB_MASK`。完整设计文档:`docs/qlutattn.md`。
+`qlutattn` 是本仓库**唯一**的公开 QLUTATTN 变体。Q/V 算法、sign/NF2 码本、
+K per-token 调度和保护窗口仍完全固定,也不支持 QUEST 叠加。唯一的 QLUTATTN
+运行时输入仍是 `QLUT_CB_MASK`;没有在线 selector 或额外运行时调参旋钮。
+默认无研究元数据的 artifact 保持历史 fixed-65/35 语义、`qlutattn` slug 与
+semantic hash 不变。版本化研究 artifact 可以在离线阶段固定
+`layer_channel_top_p` 或 uniform-top-k control;它们使用带 threshold/control、
+exact packed cost 与**完整 mask SHA-256** 的独立 method/output slug,不会与
+canonical 结果混用。完整设计文档:`docs/qlutattn.md`。
 
 ### 语义
 
@@ -515,15 +522,24 @@ kitty/kivi)。历史 QLUTATTN 调参环境变量已全部退役:任何残留非�
   抵消);残差按**离线 per-channel 码本掩码**量化
   (`scripts/calibrate_qlutattn_mask.py`,wikitext 单趟同时采集两个统计量,
   排序信号 = **σ² × E|q|**:残差方差(量化难度)× post-RoPE query 通道平均绝对
-  激活(GQA 组内平均;attention 真正读它的程度);每层跨全部 kv-head 联合排序):
-  - 65% 最低排序通道 → **sign**:1-bit 码字 + per-token mean-|r| scale
-    (~1.25 bit/value);
-  - 35% 最高排序通道 → **nf2(`symnf2-v1`)**:固定对称 NF2 LUT
-    `{-1, -c, +c, +1}`,`c = 0.25256848`,per-token absmax scale,无二次均值
-    (~2.25 bit/value)。
-  - 名义 K 位宽 = `0.65×1.25 + 0.35×2.25` = **1.60 bit/value**。65/35 是实测
-    精度最优:nf2 超过 ~35% 反而掉分(sign+mean-|r| 在低难度通道上优于
-    absmax 固定 LUT——混合本身是更优量化器,不只是省 bit)。
+  激活(GQA 组内平均;attention 真正读它的程度);每层跨全部 kv-head 联合排序)。
+  - canonical artifact:每层固定最低 65% → **sign**(1-bit + per-token
+    mean-|r| scale),最高 35% → **nf2(`symnf2-v1`)**(固定对称 LUT
+    `{-1,-c,+c,+1}`,`c=0.25256848`,per-token absmax scale,无二次均值)。
+  - research top-p format v3:每层独立按 score 降序,以 FP64 累积,取达到同一
+    `p` 的最短前缀为 NF2;离线生成 head-local reorder/inverse。推理仅
+    gather → NF2/sign 原内核 → inverse-gather,不重新打分。
+  - research control format v2:`same_cardinality` 或 `exact_packed_bits`
+    uniform per-layer top-k;嵌入 source-file SHA-256 与可重算的
+    `reference_semantic_sha256`。
+  - canonical 的 `1.60 bit/value` 是原 `head_dim=128` 约定下的
+    **quantized-region** codeword+scale 位宽,不是 full-cache 位宽。所有研究
+    artifact 必须分别报告 code/scale,并在给定长度下计入 `μ_d`、mask、
+    reorder/inverse 与 sink/recent FP16 window:
+    `b_full=(Tq*B_region + (sink+recent)*16*N + B_meta)/(T*N)`。
+    当前 fake-quant 的 K 仍以 FP16 重建保存,`μ_d` 为 FP32;artifact mask 虽为
+    uint8,cache 初始化会转成 int64 `k_cb_mask`;reorder/inverse 为 int64,
+    `nf2_count_per_head` 为 int32。理论 packed 数字不是实测显存结果。
   - 明确**不包含**:Hadamard/FWHT 旋转、SmoothAttention、在线 σ² 分箱、per-token
     自适应码本拟合、outlier 稠密-稀疏侧路、跨 token 的 block 共享码本(block 固定
     为 1)、per-head 占比均衡、RoPE 对偶绑定、逐层占比调度、token 级分档
@@ -535,22 +551,23 @@ kitty/kivi)。历史 QLUTATTN 调参环境变量已全部退役:任何残留非�
 - **保护窗口**:`sink_length=32`,recent FP16 窗口 `buffer_length=128`,
   `group_size=128`。
 
+
 ### 离线掩码(唯一运行时输入)
 
-每个模型一份掩码,命名约定 `<MODEL_PATH>.qlutattn_mask.pt`;`.env.example` 提供
-`KITTY_WIKITEXT2_TRAIN_PATH` / `KITTY_LLAMA32_1B_QLUTATTN_MASK` 两个可选变量存放
-本机路径。加载时严格校验,不满足即拒绝运行:
+每个模型一份 canonical 掩码,命名约定 `<MODEL_PATH>.qlutattn_mask.pt`;
+`.env.example` 提供 `KITTY_WIKITEXT2_TRAIN_PATH` /
+`KITTY_LLAMA32_1B_QLUTATTN_MASK` 两个可选变量存放本机路径。加载时在模型/GPU
+工作前严格校验:
 
-| 字段 | 要求 |
+| artifact | 要求 |
 | --- | --- |
-| `codebooks` | 恰为 `["sign", "nf2"]` |
-| `codebook_mask` | `uint8`,`ndim == 3`,取值恰为 `{0, 1}`(0=sign,1=nf2) |
-| 每层 sign 计数 | 每层恰为 `round(0.65 × n_kv × head_dim)` |
-| `low_frac` | 等于掩码**实际** sign 占比(±1e-6;整数取整使其接近但不必恰为 0.65) |
-| shape | `[num_layers, num_key_value_heads, head_dim]`(目标模型) |
+| common | `codebooks == ["sign","nf2"]`;`codebook_mask` 为 CPU `uint8` rank-3 binary,shape 匹配目标模型,`low_frac` 匹配实际 mask |
+| canonical | 每层 sign 计数恰为 `round(0.65 × n_kv × head_dim)` |
+| top-p format v3 | selector/tie/dtype 常量、FP64 score、每层 cumulative boundary、mask、reorder/inverse、count/ratio、exact packed K cost 与 calibration provenance 全部可重算且匹配 |
+| control format v2 | reference top-p 与 uniform top-k control 全部重算;满足 same-cardinality 或 exact-packed-bits;校验完整 source SHA-256 格式和可重算 `reference_semantic_sha256` |
 
-legacy 的 `target_bits` / `nominal_bits` 及研究期元数据一律忽略。掩码文件的
-SHA-256 进入变体语义哈希与每个 run manifest。
+canonical legacy 的 `target_bits` / `nominal_bits` 等历史字段继续忽略。
+mask 文件完整 SHA-256 进入 semantic hash、manifest 和 research method slug。
 
 ### 标定 → smoke → full
 
@@ -560,7 +577,24 @@ cd "$(git rev-parse --show-toplevel)"
 CUDA_VISIBLE_DEVICES=0 PYTHONPATH=src python scripts/calibrate_qlutattn_mask.py \
   --model /path/to/Llama-3.2-1B-Instruct \
   --calib-data /path/to/wikitext-2-raw-v1/train-00000-of-00001.parquet \
+  --stats-output /path/to/Llama-3.2-1B-Instruct.qlutattn_stats.pt \
   --output /path/to/Llama-3.2-1B-Instruct.qlutattn_mask.pt
+```
+
+```bash
+# 同一次 stats pass 离线生成 research top-p(不再次加载模型)
+CUDA_VISIBLE_DEVICES='' PYTHONPATH=src python scripts/calibrate_qlutattn_mask.py \
+  --stats-input /path/to/Llama-3.2-1B-Instruct.qlutattn_stats.pt \
+  --top-p 0.62 \
+  --output /path/to/Llama-3.2-1B-Instruct.qlutattn_topp_p62.pt
+
+# exact packed-bit uniform-top-k control
+CUDA_VISIBLE_DEVICES='' PYTHONPATH=src python scripts/calibrate_qlutattn_mask.py \
+  --stats-input /path/to/Llama-3.2-1B-Instruct.qlutattn_stats.pt \
+  --uniform-top-k-control-from \
+    /path/to/Llama-3.2-1B-Instruct.qlutattn_topp_p62.pt \
+  --control-kind exact_packed_bits \
+  --output /path/to/Llama-3.2-1B-Instruct.qlutattn_topp_p62_exact_control.pt
 ```
 
 ```bash
@@ -584,8 +618,9 @@ bash scripts/run_exp.sh llama32 --gpu 1 --variant qlutattn
 # -> longbench_out/llama32-1b-instruct_qlutattn/{pred,logs}
 ```
 
-输出布局:full → `longbench_out/<model>_qlutattn/{pred,logs}`;smoke →
-`longbench_out/smoke/<model>_qlutattn/{pred,logs}`。
+输出布局:canonical 为 `longbench_out/<model>_qlutattn/{pred,logs}`;
+top-p/control 使用带 threshold/kind、exact cost 和完整 mask SHA-256 的独立
+method slug;smoke 在同样布局外加 `longbench_out/smoke/`。
 
 ### run 验收(manifest + engagement)
 
@@ -594,8 +629,12 @@ bash scripts/run_exp.sh llama32 --gpu 1 --variant qlutattn
 - `manifest.status == "ok"`,`run_config_hash` 非空(shell preflight 与 Python
   worker 各自重算且必须一致);
 - `variant.name == "qlutattn"`,`nf2_impl == "symnf2-v1"`,`mask_sha256` 非空;
-- engagement 证据证明 V 路径真实执行:
-  `engagement.last_v_quant_mode == "tile16_rescued"`,`last_v_tile_channels == 64`,
+  research artifact 还必须记录 selector/control provenance;
+- K engagement:
+  `k_quant_calls > 0`,`k_quantized_tokens > 0`,`k_prompt_mean_layers > 0`,
+  `last_k_quant_mode == "per_token:qlut"`;
+- V engagement:
+  `last_v_quant_mode == "tile16_rescued"`,`last_v_tile_channels == 64`,
   `v_tile_blocks > 0`,`v_quantized_tokens > 0`。
 
 ### 限制
@@ -604,6 +643,8 @@ bash scripts/run_exp.sh llama32 --gpu 1 --variant qlutattn
   存储,不省真实显存、不加速 —— 这些 run 只测精度。
 - 模型必须是 FP16;`head_dim` 必须是 2 的幂且可被 64 整除;GLM 家族直接
   fail-fast 拒绝(不做静默回退)。
+- top-p/control 是 research selector,不是新默认或新 packed kernel。只在
+  Llama-3.2-1B(`head_dim=64`)验证时必须报告为 model-specific,不能写成跨模型结论。
 
 ## KV-cache 可视化 skill (`kv-cache-viz`)
 

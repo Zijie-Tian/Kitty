@@ -9,6 +9,7 @@ manifest engagement, and the masked per-token K numerics.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -26,6 +27,7 @@ from kitty_sim.kitty_simulate import KittyKVCacheConfig, KittyKVCache
 from kitty_sim.longbench.runner import (
     NF2_IMPL_VERSION,
     QLUTATTN_VARIANT,
+    QLUTATTN_CONTROL_SELECTION_METHOD,
     _cache_factory,
     _maybe_enable_quest_kernel,
     build_variant,
@@ -113,6 +115,289 @@ def _mask_payload(n_layers=1, n_kv=1, head_dim=64):
     }
 
 
+def _top_p_mask_payload(n_layers=1, n_kv=1, head_dim=64, threshold=0.55):
+    """A valid top-p artifact whose increasing scores select the high suffix."""
+    n_per_layer = n_kv * head_dim
+    sigma2 = torch.arange(
+        1, n_layers * n_per_layer + 1, dtype=torch.float32
+    ).reshape(n_layers, n_kv, head_dim)
+    q_absmean = torch.ones_like(sigma2)
+    ranking = sigma2.double() * q_absmean.double()
+    mask = torch.zeros(n_layers, n_kv, head_dim, dtype=torch.uint8)
+    count_per_layer = torch.empty(n_layers, dtype=torch.int32)
+    captured = torch.empty(n_layers, dtype=torch.float64)
+    previous = torch.empty(n_layers, dtype=torch.float64)
+    boundary = torch.empty(n_layers, dtype=torch.float64)
+    for layer_idx in range(n_layers):
+        flat = ranking[layer_idx].reshape(-1)
+        order = torch.argsort(flat, descending=True, stable=True)
+        ordered = flat[order]
+        cumulative = ordered.cumsum(0)
+        total = cumulative[-1]
+        selected = int(torch.searchsorted(
+            cumulative, total * threshold, right=False
+        )) + 1
+        mask[layer_idx].view(-1)[order[:selected]] = 1
+        count_per_layer[layer_idx] = selected
+        captured[layer_idx] = cumulative[selected - 1] / total
+        previous[layer_idx] = (
+            cumulative[selected - 2] / total if selected > 1 else 0.0
+        )
+        boundary[layer_idx] = ordered[selected - 1]
+
+    count_per_head = (mask == 1).sum(-1).to(torch.int32)
+    reorder = torch.empty(mask.shape, dtype=torch.int64)
+    inverse = torch.empty_like(reorder)
+    identity = torch.arange(head_dim, dtype=torch.int64)
+    for layer_idx in range(n_layers):
+        for head_idx in range(n_kv):
+            head_mask = mask[layer_idx, head_idx]
+            head_reorder = torch.cat((
+                torch.nonzero(head_mask == 1, as_tuple=False).flatten(),
+                torch.nonzero(head_mask == 0, as_tuple=False).flatten(),
+            ))
+            reorder[layer_idx, head_idx] = head_reorder
+            inverse[layer_idx, head_idx, head_reorder] = identity
+
+    nf2_count = int((mask == 1).sum())
+    total_count = mask.numel()
+    return {
+        "format_version": 3,
+        "selection_axis": "per_layer_flattened_kv_head_channel",
+        "threshold_rule": "minimal_desc_prefix_cumsum_ge_p",
+        "tie_rule": "score_desc_flat_index_asc",
+        "score_dtype_for_selection": "float64",
+        "nf2_impl": "symnf2-v1",
+        "ranking_signal": "sigma2_x_q",
+        "model": "test/model",
+        "calib_data": "/test/calibration.parquet",
+        "group_size": 128,
+        "skip_first": 32,
+        "num_samples": 8,
+        "sample_len": 256,
+        "seed": 0,
+        "n_layers": n_layers,
+        "n_kv": n_kv,
+        "head_dim": head_dim,
+        "selection_method": "layer_channel_top_p",
+        "top_p_threshold": float(threshold),
+        "codebook_mask": mask,
+        "codebooks": ["sign", "nf2"],
+        "reorder_index": reorder,
+        "inverse_reorder_index": inverse,
+        "nf2_count_per_head": count_per_head,
+        "nf2_count_per_layer": count_per_layer,
+        "sigma2": sigma2,
+        "q_absmean": q_absmean,
+        "ranking_score": ranking,
+        "actual_nf2_frac": nf2_count / total_count,
+        "low_frac": (total_count - nf2_count) / total_count,
+        "nf2_ratio_per_layer": count_per_layer.double() / n_per_layer,
+        "captured_mass_per_layer": captured,
+        "previous_prefix_mass_per_layer": previous,
+        "boundary_score_per_layer": boundary,
+        "actual_nf2_count": nf2_count,
+        "packed_bits_total": _packed_k_bits(mask),
+        "packed_k_values_total": total_count,
+    }
+
+
+def _packed_k_bits(mask):
+    """Independent packed-K accounting oracle for runtime control fixtures."""
+    head_dim = mask.shape[-1]
+    nf2_count = mask.to(torch.int64).sum(-1)
+    code_bits = int(((head_dim - nf2_count) + 2 * nf2_count).sum())
+    scale_bits = 16 * int((nf2_count > 0).sum())
+    scale_bits += 16 * int((nf2_count < head_dim).sum())
+    return code_bits + scale_bits
+
+
+def _reference_semantic_sha256(reference):
+    """Independent oracle for the control-v2 reference semantic digest."""
+    reference_mask = reference["codebook_mask"]
+    n_layers, n_kv, head_dim = reference_mask.shape
+    metadata = {
+        "semantic_hash_domain": "qlutattn_top_p_reference_semantics_v1",
+        "top_p_format_version": 3,
+        "selection_method": "layer_channel_top_p",
+        "selection_axis": "per_layer_flattened_kv_head_channel",
+        "threshold_rule": "minimal_desc_prefix_cumsum_ge_p",
+        "tie_rule": "score_desc_flat_index_asc",
+        "score_dtype_for_selection": "float64",
+        "top_p_threshold_hex": float(reference["top_p_threshold"]).hex(),
+        "codebooks": ["sign", "nf2"],
+        "nf2_impl": "symnf2-v1",
+        "ranking_signal": "sigma2_x_q",
+        "model": reference["model"],
+        "calib_data": reference["calib_data"],
+        "group_size": reference["group_size"],
+        "skip_first": reference["skip_first"],
+        "num_samples": reference["num_samples"],
+        "sample_len": reference["sample_len"],
+        "seed": reference["seed"],
+        "n_layers": n_layers,
+        "n_kv": n_kv,
+        "head_dim": head_dim,
+        "statistics_encoding": "ieee754_binary64_little_endian_c_order",
+        "reference_mask_encoding": "uint8_c_order",
+    }
+    metadata_bytes = json.dumps(
+        metadata,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    sigma2_values = (
+        reference["sigma2"].detach().to(dtype=torch.float64).contiguous()
+        .numpy().astype("<f8", copy=False)
+    )
+    q_absmean_values = (
+        reference["q_absmean"].detach().to(dtype=torch.float64).contiguous()
+        .numpy().astype("<f8", copy=False)
+    )
+    reference_mask_values = (
+        reference_mask.detach().to(dtype=torch.uint8).contiguous().numpy()
+    )
+    digest = hashlib.sha256()
+    for label, values in (
+        ("metadata_json_utf8", metadata_bytes),
+        ("sigma2_float64_le", sigma2_values),
+        ("q_absmean_float64_le", q_absmean_values),
+        ("reference_mask_uint8", reference_mask_values),
+    ):
+        label_bytes = label.encode("ascii")
+        value_bytes = memoryview(values).cast("B")
+        digest.update(len(label_bytes).to_bytes(4, "big"))
+        digest.update(label_bytes)
+        digest.update(len(value_bytes).to_bytes(8, "big"))
+        digest.update(value_bytes)
+    return digest.hexdigest()
+
+
+def _uniform_control_mask(ranking, reference_mask, total_nf2):
+    n_layers, n_kv, head_dim = ranking.shape
+    per_layer = n_kv * head_dim
+    floor_count, remainder = divmod(total_nf2, n_layers)
+    if floor_count <= 0 or floor_count + bool(remainder) >= per_layer:
+        raise ValueError("nontrivial uniform layer counts required")
+    flat = ranking.reshape(n_layers, -1)
+    orders = [
+        torch.argsort(flat[layer], descending=True, stable=True)
+        for layer in range(n_layers)
+    ]
+    next_scores = torch.tensor([
+        float(flat[layer, orders[layer][floor_count]])
+        for layer in range(n_layers)
+    ], dtype=torch.float64)
+    extra_layers = set(
+        torch.argsort(next_scores, descending=True, stable=True)[:remainder].tolist()
+    )
+    mask = torch.zeros_like(reference_mask)
+    count_per_layer = torch.empty(n_layers, dtype=torch.int32)
+    for layer in range(n_layers):
+        count = floor_count + int(layer in extra_layers)
+        mask[layer].reshape(-1)[orders[layer][:count]] = 1
+        count_per_layer[layer] = count
+    return mask, count_per_layer
+
+
+def _control_mask_payload(
+    control_kind="same_cardinality",
+    n_layers=3,
+    n_kv=2,
+    head_dim=8,
+    threshold=0.55,
+):
+    """Valid fixed-top-k control built independently of the runtime validator."""
+    reference = _top_p_mask_payload(
+        n_layers=n_layers,
+        n_kv=n_kv,
+        head_dim=head_dim,
+        threshold=threshold,
+    )
+    reference_mask = reference["codebook_mask"]
+    ranking = reference["ranking_score"]
+    reference_nf2 = int(reference_mask.sum())
+    if control_kind == "same_cardinality":
+        mask, count_per_layer = _uniform_control_mask(
+            ranking, reference_mask, reference_nf2
+        )
+    elif control_kind == "exact_packed_bits":
+        target = _packed_k_bits(reference_mask)
+        for total_nf2 in sorted(
+            range(1, reference_mask.numel()),
+            key=lambda value: (abs(value - reference_nf2), value),
+        ):
+            try:
+                candidate, candidate_counts = _uniform_control_mask(
+                    ranking, reference_mask, total_nf2
+                )
+            except ValueError:
+                continue
+            if _packed_k_bits(candidate) == target:
+                mask, count_per_layer = candidate, candidate_counts
+                break
+        else:
+            raise AssertionError("fixture has no exact packed-bit control")
+    else:
+        raise ValueError(control_kind)
+
+    reorder = torch.empty_like(mask, dtype=torch.int64)
+    inverse = torch.empty_like(reorder)
+    identity = torch.arange(head_dim, dtype=torch.int64)
+    count_per_head = mask.to(torch.int32).sum(-1, dtype=torch.int32)
+    for layer in range(n_layers):
+        for head in range(n_kv):
+            selected = mask[layer, head].bool()
+            index = torch.cat((identity[selected], identity[~selected]))
+            reorder[layer, head] = index
+            inverse[layer, head, index] = identity
+
+    actual_nf2 = int(mask.sum())
+    total = mask.numel()
+    return {
+        "selection_method": QLUTATTN_CONTROL_SELECTION_METHOD,
+        "format_version": 2,
+        "selection_axis": "per_layer_flattened_kv_head_channel",
+        "tie_rule": "score_desc_flat_index_asc",
+        "score_dtype_for_selection": "float64",
+        "control_kind": control_kind,
+        "reference_mask_sha256": "a" * 64,
+        "reference_semantic_sha256": _reference_semantic_sha256(reference),
+        "reference_selection_method": "layer_channel_top_p",
+        "reference_top_p_threshold": float(threshold),
+        "reference_codebook_mask": reference_mask.clone(),
+        "codebook_mask": mask,
+        "codebooks": ["sign", "nf2"],
+        "low_frac": (total - actual_nf2) / total,
+        "actual_nf2_frac": actual_nf2 / total,
+        "nf2_impl": "symnf2-v1",
+        "ranking_signal": "sigma2_x_q",
+        "reorder_index": reorder,
+        "inverse_reorder_index": inverse,
+        "nf2_count_per_head": count_per_head,
+        "nf2_count_per_layer": count_per_layer,
+        "nf2_ratio_per_layer": count_per_layer.double() / (n_kv * head_dim),
+        "group_size": reference["group_size"],
+        "skip_first": reference["skip_first"],
+        "model": reference["model"],
+        "calib_data": reference["calib_data"],
+        "num_samples": reference["num_samples"],
+        "sample_len": reference["sample_len"],
+        "seed": reference["seed"],
+        "n_layers": n_layers,
+        "n_kv": n_kv,
+        "head_dim": head_dim,
+        "sigma2": reference["sigma2"],
+        "q_absmean": reference["q_absmean"],
+        "ranking_score": ranking,
+        "reference_nf2_count": reference_nf2,
+        "actual_nf2_count": actual_nf2,
+        "reference_packed_bits_total": _packed_k_bits(reference_mask),
+        "packed_bits_total": _packed_k_bits(mask),
+    }
+
+
 class _EnvIsolation(unittest.TestCase):
     def setUp(self):
         self._env_backup = {k: os.environ.get(k) for k in _GUARDED_ENV}
@@ -184,6 +469,12 @@ class TestCanonicalResolution(_EnvIsolation):
         self.assertTrue(payload["mask_sha256"])
         self.assertNotIn("pertoken_cb_mask", payload)  # host path never hashed
         self.assertEqual(payload["nf2_impl"], NF2_IMPL_VERSION)
+        self.assertNotIn("selection_method", payload)
+        self.assertNotIn("top_p_threshold", payload)
+        self.assertNotIn("actual_nf2_frac", payload)
+        self.assertNotIn("actual_nf2_count", payload)
+        self.assertNotIn("packed_bits_total", payload)
+        self.assertNotIn("packed_k_values_total", payload)
 
     def test_cache_factory_threads_canonical_fields(self):
         cfg = build_variant(self._masked_args())
@@ -197,6 +488,52 @@ class TestCanonicalResolution(_EnvIsolation):
         self.assertEqual(cache.bin_codebooks, ["sign", "nf2"])
         self.assertTrue(cache.pertoken_offline)
         self.assertIn(0, cache.k_cb_mask)
+
+    def test_top_p_resolution_is_threshold_qualified(self):
+        mask_path = self._write_mask(_top_p_mask_payload())
+        os.environ["QLUT_CB_MASK"] = mask_path
+        digest = hashlib.sha256(Path(mask_path).read_bytes()).hexdigest()
+        cfg = build_variant(_args())
+        self.assertEqual(cfg.name, QLUTATTN_VARIANT)
+        self.assertEqual(cfg.selection_method, "layer_channel_top_p")
+        self.assertEqual(cfg.top_p_threshold, 0.55)
+        self.assertEqual(
+            cfg.actual_nf2_frac,
+            _top_p_mask_payload()["actual_nf2_frac"],
+        )
+        self.assertEqual(cfg.actual_nf2_count, _top_p_mask_payload()["actual_nf2_count"])
+        self.assertEqual(cfg.packed_bits_total, _top_p_mask_payload()["packed_bits_total"])
+        self.assertEqual(
+            cfg.packed_k_values_total,
+            _top_p_mask_payload()["packed_k_values_total"],
+        )
+        expected_slug = f"qlutattn-topp-p0p55-m{digest}"
+        self.assertEqual(cfg.tag, expected_slug)
+        self.assertEqual(method_layout_slug(cfg), expected_slug)
+        payload = variant_semantic_payload(cfg)
+        self.assertEqual(payload["selection_method"], "layer_channel_top_p")
+        self.assertEqual(payload["top_p_threshold"], 0.55)
+        self.assertEqual(payload["actual_nf2_frac"], cfg.actual_nf2_frac)
+        for key in (
+            "actual_nf2_count",
+            "packed_bits_total",
+            "packed_k_values_total",
+        ):
+            self.assertEqual(payload[key], getattr(cfg, key), key)
+        preflight = resolve_longbench_preflight(_args())
+        for key in (
+            "actual_nf2_count",
+            "packed_bits_total",
+            "packed_k_values_total",
+        ):
+            self.assertEqual(
+                preflight["resolved_variant"][key], getattr(cfg, key), key
+            )
+        cache = _cache_factory(cfg)
+        self.assertEqual(cache.qlut_selection_method, "layer_channel_top_p")
+        self.assertIn(0, cache.k_reorder_index)
+        self.assertIn(0, cache.k_inverse_reorder_index)
+        self.assertIn(0, cache.k_nf2_count_per_head)
 
 
 class TestRetiredKnobRejection(_EnvIsolation):
@@ -298,6 +635,122 @@ class TestMaskValidation(_EnvIsolation):
         )
         with self.assertRaises(ValueError):
             build_variant(_args())
+
+    def test_valid_top_p_mask_and_permutation_round_trip(self):
+        payload = _top_p_mask_payload(n_layers=2, n_kv=2, head_dim=16)
+        blob = load_qlutattn_mask_blob(self._write_mask(payload))
+        x = torch.arange(2 * 2 * 16).reshape(2, 2, 16)
+        reordered = torch.gather(x, -1, blob["reorder_index"])
+        restored = torch.gather(reordered, -1, blob["inverse_reorder_index"])
+        torch.testing.assert_close(restored, x, atol=0, rtol=0)
+        reordered_mask = torch.gather(
+            blob["codebook_mask"], -1, blob["reorder_index"]
+        )
+        expected_prefix = (
+            torch.arange(16)[None, None, :]
+            < blob["nf2_count_per_head"].unsqueeze(-1)
+        ).to(torch.uint8)
+        torch.testing.assert_close(reordered_mask, expected_prefix, atol=0, rtol=0)
+
+    def test_top_p_mask_corruption_is_rejected(self):
+        cases = []
+
+        missing = _top_p_mask_payload()
+        missing.pop("previous_prefix_mass_per_layer")
+        cases.append(("missing statistics", missing))
+
+        bad_permutation = _top_p_mask_payload()
+        bad_permutation["reorder_index"] = bad_permutation["reorder_index"].clone()
+        bad_permutation["reorder_index"][0, 0, 0] = (
+            bad_permutation["reorder_index"][0, 0, 1]
+        )
+        cases.append(("non-permutation", bad_permutation))
+
+        bad_inverse = _top_p_mask_payload()
+        bad_inverse["inverse_reorder_index"] = torch.roll(
+            bad_inverse["inverse_reorder_index"], 1, dims=-1
+        )
+        cases.append(("bad inverse", bad_inverse))
+
+        bad_count_dtype = _top_p_mask_payload()
+        bad_count_dtype["nf2_count_per_head"] = (
+            bad_count_dtype["nf2_count_per_head"].long()
+        )
+        cases.append(("count dtype", bad_count_dtype))
+
+        bad_count = _top_p_mask_payload()
+        bad_count["nf2_count_per_layer"] = (
+            bad_count["nf2_count_per_layer"].clone()
+        )
+        bad_count["nf2_count_per_layer"][0] += 1
+        cases.append(("count value", bad_count))
+
+        bad_ranking = _top_p_mask_payload()
+        bad_ranking["ranking_score"] = bad_ranking["ranking_score"].clone()
+        bad_ranking["ranking_score"][0, 0, 0] += 1.0
+        cases.append(("ranking product", bad_ranking))
+
+        bad_mass = _top_p_mask_payload()
+        bad_mass["captured_mass_per_layer"] = (
+            bad_mass["captured_mass_per_layer"].clone()
+        )
+        bad_mass["captured_mass_per_layer"][0] += 0.01
+        cases.append(("captured mass", bad_mass))
+
+        bad_fraction = _top_p_mask_payload()
+        bad_fraction["actual_nf2_frac"] += 0.01
+        cases.append(("actual fraction", bad_fraction))
+
+        missing_method = _top_p_mask_payload()
+        missing_method.pop("selection_method")
+        cases.append(("missing selection method", missing_method))
+
+        unknown_method = _top_p_mask_payload()
+        unknown_method["selection_method"] = "other"
+        cases.append(("selection method", unknown_method))
+
+        bad_identity = _top_p_mask_payload()
+        bad_identity["tie_rule"] = "unstable"
+        cases.append(("identity metadata", bad_identity))
+        for label, key, value in (
+            ("nf2 implementation", "nf2_impl", "other"),
+            ("ranking signal", "ranking_signal", "other"),
+            ("model provenance", "model", ""),
+            ("calibration provenance", "calib_data", " "),
+            ("group size", "group_size", 0),
+            ("sample count", "num_samples", 0),
+            ("sample length", "sample_len", 0),
+            ("skip first", "skip_first", -1),
+            ("seed type", "seed", True),
+            ("layer geometry", "n_layers", 2),
+            ("head geometry", "n_kv", 2),
+            ("channel geometry", "head_dim", 63),
+        ):
+            corrupted = _top_p_mask_payload()
+            corrupted[key] = value
+            cases.append((label, corrupted))
+
+        float_format = _top_p_mask_payload()
+        float_format["format_version"] = 3.0
+        cases.append(("float format version", float_format))
+
+        for key in (
+            "actual_nf2_count",
+            "packed_bits_total",
+            "packed_k_values_total",
+        ):
+            missing_accounting = _top_p_mask_payload()
+            missing_accounting.pop(key)
+            cases.append((f"missing {key}", missing_accounting))
+
+            wrong_accounting = _top_p_mask_payload()
+            wrong_accounting[key] += 1
+            cases.append((f"wrong {key}", wrong_accounting))
+
+        for label, payload in cases:
+            with self.subTest(label=label):
+                with self.assertRaises(ValueError):
+                    load_qlutattn_mask_blob(self._write_mask(payload))
 
 
 class TestModelGuards(_EnvIsolation):
@@ -536,6 +989,31 @@ class TestMaskedKNumerics(_EnvIsolation):
         # slice — same math, different fp32 summation order (~2e-7).
         torch.testing.assert_close(out, (muB + expected).to(out.dtype), atol=1e-6, rtol=0.0)
 
+    def test_top_p_reordered_quantization_matches_canonical_mask(self):
+        canonical = _mask_payload(1, 2, 16)
+        top_p = _top_p_mask_payload(1, 2, 16, threshold=0.55)
+        torch.testing.assert_close(
+            top_p["codebook_mask"], canonical["codebook_mask"], atol=0, rtol=0
+        )
+
+        os.environ["QLUT_CB_MASK"] = self._write_mask(canonical)
+        canonical_cache = _cache_factory(build_variant(_args()))
+        os.environ["QLUT_CB_MASK"] = self._write_mask(top_p)
+        top_p_cache = _cache_factory(build_variant(_args()))
+
+        torch.manual_seed(2)
+        ks = (torch.randn(1, 2, 64, 16) + 1.5).to(torch.float16)
+        canonical_out = canonical_cache._quant_k_pertoken(ks, 0)
+        top_p_out = top_p_cache._quant_k_pertoken(ks, 0)
+
+        self.assertEqual(top_p_out.dtype, ks.dtype)
+        self.assertEqual(
+            top_p_cache.k_nf2_count_per_head[0].tolist(), [0, 11]
+        )
+        torch.testing.assert_close(
+            top_p_out, canonical_out, atol=torch.finfo(torch.float16).eps, rtol=0
+        )
+
     def test_decode_reuses_cached_pc_mean(self):
         os.environ["QLUT_CB_MASK"] = self._write_mask(_mask_payload(1, 2, 16))
         cfg = build_variant(_args())
@@ -550,14 +1028,14 @@ class TestMaskedKNumerics(_EnvIsolation):
 
 
 class TestManifestEngagement(_EnvIsolation):
-    def test_fresh_manifest_records_canonical_semantics_and_engagement(self):
-        os.environ["QLUT_CB_MASK"] = self._write_mask(_mask_payload(1, 1, 64))
+    def test_fresh_manifest_records_top_p_semantics_and_engagement(self):
+        os.environ["QLUT_CB_MASK"] = self._write_mask(_top_p_mask_payload(1, 1, 64))
         cfg = build_variant(_args())
 
         class _Batch(dict):
             def __init__(self):
                 super().__init__()
-                self.input_ids = torch.zeros(1, 192, dtype=torch.long)
+                self.input_ids = torch.zeros(1, 256, dtype=torch.long)
                 self["input_ids"] = self.input_ids
 
             def to(self, _device):
@@ -582,8 +1060,8 @@ class TestManifestEngagement(_EnvIsolation):
             def generate(self, **kwargs):
                 cache = kwargs["past_key_values"]
                 value = torch.linspace(
-                    -1, 1, 192 * 64, dtype=torch.float16
-                ).reshape(1, 1, 192, 64)
+                    -1, 1, 256 * 64, dtype=torch.float16
+                ).reshape(1, 1, 256, 64)
                 cache.update(value, value.clone(), 0, {})
                 return torch.cat(
                     [kwargs["input_ids"], torch.ones(1, 1, dtype=torch.long)], dim=1
@@ -614,14 +1092,371 @@ class TestManifestEngagement(_EnvIsolation):
             self.assertEqual(manifest["variant"]["name"], "qlutattn")
             self.assertEqual(manifest["variant"]["v_codebook"], "tile16_rescued")
             self.assertEqual(manifest["variant"]["vbits"], 2)
+            self.assertEqual(
+                manifest["variant"]["selection_method"], "layer_channel_top_p"
+            )
+            self.assertEqual(manifest["variant"]["top_p_threshold"], 0.55)
+            self.assertEqual(
+                manifest["variant"]["actual_nf2_frac"], cfg.actual_nf2_frac
+            )
+            for key in (
+                "actual_nf2_count",
+                "packed_bits_total",
+                "packed_k_values_total",
+            ):
+                self.assertEqual(
+                    manifest["variant"][key], getattr(cfg, key), key
+                )
             self.assertEqual(manifest["run_config_hash"], "run-hash")
             self.assertEqual(manifest["variant_semantic_hash"], variant_semantic_hash(cfg))
             self.assertTrue(manifest["mask_sha256"])
+            self.assertGreater(manifest["engagement"]["k_quant_calls"], 0)
+            self.assertGreater(manifest["engagement"]["k_quantized_tokens"], 0)
+            self.assertGreater(manifest["engagement"]["k_prompt_mean_layers"], 0)
+            self.assertEqual(
+                manifest["engagement"]["last_k_quant_mode"], "per_token:qlut"
+            )
             self.assertGreater(manifest["engagement"]["v_quant_calls"], 0)
             self.assertGreater(manifest["engagement"]["v_quantized_tokens"], 0)
             self.assertGreater(manifest["engagement"]["v_tile_blocks"], 0)
             self.assertEqual(manifest["engagement"]["last_v_quant_mode"], "tile16_rescued")
             self.assertEqual(manifest["engagement"]["last_v_tile_channels"], 64)
+
+
+    def test_control_refuses_missing_k_engagement_evidence(self):
+        os.environ["QLUT_CB_MASK"] = self._write_mask(
+            _control_mask_payload(
+                control_kind="same_cardinality",
+                n_layers=1,
+                n_kv=1,
+                head_dim=64,
+            )
+        )
+        cfg = build_variant(_args())
+
+        class _Batch(dict):
+            def __init__(self):
+                super().__init__()
+                self.input_ids = torch.zeros(1, 256, dtype=torch.long)
+                self["input_ids"] = self.input_ids
+
+            def to(self, _device):
+                return self
+
+        class _Tokenizer:
+            eos_token_id = 2
+            pad_token_id = 2
+
+            def __call__(self, *_args, **_kwargs):
+                return _Batch()
+
+            def decode(self, *_args, **_kwargs):
+                return "prediction"
+
+            def encode(self, *_args, **_kwargs):
+                return [3]
+
+        class _Model:
+            device = torch.device("cpu")
+
+            def __init__(self, missing):
+                self.missing = missing
+
+            def generate(self, **kwargs):
+                cache = kwargs["past_key_values"]
+                value = torch.linspace(
+                    -1, 1, 256 * 64, dtype=torch.float16
+                ).reshape(1, 1, 256, 64)
+                cache.update(value, value.clone(), 0, {})
+                if self.missing == "k_prompt_mean_layers":
+                    cache.k_pc_mean.clear()
+                elif self.missing == "last_k_quant_mode":
+                    cache.last_k_quant_mode = "wrong"
+                else:
+                    setattr(cache, self.missing, 0)
+                return torch.cat(
+                    [kwargs["input_ids"], torch.ones(1, 1, dtype=torch.long)],
+                    dim=1,
+                )
+
+        for field, evidence in (
+            ("k_quant_calls", "k_quant_calls=0"),
+            ("k_quantized_tokens", "k_quantized_tokens=0"),
+            ("k_prompt_mean_layers", "k_prompt_mean_layers=0"),
+            ("last_k_quant_mode", "last_k_quant_mode=wrong"),
+        ):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as td:
+                with self.assertRaisesRegex(RuntimeError, evidence):
+                    generate_dataset(
+                        model_name="model",
+                        model=_Model(field),
+                        tokenizer=_Tokenizer(),
+                        dataset="trec",
+                        records=[{
+                            "input": "question",
+                            "answers": ["answer"],
+                            "all_classes": [],
+                            "length": 1,
+                        }],
+                        prompt_format="{input}",
+                        max_model_len=32768,
+                        max_gen=1,
+                        out_path=Path(td) / "trec.jsonl",
+                        variant=cfg,
+                        model_family="default",
+                        expected_run_config_hash="run-hash",
+                    )
+
+
+class TestFixedTopKControlRuntime(_EnvIsolation):
+    def test_control_kinds_have_distinct_slugs_hashes_and_metadata(self):
+        configs = {}
+        slugs = {}
+        hashes = {}
+        for kind in ("same_cardinality", "exact_packed_bits"):
+            artifact = _control_mask_payload(control_kind=kind)
+            path = self._write_mask(artifact)
+            os.environ["QLUT_CB_MASK"] = path
+            cfg = build_variant(_args())
+            configs[kind] = cfg
+            slugs[kind] = method_layout_slug(cfg)
+            hashes[kind] = variant_semantic_hash(cfg)
+
+            file_digest = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+            self.assertEqual(cfg.selection_method, QLUTATTN_CONTROL_SELECTION_METHOD)
+            self.assertEqual(cfg.control_kind, kind)
+            self.assertEqual(cfg.reference_selection_method, "layer_channel_top_p")
+            self.assertEqual(cfg.reference_top_p_threshold, 0.55)
+            self.assertEqual(cfg.reference_mask_sha256, "a" * 64)
+            self.assertEqual(
+                cfg.reference_semantic_sha256,
+                artifact["reference_semantic_sha256"],
+            )
+            self.assertEqual(
+                cfg.reference_nf2_count, artifact["reference_nf2_count"]
+            )
+            self.assertEqual(cfg.actual_nf2_count, artifact["actual_nf2_count"])
+            self.assertEqual(
+                cfg.reference_packed_bits_total,
+                artifact["reference_packed_bits_total"],
+            )
+            self.assertEqual(cfg.packed_bits_total, artifact["packed_bits_total"])
+            self.assertEqual(cfg.packed_k_values_total, artifact["codebook_mask"].numel())
+            self.assertIn(kind.replace("_", "-"), slugs[kind])
+            self.assertIn(
+                f"kbpv{artifact['packed_bits_total']}of"
+                f"{artifact['codebook_mask'].numel()}",
+                slugs[kind],
+            )
+            self.assertTrue(slugs[kind].endswith(f"-m{file_digest}"))
+            self.assertEqual(cfg.tag, slugs[kind])
+
+            semantic = variant_semantic_payload(cfg)
+            for key in (
+                "control_kind",
+                "reference_selection_method",
+                "reference_top_p_threshold",
+                "reference_mask_sha256",
+                "reference_semantic_sha256",
+                "reference_nf2_count",
+                "actual_nf2_count",
+                "reference_packed_bits_total",
+                "packed_bits_total",
+                "packed_k_values_total",
+            ):
+                self.assertEqual(semantic[key], getattr(cfg, key), key)
+
+            preflight = resolve_longbench_preflight(_args())
+            self.assertEqual(preflight["method_slug"], slugs[kind])
+            self.assertEqual(preflight["variant_semantic_hash"], hashes[kind])
+            resolved = preflight["resolved_variant"]
+            for key in (
+                "selection_method",
+                "control_kind",
+                "reference_selection_method",
+                "reference_top_p_threshold",
+                "reference_mask_sha256",
+                "reference_semantic_sha256",
+                "reference_nf2_count",
+                "actual_nf2_count",
+                "reference_packed_bits_total",
+                "packed_bits_total",
+                "packed_k_values_total",
+            ):
+                self.assertEqual(resolved[key], getattr(cfg, key), key)
+
+        self.assertEqual(len(set(slugs.values())), 2)
+        self.assertEqual(len(set(hashes.values())), 2)
+        self.assertEqual(
+            configs["same_cardinality"].actual_nf2_count,
+            configs["same_cardinality"].reference_nf2_count,
+        )
+        self.assertEqual(
+            configs["exact_packed_bits"].packed_bits_total,
+            configs["exact_packed_bits"].reference_packed_bits_total,
+        )
+
+    def test_control_metadata_does_not_change_canonical_or_top_p_identity(self):
+        os.environ["QLUT_CB_MASK"] = self._write_mask(_mask_payload())
+        canonical = build_variant(_args())
+        self.assertEqual(method_layout_slug(canonical), "qlutattn")
+        os.environ["QLUT_CB_MASK"] = self._write_mask(_top_p_mask_payload())
+        top_p = build_variant(_args())
+        self.assertTrue(method_layout_slug(top_p).startswith("qlutattn-topp-p0p55-m"))
+
+        reference_only_keys = (
+            "control_kind",
+            "reference_selection_method",
+            "reference_top_p_threshold",
+            "reference_mask_sha256",
+            "reference_semantic_sha256",
+            "reference_nf2_count",
+            "reference_packed_bits_total",
+        )
+        accounting_keys = (
+            "actual_nf2_count",
+            "packed_bits_total",
+            "packed_k_values_total",
+        )
+        canonical_semantic = variant_semantic_payload(canonical)
+        for key in reference_only_keys + accounting_keys:
+            self.assertNotIn(key, canonical_semantic)
+        top_p_semantic = variant_semantic_payload(top_p)
+        for key in reference_only_keys:
+            self.assertNotIn(key, top_p_semantic)
+        for key in accounting_keys:
+            self.assertEqual(top_p_semantic[key], getattr(top_p, key), key)
+
+    def test_control_tampering_is_rejected(self):
+        cases = {}
+
+        identity = _control_mask_payload()
+        identity["tie_rule"] = "unstable"
+        cases["identity"] = identity
+
+        provenance = _control_mask_payload()
+        provenance["reference_mask_sha256"] = "A" * 64
+        cases["provenance"] = provenance
+
+        semantic_digest = _control_mask_payload()
+        semantic_digest["reference_semantic_sha256"] = "b" * 64
+        cases["valid lowercase semantic digest"] = semantic_digest
+
+        semantic_provenance = _control_mask_payload()
+        semantic_provenance["model"] = "tampered/model"
+        cases["semantic provenance"] = semantic_provenance
+
+        reference_mask = _control_mask_payload()
+        reference_mask["reference_codebook_mask"] = (
+            reference_mask["reference_codebook_mask"].clone()
+        )
+        reference_mask["reference_codebook_mask"][0, 0, 0] ^= 1
+        cases["reference mask"] = reference_mask
+
+        selected_mask = _control_mask_payload()
+        selected_mask["codebook_mask"] = selected_mask["codebook_mask"].clone()
+        selected_mask["codebook_mask"][0, 0, 0] ^= 1
+        cases["selected mask"] = selected_mask
+
+        count = _control_mask_payload()
+        count["actual_nf2_count"] += 1
+        cases["count"] = count
+
+        cost = _control_mask_payload()
+        cost["packed_bits_total"] += 1
+        cases["cost"] = cost
+
+        reorder = _control_mask_payload()
+        reorder["reorder_index"] = torch.roll(
+            reorder["reorder_index"], 1, dims=-1
+        )
+        cases["reorder"] = reorder
+
+        inverse = _control_mask_payload()
+        inverse["inverse_reorder_index"] = torch.roll(
+            inverse["inverse_reorder_index"], 1, dims=-1
+        )
+        cases["inverse"] = inverse
+
+        ranking = _control_mask_payload()
+        ranking["ranking_score"] = ranking["ranking_score"].clone()
+        ranking["ranking_score"][0, 0, 0] += 1.0
+        cases["ranking"] = ranking
+
+        overflow = _control_mask_payload()
+        overflow["sigma2"] = torch.full(
+            overflow["sigma2"].shape, 1e308, dtype=torch.float64
+        )
+        overflow["q_absmean"] = torch.ones_like(overflow["sigma2"])
+        overflow["ranking_score"] = (
+            overflow["sigma2"] * overflow["q_absmean"]
+        )
+        cases["ranking layer-mass overflow"] = overflow
+
+        for label, payload in cases.items():
+            with self.subTest(label=label):
+                with self.assertRaises(ValueError):
+                    load_qlutattn_mask_blob(self._write_mask(payload))
+
+    def test_tampering_fails_before_model_execution(self):
+        artifact = _control_mask_payload()
+        artifact["reference_packed_bits_total"] += 1
+        os.environ["QLUT_CB_MASK"] = self._write_mask(artifact)
+        args = _args(require_gpu1=False)
+        with mock.patch(
+            "kitty_sim.longbench.runner.AutoConfig.from_pretrained"
+        ) as config_loader, mock.patch(
+            "kitty_sim.longbench.runner.AutoModelForCausalLM.from_pretrained"
+        ) as model_loader:
+            with self.assertRaises(ValueError):
+                run_longbench(args)
+            config_loader.assert_not_called()
+            model_loader.assert_not_called()
+
+    def test_control_reordered_quantization_matches_direct_mask(self):
+        for kind in ("same_cardinality", "exact_packed_bits"):
+            with self.subTest(kind=kind):
+                control = _control_mask_payload(
+                    control_kind=kind,
+                    n_layers=1,
+                    n_kv=2,
+                    head_dim=16,
+                )
+                direct = {
+                    "codebook_mask": control["codebook_mask"].clone(),
+                    "codebooks": ["sign", "nf2"],
+                    "low_frac": control["low_frac"],
+                }
+                os.environ["QLUT_CB_MASK"] = self._write_mask(direct)
+                direct_cache = _cache_factory(build_variant(_args()))
+                os.environ["QLUT_CB_MASK"] = self._write_mask(control)
+                control_cache = _cache_factory(build_variant(_args()))
+
+                torch.manual_seed(23)
+                keys = (
+                    torch.randn(1, 2, 64, 16, dtype=torch.float32) + 1.25
+                ).to(torch.float16)
+                direct_out = direct_cache._quant_k_pertoken(keys, 0)
+                with mock.patch.object(
+                    control_cache,
+                    "_pt_apply_reordered_cb_segments",
+                    wraps=control_cache._pt_apply_reordered_cb_segments,
+                ) as reordered:
+                    control_out = control_cache._quant_k_pertoken(keys, 0)
+                reordered.assert_called_once()
+                self.assertEqual(
+                    control_cache.qlut_selection_method,
+                    QLUTATTN_CONTROL_SELECTION_METHOD,
+                )
+                self.assertIn(0, control_cache.k_reorder_index)
+                self.assertIn(0, control_cache.k_inverse_reorder_index)
+                self.assertIn(0, control_cache.k_nf2_count_per_head)
+                torch.testing.assert_close(
+                    control_out,
+                    direct_out,
+                    atol=torch.finfo(torch.float16).eps,
+                    rtol=0,
+                )
 
 
 if __name__ == "__main__":

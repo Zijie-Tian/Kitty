@@ -5,6 +5,7 @@ from __future__ import annotations
 import gc
 import hashlib
 import json
+import math
 import os
 import re
 import sys
@@ -47,7 +48,54 @@ NF2_IMPL_VERSION = "symnf2-v1"
 QLUTATTN_VARIANT = "qlutattn"
 QLUTATTN_BIN_CODEBOOKS = ("sign", "nf2")
 QLUTATTN_SIGN_FRACTION = 0.65
+QLUTATTN_TOP_P_SELECTION_METHOD = "layer_channel_top_p"
+QLUTATTN_TOP_P_FORMAT_VERSION = 3
+QLUTATTN_TOP_P_SELECTION_AXIS = "per_layer_flattened_kv_head_channel"
+QLUTATTN_TOP_P_THRESHOLD_RULE = "minimal_desc_prefix_cumsum_ge_p"
+QLUTATTN_TOP_P_TIE_RULE = "score_desc_flat_index_asc"
+QLUTATTN_TOP_P_SCORE_DTYPE = "float64"
+QLUTATTN_CONTROL_SELECTION_METHOD = "layer_uniform_fixed_top_k_control"
+QLUTATTN_CONTROL_FORMAT_VERSION = 2
+QLUTATTN_CONTROL_KINDS = ("same_cardinality", "exact_packed_bits")
+QLUTATTN_REFERENCE_SEMANTIC_HASH_DOMAIN = (
+    "qlutattn_top_p_reference_semantics_v1"
+)
 QLUTATTN_V_TILE_CHANNELS = 64
+
+
+def _top_p_threshold_slug(value: float) -> str:
+    text = repr(float(value))
+    if "e" not in text.lower():
+        whole, separator, fraction = text.partition(".")
+        fraction = fraction if separator else ""
+        text = f"{whole}.{fraction.ljust(2, '0')}"
+    return text.replace(".", "p").replace("+", "")
+
+
+def _qlutattn_top_p_slug(config: Any) -> str:
+    if not config.pertoken_cb_mask:
+        raise ValueError("top-p qlutattn requires a codebook-mask path")
+    threshold = _top_p_threshold_slug(config.top_p_threshold)
+    mask_digest = _sha256_file(config.pertoken_cb_mask)
+    return f"qlutattn-topp-p{threshold}-m{mask_digest}"
+
+
+def _qlutattn_control_slug(config: Any) -> str:
+    if not config.pertoken_cb_mask:
+        raise ValueError("fixed-top-k qlutattn control requires a codebook-mask path")
+    if config.control_kind not in QLUTATTN_CONTROL_KINDS:
+        raise ValueError(
+            f"unsupported qlutattn control_kind={config.control_kind!r}"
+        )
+    if config.packed_bits_total is None or config.packed_k_values_total is None:
+        raise ValueError("fixed-top-k qlutattn control requires exact packed K cost")
+    kind = config.control_kind.replace("_", "-")
+    mask_digest = _sha256_file(config.pertoken_cb_mask)
+    return (
+        f"qlutattn-control-{kind}-"
+        f"kbpv{config.packed_bits_total}of{config.packed_k_values_total}-"
+        f"m{mask_digest}"
+    )
 
 
 @dataclass(frozen=True)
@@ -98,6 +146,24 @@ class VariantConfig:
     # qlutattn: path to the OFFLINE per-(layer, kv-head, channel) codebook mask
     # (scripts/calibrate_qlutattn_mask.py). Required for the qlut K codebook.
     pertoken_cb_mask: Optional[str] = None
+    # Optional research selection metadata. Canonical qlutattn leaves these
+    # unset; top-p populates all three, while controls populate the method and
+    # actual fraction plus the explicit reference/cost fields below.
+    selection_method: Optional[str] = None
+    top_p_threshold: Optional[float] = None
+    actual_nf2_frac: Optional[float] = None
+    # Exact theoretical packed-K accounting. Top-p and fixed-top-k controls
+    # populate actual/count/cost fields; canonical qlutattn leaves them unset.
+    control_kind: Optional[str] = None
+    reference_selection_method: Optional[str] = None
+    reference_top_p_threshold: Optional[float] = None
+    reference_mask_sha256: Optional[str] = None
+    reference_semantic_sha256: Optional[str] = None
+    reference_nf2_count: Optional[int] = None
+    actual_nf2_count: Optional[int] = None
+    reference_packed_bits_total: Optional[int] = None
+    packed_bits_total: Optional[int] = None
+    packed_k_values_total: Optional[int] = None
     # nf2 implementation marker: "symnf2-v1" whenever the effective codebooks include
     # "nf2" (static bin_codebooks or the offline mask blob), None otherwise. Purely a
     # run_config_hash version gate -- Lloyd-era nf2 manifests must NOT be resumed or
@@ -118,8 +184,10 @@ class VariantConfig:
             return "fp16"
         ratio = str(self.promote_ratio).replace(".", "p")
         if self.k_codebook == "qlut":
-            # The canonical qlutattn variant is fully fixed (sign/nf2 f50 K,
-            # tile16c64 V2), so its tag is just the name.
+            if self.selection_method == QLUTATTN_TOP_P_SELECTION_METHOD:
+                return _qlutattn_top_p_slug(self)
+            if self.selection_method == QLUTATTN_CONTROL_SELECTION_METHOD:
+                return _qlutattn_control_slug(self)
             return self.name
         if self.shadowkv:
             return f"{self.name}_sb{self.sparse_budget}_r{self.rank}_c{self.chunk_size}"
@@ -269,15 +337,865 @@ def _reject_pertoken_block_env() -> None:
     )
 
 
-def load_qlutattn_mask_blob(mask_path: str) -> dict[str, Any]:
-    """Load and strictly validate the offline qlutattn codebook mask (CPU-only).
+def _validate_qlutattn_top_p_blob(
+    blob: dict[str, Any], mask_path: str, mask: torch.Tensor
+) -> None:
+    """Validate the layer-global top-p selection and head-local layout."""
+    shape = tuple(mask.shape)
+    n_layers, n_heads, head_dim = shape
+    if not all(dim > 0 for dim in shape):
+        raise ValueError(
+            f"qlutattn top-p codebook_mask dimensions must be positive; got {shape}"
+        )
 
-    The runtime must not trust the blob's metadata alone: the mask tensor
-    itself is checked (dtype, rank, value set, actual sign fraction). Legacy
-    metadata keys (``target_bits``/``nominal_bits``) are ignored. The shape is
-    validated against the model config separately in
-    ``validate_qlutattn_model_config``.
-    """
+    def require_tensor(
+        key: str, expected_shape: tuple[int, ...], dtype: torch.dtype | None = None
+    ) -> torch.Tensor:
+        value = blob.get(key)
+        if not isinstance(value, torch.Tensor):
+            raise ValueError(
+                f"qlutattn top-p mask {mask_path} requires tensor field {key!r}"
+            )
+        if tuple(value.shape) != expected_shape:
+            raise ValueError(
+                f"qlutattn top-p field {key!r} must have shape {expected_shape}; "
+                f"got {tuple(value.shape)}"
+            )
+        if dtype is not None and value.dtype != dtype:
+            raise ValueError(
+                f"qlutattn top-p field {key!r} must have dtype {dtype}; "
+                f"got {value.dtype}"
+            )
+        return value
+
+    identity_fields = {
+        "format_version": QLUTATTN_TOP_P_FORMAT_VERSION,
+        "selection_axis": QLUTATTN_TOP_P_SELECTION_AXIS,
+        "threshold_rule": QLUTATTN_TOP_P_THRESHOLD_RULE,
+        "tie_rule": QLUTATTN_TOP_P_TIE_RULE,
+        "score_dtype_for_selection": QLUTATTN_TOP_P_SCORE_DTYPE,
+        "nf2_impl": NF2_IMPL_VERSION,
+        "ranking_signal": "sigma2_x_q",
+    }
+    for key, expected in identity_fields.items():
+        actual = blob.get(key)
+        if (key == "format_version" and isinstance(actual, bool)) or actual != expected:
+            raise ValueError(
+                f"qlutattn top-p field {key!r} must equal {expected!r}; "
+                f"got {actual!r}"
+            )
+        if key == "format_version" and (
+            isinstance(actual, bool) or not isinstance(actual, int)
+        ):
+            raise ValueError(
+                "qlutattn top-p field 'format_version' must be an integer"
+            )
+    if blob.get("codebooks") != list(QLUTATTN_BIN_CODEBOOKS):
+        raise ValueError(
+            "qlutattn top-p codebooks must be exactly ['sign', 'nf2']"
+        )
+    for key in ("model", "calib_data"):
+        value = blob.get(key)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(
+                f"qlutattn top-p field {key!r} must be a nonempty string; "
+                f"got {value!r}"
+            )
+    for key in ("group_size", "num_samples", "sample_len"):
+        value = blob.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(
+                f"qlutattn top-p field {key!r} must be a positive integer; "
+                f"got {value!r}"
+            )
+    skip_first = blob.get("skip_first")
+    if (
+        isinstance(skip_first, bool)
+        or not isinstance(skip_first, int)
+        or skip_first < 0
+    ):
+        raise ValueError(
+            "qlutattn top-p field 'skip_first' must be a nonnegative integer; "
+            f"got {skip_first!r}"
+        )
+    seed = blob.get("seed")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise ValueError(
+            f"qlutattn top-p field 'seed' must be an integer; got {seed!r}"
+        )
+    for key, expected in (
+        ("n_layers", n_layers),
+        ("n_kv", n_heads),
+        ("head_dim", head_dim),
+    ):
+        value = blob.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value != expected:
+            raise ValueError(
+                f"qlutattn top-p field {key!r} must match codebook_mask "
+                f"geometry ({expected}); got {value!r}"
+            )
+
+    threshold_raw = blob.get("top_p_threshold")
+    if not isinstance(threshold_raw, float) or not math.isfinite(threshold_raw):
+        raise ValueError(
+            f"qlutattn top-p mask {mask_path} requires a finite float "
+            f"top_p_threshold; got {threshold_raw!r}"
+        )
+    threshold = float(threshold_raw)
+    if not 0.0 < threshold <= 1.0:
+        raise ValueError(
+            f"qlutattn top_p_threshold must be in (0, 1]; got {threshold}"
+        )
+
+    values = set(torch.unique(mask).tolist())
+    if not values.issubset({0, 1}):
+        raise ValueError(
+            "qlutattn top-p codebook_mask values must be in {0, 1} "
+            f"(0=sign, 1=nf2); got {sorted(values)}"
+        )
+
+    expected_int_fields = {
+        "actual_nf2_count": int(mask.sum()),
+        "packed_bits_total": _qlutattn_packed_k_bits_total(mask),
+        "packed_k_values_total": mask.numel(),
+    }
+    for key, expected in expected_int_fields.items():
+        value = blob.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value != expected:
+            raise ValueError(
+                f"qlutattn top-p field {key!r} must equal recomputed "
+                f"value {expected}; got {value!r}"
+            )
+
+    reorder = require_tensor("reorder_index", shape, torch.int64)
+    inverse = require_tensor("inverse_reorder_index", shape, torch.int64)
+    count_per_head = require_tensor(
+        "nf2_count_per_head", (n_layers, n_heads), torch.int32
+    )
+    count_per_layer = require_tensor(
+        "nf2_count_per_layer", (n_layers,), torch.int32
+    )
+    actual_count_per_head = (mask == 1).sum(dim=-1).to(torch.int32)
+    actual_count_per_layer = actual_count_per_head.sum(dim=-1).to(torch.int32)
+    if not torch.equal(count_per_head, actual_count_per_head):
+        raise ValueError(
+            "qlutattn top-p nf2_count_per_head does not match codebook_mask"
+        )
+    if not torch.equal(count_per_layer, actual_count_per_layer):
+        raise ValueError(
+            "qlutattn top-p nf2_count_per_layer does not match codebook_mask"
+        )
+
+    identity = torch.arange(head_dim, dtype=torch.int64).view(1, 1, head_dim)
+    identity = identity.expand(n_layers, n_heads, head_dim)
+    if not torch.equal(torch.sort(reorder, dim=-1).values, identity):
+        raise ValueError(
+            "qlutattn top-p reorder_index must be a permutation of every head"
+        )
+    if not torch.equal(torch.sort(inverse, dim=-1).values, identity):
+        raise ValueError(
+            "qlutattn top-p inverse_reorder_index must be a permutation of every head"
+        )
+    if not torch.equal(torch.gather(reorder, -1, inverse), identity):
+        raise ValueError(
+            "qlutattn top-p inverse_reorder_index is not the inverse of reorder_index"
+        )
+
+    expected_reorder = torch.empty_like(reorder)
+    for layer_idx in range(n_layers):
+        for head_idx in range(n_heads):
+            head_mask = mask[layer_idx, head_idx]
+            expected_reorder[layer_idx, head_idx] = torch.cat(
+                (
+                    torch.nonzero(head_mask == 1, as_tuple=False).flatten(),
+                    torch.nonzero(head_mask == 0, as_tuple=False).flatten(),
+                )
+            )
+    if not torch.equal(reorder, expected_reorder):
+        raise ValueError(
+            "qlutattn top-p reorder_index must be the original-index-stable "
+            "head-local [NF2 prefix | sign suffix] permutation"
+        )
+    reordered_mask = torch.gather(mask, -1, reorder)
+    expected_prefix = (
+        torch.arange(head_dim).view(1, 1, head_dim)
+        < count_per_head.unsqueeze(-1)
+    ).to(torch.uint8)
+    if not torch.equal(reordered_mask, expected_prefix):
+        raise ValueError(
+            "qlutattn top-p reorder/count metadata does not form an NF2 prefix"
+        )
+
+    sigma2 = require_tensor("sigma2", shape)
+    q_absmean = require_tensor("q_absmean", shape)
+    ranking = require_tensor("ranking_score", shape, torch.float64)
+    for key, statistic in (("sigma2", sigma2), ("q_absmean", q_absmean)):
+        if not torch.is_floating_point(statistic):
+            raise ValueError(
+                f"qlutattn top-p field {key!r} must be floating point; "
+                f"got {statistic.dtype}"
+            )
+        if not bool(torch.isfinite(statistic).all()) or bool((statistic < 0).any()):
+            raise ValueError(
+                f"qlutattn top-p field {key!r} must contain finite nonnegative values"
+            )
+    if not bool(torch.isfinite(ranking).all()) or bool((ranking < 0).any()):
+        raise ValueError(
+            "qlutattn top-p ranking_score must contain finite nonnegative values"
+        )
+    if not torch.equal(ranking, sigma2.double() * q_absmean.double()):
+        raise ValueError(
+            "qlutattn top-p ranking_score must equal sigma2.double() * "
+            "q_absmean.double() exactly"
+        )
+
+    ratio_per_layer = require_tensor(
+        "nf2_ratio_per_layer", (n_layers,), torch.float64
+    )
+    captured = require_tensor(
+        "captured_mass_per_layer", (n_layers,), torch.float64
+    )
+    previous = require_tensor(
+        "previous_prefix_mass_per_layer", (n_layers,), torch.float64
+    )
+    boundary = require_tensor(
+        "boundary_score_per_layer", (n_layers,), torch.float64
+    )
+    for key, statistic in (
+        ("nf2_ratio_per_layer", ratio_per_layer),
+        ("captured_mass_per_layer", captured),
+        ("previous_prefix_mass_per_layer", previous),
+        ("boundary_score_per_layer", boundary),
+    ):
+        if not bool(torch.isfinite(statistic).all()):
+            raise ValueError(
+                f"qlutattn top-p field {key!r} must contain only finite values"
+            )
+
+    expected_mask = torch.zeros_like(mask).reshape(n_layers, -1)
+    expected_counts = torch.empty(n_layers, dtype=torch.int32)
+    expected_captured = torch.empty(n_layers, dtype=torch.float64)
+    expected_previous = torch.empty(n_layers, dtype=torch.float64)
+    expected_boundary = torch.empty(n_layers, dtype=torch.float64)
+    flat_ranking = ranking.reshape(n_layers, -1)
+    for layer_idx in range(n_layers):
+        order = torch.argsort(
+            flat_ranking[layer_idx], descending=True, stable=True
+        )
+        ordered_scores = flat_ranking[layer_idx, order]
+        cumulative = ordered_scores.cumsum(dim=0)
+        total = cumulative[-1]
+        if not bool(total > 0):
+            raise ValueError(
+                f"qlutattn top-p ranking_score layer {layer_idx} must have "
+                "positive total mass"
+            )
+        target = total * threshold
+        boundary_idx = int(torch.searchsorted(cumulative, target, right=False))
+        if boundary_idx >= order.numel():
+            raise ValueError(
+                f"qlutattn top-p threshold {threshold} is unreachable at "
+                f"layer {layer_idx}"
+            )
+        count = boundary_idx + 1
+        expected_mask[layer_idx, order[:count]] = 1
+        expected_counts[layer_idx] = count
+        expected_captured[layer_idx] = cumulative[count - 1] / total
+        expected_previous[layer_idx] = (
+            cumulative[count - 2] / total if count > 1 else 0.0
+        )
+        expected_boundary[layer_idx] = ordered_scores[count - 1]
+
+    if not torch.equal(mask.reshape(n_layers, -1), expected_mask):
+        raise ValueError(
+            "qlutattn top-p codebook_mask is not the deterministic "
+            "score-desc/flat-index prefix selected by top_p_threshold"
+        )
+    if not torch.equal(count_per_layer, expected_counts):
+        raise ValueError(
+            "qlutattn top-p nf2_count_per_layer does not match the selected prefix"
+        )
+    expected_ratio = expected_counts.double() / float(n_heads * head_dim)
+    if not torch.equal(ratio_per_layer, expected_ratio):
+        raise ValueError(
+            "qlutattn top-p nf2_ratio_per_layer does not match selected counts"
+        )
+    for key, actual, expected in (
+        ("captured_mass_per_layer", captured, expected_captured),
+        ("previous_prefix_mass_per_layer", previous, expected_previous),
+        ("boundary_score_per_layer", boundary, expected_boundary),
+    ):
+        if not torch.equal(actual, expected):
+            raise ValueError(
+                f"qlutattn top-p {key} does not match ranking_score selection"
+            )
+
+    actual_nf2 = blob.get("actual_nf2_frac")
+    low_frac = blob.get("low_frac")
+    if not isinstance(actual_nf2, float) or not math.isfinite(actual_nf2):
+        raise ValueError(
+            f"qlutattn top-p actual_nf2_frac must be a finite float; "
+            f"got {actual_nf2!r}"
+        )
+    if not isinstance(low_frac, float) or not math.isfinite(low_frac):
+        raise ValueError(
+            f"qlutattn top-p low_frac must be a finite float; got {low_frac!r}"
+        )
+    expected_actual_nf2 = int(actual_count_per_layer.sum()) / mask.numel()
+    expected_low_frac = (mask.numel() - int(actual_count_per_layer.sum())) / mask.numel()
+    if actual_nf2 != expected_actual_nf2:
+        raise ValueError(
+            "qlutattn top-p actual_nf2_frac does not match codebook_mask"
+        )
+    if low_frac != expected_low_frac:
+        raise ValueError(
+            "qlutattn top-p low_frac does not match codebook_mask"
+        )
+
+
+def _qlutattn_packed_k_bits_total(codebook_mask: torch.Tensor) -> int:
+    """Exact packed K bits for one token over a full QLUTATTN mask."""
+    if (
+        codebook_mask.ndim != 3
+        or codebook_mask.dtype != torch.uint8
+        or not bool(((codebook_mask == 0) | (codebook_mask == 1)).all())
+    ):
+        raise ValueError(
+            "qlutattn packed-bit accounting requires a uint8 "
+            "[layer, kv_head, channel] sign/NF2 mask"
+        )
+    head_dim = codebook_mask.shape[-1]
+    nf2_counts = codebook_mask.to(torch.int64).sum(dim=-1)
+    code_bits = int(((head_dim - nf2_counts) + 2 * nf2_counts).sum())
+    scale_bits = 16 * int((nf2_counts > 0).sum())
+    scale_bits += 16 * int((nf2_counts < head_dim).sum())
+    return code_bits + scale_bits
+
+
+def _recompute_qlutattn_top_p_reference(
+    ranking_score: torch.Tensor, threshold: float
+) -> torch.Tensor:
+    """Recompute the deterministic layer-global top-p reference mask."""
+    n_layers = ranking_score.shape[0]
+    flat_score = ranking_score.reshape(n_layers, -1)
+    layer_mass = flat_score.sum(dim=1, dtype=torch.float64)
+    if not bool(torch.isfinite(layer_mass).all()):
+        raise ValueError("qlutattn control ranking_score layer mass overflowed FP64")
+    nonpositive_layers = torch.nonzero(
+        layer_mass <= 0, as_tuple=False
+    ).flatten()
+    if nonpositive_layers.numel():
+        indices = ", ".join(str(int(index)) for index in nonpositive_layers)
+        raise ValueError(
+            "qlutattn control ranking_score must have positive total mass in "
+            f"every layer; invalid layer(s): {indices}"
+        )
+    reference = torch.zeros_like(ranking_score, dtype=torch.uint8)
+    flat_reference = reference.reshape(n_layers, -1)
+    for layer_idx in range(n_layers):
+        order = torch.argsort(
+            flat_score[layer_idx], descending=True, stable=True
+        )
+        ordered_scores = flat_score[layer_idx, order]
+        cumulative = ordered_scores.cumsum(dim=0)
+        total = cumulative[-1]
+        boundary_idx = int(
+            torch.searchsorted(cumulative, total * threshold, right=False)
+        )
+        if boundary_idx >= order.numel():
+            raise ValueError(
+                f"qlutattn control reference threshold {threshold} is "
+                f"unreachable at layer {layer_idx}"
+            )
+        flat_reference[layer_idx, order[: boundary_idx + 1]] = 1
+    return reference
+
+
+def _uniform_layer_control_for_total(
+    ranking_score: torch.Tensor,
+    reference_mask: torch.Tensor,
+    orders: list[torch.Tensor],
+    total_nf2: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Select a deterministic near-uniform layer top-k mask for one total."""
+    n_layers, n_heads, head_dim = ranking_score.shape
+    channels_per_layer = n_heads * head_dim
+    floor_count, remainder = divmod(int(total_nf2), n_layers)
+    if floor_count <= 0 or floor_count + bool(remainder) >= channels_per_layer:
+        raise ValueError(
+            "qlutattn control NF2 cardinality cannot form nontrivial "
+            "uniform layer counts"
+        )
+    flat_score = ranking_score.reshape(n_layers, -1)
+    next_scores = torch.tensor(
+        [
+            float(flat_score[layer_idx, orders[layer_idx][floor_count]])
+            for layer_idx in range(n_layers)
+        ],
+        dtype=torch.float64,
+    )
+    extra_layers = set(
+        torch.argsort(next_scores, descending=True, stable=True)[:remainder].tolist()
+    )
+    selected = torch.zeros_like(reference_mask)
+    count_per_layer = torch.empty(n_layers, dtype=torch.int32)
+    for layer_idx in range(n_layers):
+        count = floor_count + int(layer_idx in extra_layers)
+        selected[layer_idx].reshape(-1)[orders[layer_idx][:count]] = 1
+        count_per_layer[layer_idx] = count
+    return selected, count_per_layer
+
+
+def _recompute_qlutattn_uniform_control(
+    ranking_score: torch.Tensor,
+    reference_mask: torch.Tensor,
+    control_kind: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Recompute either approved uniform fixed-top-k control."""
+    reference_nf2 = int(reference_mask.sum())
+    flat_score = ranking_score.reshape(ranking_score.shape[0], -1)
+    orders = [
+        torch.argsort(flat_score[layer_idx], descending=True, stable=True)
+        for layer_idx in range(ranking_score.shape[0])
+    ]
+    if control_kind == "same_cardinality":
+        return _uniform_layer_control_for_total(
+            ranking_score, reference_mask, orders, reference_nf2
+        )
+    if control_kind != "exact_packed_bits":
+        raise ValueError(f"unsupported qlutattn control_kind={control_kind!r}")
+
+    target_bits = _qlutattn_packed_k_bits_total(reference_mask)
+    max_total = reference_mask.numel() - 1
+    max_distance = max(reference_nf2 - 1, max_total - reference_nf2)
+    for distance in range(max_distance + 1):
+        candidates = (reference_nf2,) if distance == 0 else (
+            reference_nf2 - distance,
+            reference_nf2 + distance,
+        )
+        for total_nf2 in candidates:
+            if not 1 <= total_nf2 <= max_total:
+                continue
+            try:
+                selected, count_per_layer = _uniform_layer_control_for_total(
+                    ranking_score, reference_mask, orders, total_nf2
+                )
+            except ValueError:
+                continue
+            if _qlutattn_packed_k_bits_total(selected) == target_bits:
+                return selected, count_per_layer
+    raise ValueError(
+        "no uniform per-layer top-k mask matches the reference packed bit cost"
+    )
+
+
+def _recompute_qlutattn_head_layout(
+    codebook_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build stable head-local [NF2 prefix | sign suffix] layout metadata."""
+    n_layers, n_heads, head_dim = codebook_mask.shape
+    identity = torch.arange(head_dim, dtype=torch.int64)
+    reorder = torch.empty(
+        (n_layers, n_heads, head_dim), dtype=torch.int64
+    )
+    inverse = torch.empty_like(reorder)
+    count_per_head = codebook_mask.to(torch.int32).sum(
+        dim=-1, dtype=torch.int32
+    )
+    for layer_idx in range(n_layers):
+        for head_idx in range(n_heads):
+            head_mask = codebook_mask[layer_idx, head_idx].bool()
+            index = torch.cat((identity[head_mask], identity[~head_mask]))
+            reorder[layer_idx, head_idx] = index
+            inverse[layer_idx, head_idx, index] = identity
+    return reorder, inverse, count_per_head
+
+
+def _qlutattn_reference_semantic_sha256(
+    sigma2: torch.Tensor,
+    q_absmean: torch.Tensor,
+    reference_mask: torch.Tensor,
+    *,
+    top_p_threshold: float,
+    group_size: int,
+    skip_first: int,
+    model: str,
+    calib_data: str,
+    num_samples: int,
+    sample_len: int,
+    seed: int,
+) -> str:
+    """Hash top-p reference semantics using the calibration v3 encoding."""
+    n_layers, n_kv, head_dim = reference_mask.shape
+    metadata = {
+        "semantic_hash_domain": QLUTATTN_REFERENCE_SEMANTIC_HASH_DOMAIN,
+        "top_p_format_version": QLUTATTN_TOP_P_FORMAT_VERSION,
+        "selection_method": QLUTATTN_TOP_P_SELECTION_METHOD,
+        "selection_axis": QLUTATTN_TOP_P_SELECTION_AXIS,
+        "threshold_rule": QLUTATTN_TOP_P_THRESHOLD_RULE,
+        "tie_rule": QLUTATTN_TOP_P_TIE_RULE,
+        "score_dtype_for_selection": QLUTATTN_TOP_P_SCORE_DTYPE,
+        "top_p_threshold_hex": float(top_p_threshold).hex(),
+        "codebooks": list(QLUTATTN_BIN_CODEBOOKS),
+        "nf2_impl": NF2_IMPL_VERSION,
+        "ranking_signal": "sigma2_x_q",
+        "model": model,
+        "calib_data": calib_data,
+        "group_size": group_size,
+        "skip_first": skip_first,
+        "num_samples": num_samples,
+        "sample_len": sample_len,
+        "seed": seed,
+        "n_layers": n_layers,
+        "n_kv": n_kv,
+        "head_dim": head_dim,
+        "statistics_encoding": "ieee754_binary64_little_endian_c_order",
+        "reference_mask_encoding": "uint8_c_order",
+    }
+    metadata_bytes = json.dumps(
+        metadata,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    sigma2_values = (
+        sigma2.detach()
+        .to(device="cpu", dtype=torch.float64)
+        .contiguous()
+        .numpy()
+        .astype("<f8", copy=False)
+    )
+    q_absmean_values = (
+        q_absmean.detach()
+        .to(device="cpu", dtype=torch.float64)
+        .contiguous()
+        .numpy()
+        .astype("<f8", copy=False)
+    )
+    reference_mask_values = (
+        reference_mask.detach()
+        .to(device="cpu", dtype=torch.uint8)
+        .contiguous()
+        .numpy()
+    )
+    digest = hashlib.sha256()
+    for label, values in (
+        ("metadata_json_utf8", metadata_bytes),
+        ("sigma2_float64_le", sigma2_values),
+        ("q_absmean_float64_le", q_absmean_values),
+        ("reference_mask_uint8", reference_mask_values),
+    ):
+        label_bytes = label.encode("ascii")
+        value_bytes = memoryview(values).cast("B")
+        digest.update(len(label_bytes).to_bytes(4, "big"))
+        digest.update(label_bytes)
+        digest.update(len(value_bytes).to_bytes(8, "big"))
+        digest.update(value_bytes)
+    return digest.hexdigest()
+
+
+def _validate_qlutattn_control_blob(
+    blob: dict[str, Any], mask_path: str, mask: torch.Tensor
+) -> None:
+    """Strictly validate an explicit layer-uniform fixed-top-k control."""
+    shape = tuple(mask.shape)
+    n_layers, n_heads, head_dim = shape
+    if not all(dim > 0 for dim in shape):
+        raise ValueError(
+            f"qlutattn control codebook_mask dimensions must be positive; got {shape}"
+        )
+
+    def require_tensor(
+        key: str, expected_shape: tuple[int, ...], dtype: torch.dtype | None = None
+    ) -> torch.Tensor:
+        value = blob.get(key)
+        if not isinstance(value, torch.Tensor):
+            raise ValueError(
+                f"qlutattn control mask {mask_path} requires tensor field {key!r}"
+            )
+        if tuple(value.shape) != expected_shape:
+            raise ValueError(
+                f"qlutattn control field {key!r} must have shape "
+                f"{expected_shape}; got {tuple(value.shape)}"
+            )
+        if dtype is not None and value.dtype != dtype:
+            raise ValueError(
+                f"qlutattn control field {key!r} must have dtype {dtype}; "
+                f"got {value.dtype}"
+            )
+        return value
+
+    identity_fields = {
+        "selection_method": QLUTATTN_CONTROL_SELECTION_METHOD,
+        "format_version": QLUTATTN_CONTROL_FORMAT_VERSION,
+        "selection_axis": QLUTATTN_TOP_P_SELECTION_AXIS,
+        "tie_rule": QLUTATTN_TOP_P_TIE_RULE,
+        "score_dtype_for_selection": QLUTATTN_TOP_P_SCORE_DTYPE,
+        "reference_selection_method": QLUTATTN_TOP_P_SELECTION_METHOD,
+        "nf2_impl": NF2_IMPL_VERSION,
+        "ranking_signal": "sigma2_x_q",
+    }
+    for key, expected in identity_fields.items():
+        actual = blob.get(key)
+        if (
+            (key == "format_version" and (
+                isinstance(actual, bool) or not isinstance(actual, int)
+            ))
+            or actual != expected
+        ):
+            raise ValueError(
+                f"qlutattn control field {key!r} must equal {expected!r}; "
+                f"got {actual!r}"
+            )
+    control_kind = blob.get("control_kind")
+    if control_kind not in QLUTATTN_CONTROL_KINDS:
+        raise ValueError(
+            f"qlutattn control_kind must be one of {QLUTATTN_CONTROL_KINDS}; "
+            f"got {control_kind!r}"
+        )
+    if blob.get("codebooks") != list(QLUTATTN_BIN_CODEBOOKS):
+        raise ValueError(
+            "qlutattn control codebooks must be exactly ['sign', 'nf2']"
+        )
+
+    reference_sha = blob.get("reference_mask_sha256")
+    if (
+        not isinstance(reference_sha, str)
+        or re.fullmatch(r"[0-9a-f]{64}", reference_sha) is None
+    ):
+        raise ValueError(
+            "qlutattn control reference_mask_sha256 must be exactly 64 "
+            "lowercase hexadecimal characters"
+        )
+    reference_semantic_sha = blob.get("reference_semantic_sha256")
+    if (
+        not isinstance(reference_semantic_sha, str)
+        or re.fullmatch(r"[0-9a-f]{64}", reference_semantic_sha) is None
+    ):
+        raise ValueError(
+            "qlutattn control reference_semantic_sha256 must be exactly 64 "
+            "lowercase hexadecimal characters"
+        )
+    for key in ("model", "calib_data"):
+        value = blob.get(key)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(
+                f"qlutattn control field {key!r} must be a nonempty string; "
+                f"got {value!r}"
+            )
+    for key in ("group_size", "num_samples", "sample_len"):
+        value = blob.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(
+                f"qlutattn control field {key!r} must be a positive integer; "
+                f"got {value!r}"
+            )
+    skip_first = blob.get("skip_first")
+    if (
+        isinstance(skip_first, bool)
+        or not isinstance(skip_first, int)
+        or skip_first < 0
+    ):
+        raise ValueError(
+            "qlutattn control field 'skip_first' must be a nonnegative integer; "
+            f"got {skip_first!r}"
+        )
+    seed = blob.get("seed")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise ValueError(
+            f"qlutattn control field 'seed' must be an integer; got {seed!r}"
+        )
+    for key, expected in (
+        ("n_layers", n_layers),
+        ("n_kv", n_heads),
+        ("head_dim", head_dim),
+    ):
+        value = blob.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value != expected:
+            raise ValueError(
+                f"qlutattn control field {key!r} must match codebook_mask "
+                f"geometry ({expected}); got {value!r}"
+            )
+
+    threshold_raw = blob.get("reference_top_p_threshold")
+    if not isinstance(threshold_raw, float) or not math.isfinite(threshold_raw):
+        raise ValueError(
+            "qlutattn control reference_top_p_threshold must be a finite float; "
+            f"got {threshold_raw!r}"
+        )
+    threshold = float(threshold_raw)
+    if not 0.0 < threshold <= 1.0:
+        raise ValueError(
+            "qlutattn control reference_top_p_threshold must be in (0, 1]; "
+            f"got {threshold}"
+        )
+
+    reference_mask = require_tensor(
+        "reference_codebook_mask", shape, torch.uint8
+    )
+    if not bool(((reference_mask == 0) | (reference_mask == 1)).all()):
+        raise ValueError(
+            "qlutattn control reference_codebook_mask values must be in {0, 1}"
+        )
+    if not bool(((mask == 0) | (mask == 1)).all()):
+        raise ValueError(
+            "qlutattn control codebook_mask values must be in {0, 1}"
+        )
+
+    sigma2 = require_tensor("sigma2", shape)
+    q_absmean = require_tensor("q_absmean", shape)
+    ranking = require_tensor("ranking_score", shape, torch.float64)
+    for key, statistic in (("sigma2", sigma2), ("q_absmean", q_absmean)):
+        if not torch.is_floating_point(statistic):
+            raise ValueError(
+                f"qlutattn control field {key!r} must be floating point; "
+                f"got {statistic.dtype}"
+            )
+        if not bool(torch.isfinite(statistic).all()) or bool((statistic < 0).any()):
+            raise ValueError(
+                f"qlutattn control field {key!r} must contain finite "
+                "nonnegative values"
+            )
+    if not bool(torch.isfinite(ranking).all()) or bool((ranking < 0).any()):
+        raise ValueError(
+            "qlutattn control ranking_score must contain finite nonnegative values"
+        )
+    expected_ranking = sigma2.double() * q_absmean.double()
+    if not torch.equal(ranking, expected_ranking):
+        raise ValueError(
+            "qlutattn control ranking_score must equal sigma2.double() * "
+            "q_absmean.double() exactly"
+        )
+
+    expected_reference = _recompute_qlutattn_top_p_reference(ranking, threshold)
+    if not torch.equal(reference_mask, expected_reference):
+        raise ValueError(
+            "qlutattn control reference_codebook_mask does not match the "
+            "recomputed top-p reference"
+        )
+    expected_reference_semantic_sha = _qlutattn_reference_semantic_sha256(
+        sigma2,
+        q_absmean,
+        expected_reference,
+        top_p_threshold=threshold,
+        group_size=blob["group_size"],
+        skip_first=blob["skip_first"],
+        model=blob["model"],
+        calib_data=blob["calib_data"],
+        num_samples=blob["num_samples"],
+        sample_len=blob["sample_len"],
+        seed=blob["seed"],
+    )
+    if reference_semantic_sha != expected_reference_semantic_sha:
+        raise ValueError(
+            "qlutattn control reference_semantic_sha256 does not match "
+            "recomputed top-p reference semantics"
+        )
+    expected_mask, expected_count_per_layer = (
+        _recompute_qlutattn_uniform_control(
+            ranking, expected_reference, control_kind
+        )
+    )
+    if not torch.equal(mask, expected_mask):
+        raise ValueError(
+            "qlutattn control codebook_mask does not match the recomputed "
+            f"{control_kind} fixed-top-k selection"
+        )
+
+    expected_reorder, expected_inverse, expected_count_per_head = (
+        _recompute_qlutattn_head_layout(expected_mask)
+    )
+    reorder = require_tensor("reorder_index", shape, torch.int64)
+    inverse = require_tensor("inverse_reorder_index", shape, torch.int64)
+    count_per_head = require_tensor(
+        "nf2_count_per_head", (n_layers, n_heads), torch.int32
+    )
+    count_per_layer = require_tensor(
+        "nf2_count_per_layer", (n_layers,), torch.int32
+    )
+    if not torch.equal(reorder, expected_reorder):
+        raise ValueError(
+            "qlutattn control reorder_index must be the stable head-local "
+            "[NF2 prefix | sign suffix] permutation"
+        )
+    if not torch.equal(inverse, expected_inverse):
+        raise ValueError(
+            "qlutattn control inverse_reorder_index does not match reorder_index"
+        )
+    if not torch.equal(count_per_head, expected_count_per_head):
+        raise ValueError(
+            "qlutattn control nf2_count_per_head does not match codebook_mask"
+        )
+    if not torch.equal(count_per_layer, expected_count_per_layer):
+        raise ValueError(
+            "qlutattn control nf2_count_per_layer does not match selection"
+        )
+
+    ratio_per_layer = require_tensor(
+        "nf2_ratio_per_layer", (n_layers,), torch.float64
+    )
+    expected_ratio = expected_count_per_layer.double() / float(
+        n_heads * head_dim
+    )
+    if not torch.equal(ratio_per_layer, expected_ratio):
+        raise ValueError(
+            "qlutattn control nf2_ratio_per_layer does not match selected counts"
+        )
+
+    reference_nf2_count = int(expected_reference.sum())
+    actual_nf2_count = int(expected_mask.sum())
+    reference_packed_bits = _qlutattn_packed_k_bits_total(expected_reference)
+    packed_bits = _qlutattn_packed_k_bits_total(expected_mask)
+    expected_int_fields = {
+        "reference_nf2_count": reference_nf2_count,
+        "actual_nf2_count": actual_nf2_count,
+        "reference_packed_bits_total": reference_packed_bits,
+        "packed_bits_total": packed_bits,
+    }
+    for key, expected in expected_int_fields.items():
+        value = blob.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value != expected:
+            raise ValueError(
+                f"qlutattn control field {key!r} must equal recomputed "
+                f"value {expected}; got {value!r}"
+            )
+    if (
+        control_kind == "same_cardinality"
+        and actual_nf2_count != reference_nf2_count
+    ):
+        raise ValueError(
+            "qlutattn same_cardinality control must match reference NF2 count"
+        )
+    if (
+        control_kind == "exact_packed_bits"
+        and packed_bits != reference_packed_bits
+    ):
+        raise ValueError(
+            "qlutattn exact_packed_bits control must match reference packed cost"
+        )
+
+    actual_nf2 = blob.get("actual_nf2_frac")
+    low_frac = blob.get("low_frac")
+    for key, value in (
+        ("actual_nf2_frac", actual_nf2),
+        ("low_frac", low_frac),
+    ):
+        if not isinstance(value, float) or not math.isfinite(value):
+            raise ValueError(
+                f"qlutattn control {key} must be a finite float; got {value!r}"
+            )
+    if actual_nf2 != actual_nf2_count / mask.numel():
+        raise ValueError(
+            "qlutattn control actual_nf2_frac does not match codebook_mask"
+        )
+    if low_frac != (mask.numel() - actual_nf2_count) / mask.numel():
+        raise ValueError(
+            "qlutattn control low_frac does not match codebook_mask"
+        )
+
+
+def load_qlutattn_mask_blob(mask_path: str) -> dict[str, Any]:
+    """Load and strictly validate a canonical, top-p, or control QLUTATTN mask."""
     blob = torch.load(mask_path, map_location="cpu", weights_only=False)
     if not isinstance(blob, dict):
         raise ValueError(f"qlutattn mask {mask_path} must be a dict payload")
@@ -299,22 +1217,85 @@ def load_qlutattn_mask_blob(mask_path: str) -> dict[str, Any]:
         raise ValueError(
             f"qlutattn codebook_mask must be torch.uint8; got {mask.dtype}"
         )
+
+    selection_method = blob.get("selection_method")
+    if selection_method == QLUTATTN_TOP_P_SELECTION_METHOD:
+        _validate_qlutattn_top_p_blob(blob, mask_path, mask)
+        return blob
+    if selection_method == QLUTATTN_CONTROL_SELECTION_METHOD:
+        _validate_qlutattn_control_blob(blob, mask_path, mask)
+        return blob
+    if selection_method is not None:
+        raise ValueError(
+            f"unsupported qlutattn selection_method={selection_method!r} "
+            f"in {mask_path}"
+        )
+    control_only_fields = (
+        "control_kind",
+        "reference_mask_sha256",
+        "reference_semantic_sha256",
+        "reference_selection_method",
+        "reference_top_p_threshold",
+        "reference_codebook_mask",
+        "reference_nf2_count",
+        "actual_nf2_count",
+        "reference_packed_bits_total",
+        "packed_bits_total",
+        "packed_k_values_total",
+    )
+    orphaned_control_fields = sorted(
+        key for key in control_only_fields if key in blob
+    )
+    if orphaned_control_fields:
+        raise ValueError(
+            "qlutattn fixed-top-k control metadata requires "
+            f"selection_method={QLUTATTN_CONTROL_SELECTION_METHOD!r}; "
+            f"found control-only fields without it: {orphaned_control_fields}"
+        )
+
+    top_p_only_fields = (
+        "format_version",
+        "selection_axis",
+        "threshold_rule",
+        "tie_rule",
+        "score_dtype_for_selection",
+        "top_p_threshold",
+        "reorder_index",
+        "inverse_reorder_index",
+        "nf2_count_per_head",
+        "nf2_count_per_layer",
+        "nf2_ratio_per_layer",
+        "captured_mass_per_layer",
+        "previous_prefix_mass_per_layer",
+        "boundary_score_per_layer",
+        "actual_nf2_frac",
+        "ranking_score",
+    )
+    orphaned_top_p_fields = sorted(
+        key for key in top_p_only_fields if key in blob
+    )
+    if orphaned_top_p_fields:
+        raise ValueError(
+            "qlutattn top-p metadata requires "
+            f"selection_method={QLUTATTN_TOP_P_SELECTION_METHOD!r}; "
+            f"found top-p-only fields without it: {orphaned_top_p_fields}"
+        )
+
     values = set(torch.unique(mask).tolist())
     if values != {0, 1}:
         raise ValueError(
             f"qlutattn codebook_mask values must be exactly {{0, 1}} "
             f"(0=sign, 1=nf2); got {sorted(values)}"
         )
-    # Canonical 65/35 split: the per-layer sign count must equal
-    # round(0.65 * n_kv * head_dim) exactly (integer rounding makes the global
-    # fraction land near but not exactly on 0.65; the metadata must state the
-    # ACTUAL fraction). Legacy/research metadata keys are ignored — the mask
-    # content is what is validated.
     n_per_layer = mask.shape[1] * mask.shape[2]
     expected_sign = int(round(QLUTATTN_SIGN_FRACTION * n_per_layer))
     per_layer_sign = (mask == 0).reshape(mask.shape[0], -1).sum(dim=1)
     if not bool((per_layer_sign == expected_sign).all()):
-        bad = {int(i): int(c) for i, c in enumerate(per_layer_sign.tolist()) if c != expected_sign}
+        bad = {
+            int(i): int(c)
+            for i, c in enumerate(per_layer_sign.tolist())
+            if c != expected_sign
+        }
         raise ValueError(
             f"qlutattn requires exactly {expected_sign}/{n_per_layer} sign channels "
             f"per layer (= round({QLUTATTN_SIGN_FRACTION} * n_kv * head_dim)); "
@@ -549,7 +1530,8 @@ def _build_variant_impl(args: Any) -> VariantConfig:
                 "QLUT_CB_MASK=/path/to/mask.pt (generate via "
                 "scripts/calibrate_qlutattn_mask.py). "
                 f"Got QLUT_CB_MASK='{mask}'")
-        load_qlutattn_mask_blob(mask)
+        mask_blob = load_qlutattn_mask_blob(mask)
+        selection_method = mask_blob.get("selection_method")
         return VariantConfig(
             name=QLUTATTN_VARIANT, use_kitty=True, k_codebook="qlut",
             bin_codebooks=QLUTATTN_BIN_CODEBOOKS, vbits=2,
@@ -557,7 +1539,70 @@ def _build_variant_impl(args: Any) -> VariantConfig:
             v_tile_channels=QLUTATTN_V_TILE_CHANNELS,
             v_tile_algo_version=V_TILE_ALGO_VERSION, v_rht_seed=V_RHT_SEED,
             v_mse_iters=V_MSE_ITERS, promote_ratio=0.0, channel_selection=0,
-            k_quant_mode="per_token", pertoken_cb_mask=mask)
+            k_quant_mode="per_token", pertoken_cb_mask=mask,
+            selection_method=selection_method,
+            top_p_threshold=(
+                float(mask_blob["top_p_threshold"])
+                if selection_method == QLUTATTN_TOP_P_SELECTION_METHOD else None
+            ),
+            actual_nf2_frac=(
+                float(mask_blob["actual_nf2_frac"])
+                if selection_method in (
+                    QLUTATTN_TOP_P_SELECTION_METHOD,
+                    QLUTATTN_CONTROL_SELECTION_METHOD,
+                ) else None
+            ),
+            control_kind=(
+                str(mask_blob["control_kind"])
+                if selection_method == QLUTATTN_CONTROL_SELECTION_METHOD else None
+            ),
+            reference_selection_method=(
+                str(mask_blob["reference_selection_method"])
+                if selection_method == QLUTATTN_CONTROL_SELECTION_METHOD else None
+            ),
+            reference_top_p_threshold=(
+                float(mask_blob["reference_top_p_threshold"])
+                if selection_method == QLUTATTN_CONTROL_SELECTION_METHOD else None
+            ),
+            reference_mask_sha256=(
+                str(mask_blob["reference_mask_sha256"])
+                if selection_method == QLUTATTN_CONTROL_SELECTION_METHOD else None
+            ),
+            reference_semantic_sha256=(
+                str(mask_blob["reference_semantic_sha256"])
+                if selection_method == QLUTATTN_CONTROL_SELECTION_METHOD else None
+            ),
+            reference_nf2_count=(
+                int(mask_blob["reference_nf2_count"])
+                if selection_method == QLUTATTN_CONTROL_SELECTION_METHOD else None
+            ),
+            actual_nf2_count=(
+                int(mask_blob["actual_nf2_count"])
+                if selection_method in (
+                    QLUTATTN_TOP_P_SELECTION_METHOD,
+                    QLUTATTN_CONTROL_SELECTION_METHOD,
+                ) else None
+            ),
+            reference_packed_bits_total=(
+                int(mask_blob["reference_packed_bits_total"])
+                if selection_method == QLUTATTN_CONTROL_SELECTION_METHOD else None
+            ),
+            packed_bits_total=(
+                int(mask_blob["packed_bits_total"])
+                if selection_method in (
+                    QLUTATTN_TOP_P_SELECTION_METHOD,
+                    QLUTATTN_CONTROL_SELECTION_METHOD,
+                ) else None
+            ),
+            packed_k_values_total=(
+                int(mask_blob["packed_k_values_total"])
+                if selection_method == QLUTATTN_TOP_P_SELECTION_METHOD
+                else (
+                    int(mask_blob["codebook_mask"].numel())
+                    if selection_method == QLUTATTN_CONTROL_SELECTION_METHOD
+                    else None
+                )
+            ))
     if variant in ("llamacpp_q40", "llamacpp-q40"):
         # llama.cpp Q4_0 KV cache, faithful port (sim fake-quant): K and V both
         # per-token with 32-channel symmetric absmax blocks (d = signed_max/-8,
@@ -710,8 +1755,19 @@ def method_layout_slug(variant: VariantConfig | str) -> str:
             slug = f"kitty-k{variant.kbits}b{variant.promote_bit}v{variant.vbits}-pr{pr}"
         else:
             slug = "kitty"  # str fallback: no bit info available
+    elif (
+        name == QLUTATTN_VARIANT
+        and isinstance(variant, VariantConfig)
+        and variant.selection_method == QLUTATTN_TOP_P_SELECTION_METHOD
+    ):
+        slug = _qlutattn_top_p_slug(variant)
+    elif (
+        name == QLUTATTN_VARIANT
+        and isinstance(variant, VariantConfig)
+        and variant.selection_method == QLUTATTN_CONTROL_SELECTION_METHOD
+    ):
+        slug = _qlutattn_control_slug(variant)
     else:
-        # qlutattn is fully fixed, so its slug is exactly the variant name.
         slug = {
             "fp16": "fp16",
             "custom": "custom-kitty",
@@ -747,6 +1803,24 @@ def variant_semantic_payload(variant: VariantConfig) -> dict[str, Any]:
     # pre-symnf2 payload (their historical run_config_hashes stay valid).
     if payload.get("nf2_impl") is None:
         payload.pop("nf2_impl", None)
+    optional_research_fields = (
+        "selection_method",
+        "top_p_threshold",
+        "actual_nf2_frac",
+        "control_kind",
+        "reference_selection_method",
+        "reference_top_p_threshold",
+        "reference_mask_sha256",
+        "reference_semantic_sha256",
+        "reference_nf2_count",
+        "actual_nf2_count",
+        "reference_packed_bits_total",
+        "packed_bits_total",
+        "packed_k_values_total",
+    )
+    for key in optional_research_fields:
+        if payload.get(key) is None:
+            payload.pop(key, None)
     payload["mask_sha256"] = _sha256_file(mask_path) if mask_path else None
     return payload
 
@@ -1045,6 +2119,10 @@ def generate_dataset(
     kitty_engagement_checked = False
     engagement_evidence = {
         "samples_observed": 0,
+        "k_quant_calls": 0,
+        "k_quantized_tokens": 0,
+        "k_prompt_mean_layers": 0,
+        "last_k_quant_mode": None,
         "v_quant_calls": 0,
         "v_quantized_tokens": 0,
         "v_tile_blocks": 0,
@@ -1111,8 +2189,21 @@ def generate_dataset(
                     **inputs,
                     **gen_kwargs,
                 )[0]
-            if variant.name == QLUTATTN_VARIANT and kv_cache is not None:
+            if variant.use_kitty and kv_cache is not None:
                 engagement_evidence["samples_observed"] += 1
+                engagement_evidence["k_quant_calls"] += int(
+                    getattr(kv_cache, "k_quant_calls", 0)
+                )
+                engagement_evidence["k_quantized_tokens"] += int(
+                    getattr(kv_cache, "k_quantized_tokens", 0)
+                )
+                prompt_means = getattr(kv_cache, "k_pc_mean", None)
+                engagement_evidence["k_prompt_mean_layers"] += (
+                    len(prompt_means) if isinstance(prompt_means, dict) else 0
+                )
+                k_mode_seen = getattr(kv_cache, "last_k_quant_mode", None)
+                if k_mode_seen is not None:
+                    engagement_evidence["last_k_quant_mode"] = k_mode_seen
                 engagement_evidence["v_quant_calls"] += int(
                     getattr(kv_cache, "v_quant_calls", 0)
                 )
@@ -1203,15 +2294,35 @@ def generate_dataset(
                         f"{seqlen}"
                     )
                     if variant.name == QLUTATTN_VARIANT and kv_cache is not None:
+                        k_mode = getattr(kv_cache, "last_k_quant_mode", None)
+                        k_calls = int(getattr(kv_cache, "k_quant_calls", 0))
+                        k_tokens = int(getattr(kv_cache, "k_quantized_tokens", 0))
+                        prompt_means = getattr(kv_cache, "k_pc_mean", None)
+                        k_prompt_mean_layers = (
+                            len(prompt_means)
+                            if isinstance(prompt_means, dict)
+                            else 0
+                        )
                         mode = getattr(kv_cache, "last_v_quant_mode", None)
                         calls = int(getattr(kv_cache, "v_quant_calls", 0))
                         blocks = int(getattr(kv_cache, "v_tile_blocks", 0))
                         tokens = int(getattr(kv_cache, "v_quantized_tokens", 0))
                         c_seen = getattr(kv_cache, "last_v_tile_channels", None)
                         detail = (
-                            f"{detail} v_quant_calls={calls} v_quantized_tokens={tokens} "
+                            f"{detail} k_quant_calls={k_calls} "
+                            f"k_quantized_tokens={k_tokens} "
+                            f"k_prompt_mean_layers={k_prompt_mean_layers} "
+                            f"last_k_quant_mode={k_mode} "
+                            f"v_quant_calls={calls} v_quantized_tokens={tokens} "
                             f"v_tile_blocks={blocks} last_v_quant_mode={mode} "
                             f"last_v_tile_channels={c_seen} context_length={context_length}"
+                        )
+                        engaged = (
+                            engaged
+                            and k_calls > 0
+                            and k_tokens > 0
+                            and k_prompt_mean_layers > 0
+                            and k_mode == "per_token:qlut"
                         )
                         print(f"[vcache-2bit] {dataset} first-sample evidence: {detail}")
                         # Long prompts must engage at least one full tile; short
