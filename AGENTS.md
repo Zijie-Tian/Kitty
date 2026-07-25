@@ -258,11 +258,11 @@ datasets across GPUs, use a single target, e.g. `run_exp.sh llama32 --gpus 0,1,2
 | `shadowkv` | `shadowkv` | ShadowKV pure-torch sim (accuracy proxy; no memory/speed savings). |
 | `custom` | `custom-kitty` | Custom Kitty config. |
 
-`qlutattn` keeps one public variant and one runtime input (`QLUT_CB_MASK`), but
-the mask artifact may be canonical fixed-65/35 or a versioned research
-`layer_channel_top_p` / uniform-top-k-control artifact. Research artifacts get
-artifact-qualified method slugs with the full mask SHA-256; the canonical
-artifact remains plain `qlutattn`. See the dedicated section below.
+`qlutattn` keeps one public variant and one runtime input (`QLUT_CB_MASK`).
+The mask artifact may be canonical fixed-65/35 or a versioned research
+`layer_channel_top_p` artifact. Top-p artifacts get threshold- and
+full-SHA-qualified method slugs; the canonical artifact remains plain
+`qlutattn`. See the dedicated section below.
 
 All LongBench variants here run on the pure-torch sim fake-quant path (accuracy
 proxy, no real KV-memory savings); `fp16`/`kivi`/`kivi_star` keep dense fp16 KV.
@@ -509,10 +509,10 @@ overrides; never hardcode host paths in tracked files.
 K per-token 调度和保护窗口仍完全固定,也不支持 QUEST 叠加。唯一的 QLUTATTN
 运行时输入仍是 `QLUT_CB_MASK`;没有在线 selector 或额外运行时调参旋钮。
 默认无研究元数据的 artifact 保持历史 fixed-65/35 语义、`qlutattn` slug 与
-semantic hash 不变。版本化研究 artifact 可以在离线阶段固定
-`layer_channel_top_p` 或 uniform-top-k control;它们使用带 threshold/control、
-exact packed cost 与**完整 mask SHA-256** 的独立 method/output slug,不会与
-canonical 结果混用。完整设计文档:`docs/qlutattn.md`。
+semantic hash 不变。版本化 research artifact 可以在离线阶段固定
+`layer_channel_top_p`;它使用带 threshold 与**完整 mask SHA-256** 的独立
+method/output slug,不会与 canonical 结果混用。完整设计文档:
+`docs/qlutattn.md`。
 
 ### 语义
 
@@ -529,9 +529,6 @@ canonical 结果混用。完整设计文档:`docs/qlutattn.md`。
   - research top-p format v3:每层独立按 score 降序,以 FP64 累积,取达到同一
     `p` 的最短前缀为 NF2;离线生成 head-local reorder/inverse。推理仅
     gather → NF2/sign 原内核 → inverse-gather,不重新打分。
-  - research control format v2:`same_cardinality` 或 `exact_packed_bits`
-    uniform per-layer top-k;嵌入 source-file SHA-256 与可重算的
-    `reference_semantic_sha256`。
   - canonical 的 `1.60 bit/value` 是原 `head_dim=128` 约定下的
     **quantized-region** codeword+scale 位宽,不是 full-cache 位宽。所有研究
     artifact 必须分别报告 code/scale,并在给定长度下计入 `μ_d`、mask、
@@ -564,9 +561,11 @@ canonical 结果混用。完整设计文档:`docs/qlutattn.md`。
 | common | `codebooks == ["sign","nf2"]`;`codebook_mask` 为 CPU `uint8` rank-3 binary,shape 匹配目标模型,`low_frac` 匹配实际 mask |
 | canonical | 每层 sign 计数恰为 `round(0.65 × n_kv × head_dim)` |
 | top-p format v3 | selector/tie/dtype 常量、FP64 score、每层 cumulative boundary、mask、reorder/inverse、count/ratio、exact packed K cost 与 calibration provenance 全部可重算且匹配 |
-| control format v2 | reference top-p 与 uniform top-k control 全部重算;满足 same-cardinality 或 exact-packed-bits;校验完整 source SHA-256 格式和可重算 `reference_semantic_sha256` |
 
-canonical legacy 的 `target_bits` / `nominal_bits` 等历史字段继续忽略。
+canonical legacy 的 `target_bits` / `nominal_bits` 等历史字段继续忽略。已退役的
+uniform fixed-top-k control format v2 及 `--uniform-top-k-control-from` /
+`--control-kind` 参数会硬报错,不属于可忽略 metadata;必须重新生成 canonical
+或 top-p v3 artifact,不保留兼容 shim。
 mask 文件完整 SHA-256 进入 semantic hash、manifest 和 research method slug。
 
 ### 标定 → smoke → full
@@ -588,13 +587,6 @@ CUDA_VISIBLE_DEVICES='' PYTHONPATH=src python scripts/calibrate_qlutattn_mask.py
   --top-p 0.62 \
   --output /path/to/Llama-3.2-1B-Instruct.qlutattn_topp_p62.pt
 
-# exact packed-bit uniform-top-k control
-CUDA_VISIBLE_DEVICES='' PYTHONPATH=src python scripts/calibrate_qlutattn_mask.py \
-  --stats-input /path/to/Llama-3.2-1B-Instruct.qlutattn_stats.pt \
-  --uniform-top-k-control-from \
-    /path/to/Llama-3.2-1B-Instruct.qlutattn_topp_p62.pt \
-  --control-kind exact_packed_bits \
-  --output /path/to/Llama-3.2-1B-Instruct.qlutattn_topp_p62_exact_control.pt
 ```
 
 ```bash
@@ -619,8 +611,8 @@ bash scripts/run_exp.sh llama32 --gpu 1 --variant qlutattn
 ```
 
 输出布局:canonical 为 `longbench_out/<model>_qlutattn/{pred,logs}`;
-top-p/control 使用带 threshold/kind、exact cost 和完整 mask SHA-256 的独立
-method slug;smoke 在同样布局外加 `longbench_out/smoke/`。
+top-p 使用带 threshold 和完整 mask SHA-256 的独立 method slug;smoke 在同样
+布局外加 `longbench_out/smoke/`。
 
 ### run 验收(manifest + engagement)
 
@@ -629,7 +621,7 @@ method slug;smoke 在同样布局外加 `longbench_out/smoke/`。
 - `manifest.status == "ok"`,`run_config_hash` 非空(shell preflight 与 Python
   worker 各自重算且必须一致);
 - `variant.name == "qlutattn"`,`nf2_impl == "symnf2-v1"`,`mask_sha256` 非空;
-  research artifact 还必须记录 selector/control provenance;
+  top-p research artifact 还必须记录 selector provenance;
 - K engagement:
   `k_quant_calls > 0`,`k_quantized_tokens > 0`,`k_prompt_mean_layers > 0`,
   `last_k_quant_mode == "per_token:qlut"`;
@@ -643,7 +635,7 @@ method slug;smoke 在同样布局外加 `longbench_out/smoke/`。
   存储,不省真实显存、不加速 —— 这些 run 只测精度。
 - 模型必须是 FP16;`head_dim` 必须是 2 的幂且可被 64 整除;GLM 家族直接
   fail-fast 拒绝(不做静默回退)。
-- top-p/control 是 research selector,不是新默认或新 packed kernel。只在
+- top-p 是 research selector,不是新默认或新 packed kernel。只在
   Llama-3.2-1B(`head_dim=64`)验证时必须报告为 model-specific,不能写成跨模型结论。
 
 ## KV-cache 可视化 skill (`kv-cache-viz`)

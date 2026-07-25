@@ -51,4 +51,3 @@ def channel_sigma2(x_quant, G):
     -> sign, high sigma^2 -> nf2)."""
     xg, _ = _grouped(x_quant.float(), G)
     return (xg - xg.mean(-1, keepdim=True)).pow(2).mean(dim=(-1, -2))
-

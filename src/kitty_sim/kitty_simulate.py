@@ -332,9 +332,8 @@ class KittyKVCache(DynamicCache):
         self.k_pc_mean: dict[int, torch.Tensor] = {}
         # qlutattn: OFFLINE per-(layer,head,channel) codebook metadata, loaded
         # once and used unchanged -- never recomputed per prompt. Canonical
-        # artifacts use k_cb_mask directly. Top-p and fixed-top-k control
-        # artifacts additionally carry head-local [NF2 prefix | sign suffix]
-        # permutations and counts.
+        # artifacts use k_cb_mask directly. Top-p artifacts additionally carry
+        # head-local [NF2 prefix | sign suffix] permutations and counts.
         self.pertoken_cb_mask_path = getattr(cache_config, "pertoken_cb_mask", None)
         self.pertoken_offline = bool(self.pertoken_cb_mask_path)
         self.k_cb_mask: dict[int, torch.Tensor] = {}
@@ -351,10 +350,7 @@ class KittyKVCache(DynamicCache):
             if _cbs:                                           # mask file carries its codebook names
                 self.bin_codebooks = list(_cbs)
             self.qlut_selection_method = _blob.get("selection_method")
-            if self.qlut_selection_method in (
-                "layer_channel_top_p",
-                "layer_uniform_fixed_top_k_control",
-            ):
+            if self.qlut_selection_method == "layer_channel_top_p":
                 _reorder = _blob["reorder_index"]
                 _inverse = _blob["inverse_reorder_index"]
                 _counts = _blob["nf2_count_per_head"]
@@ -476,10 +472,7 @@ class KittyKVCache(DynamicCache):
                 f"qlutattn offline codebook mask has no entry for layer {layer_idx}; "
                 "the mask shape must match the model (validated at preflight)"
             )
-        if self.qlut_selection_method in (
-            "layer_channel_top_p",
-            "layer_uniform_fixed_top_k_control",
-        ):
+        if self.qlut_selection_method == "layer_channel_top_p":
             out = self._pt_apply_reordered_cb_segments(r, layer_idx)
         else:
             if cb_id.device != ks.device:

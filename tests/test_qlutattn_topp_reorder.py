@@ -295,17 +295,27 @@ class TestArtifactValidationAndStatsReuse(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     calibration.validate_top_p_artifact(tampered)
 
-    def test_control_format_version_rejects_equal_float(self):
-        reference = self._artifact()
-        control = calibration.build_uniform_top_k_control_artifact(
-            reference["sigma2"], reference["q_absmean"], reference, "0" * 64,
-            control_kind="same_cardinality", group_size=128, skip_first=32,
-            model="synthetic-model", calib_data="synthetic.parquet",
-            num_samples=4, sample_len=64, seed=7)
-        self.assertEqual(control["format_version"], 2)
-        control["format_version"] = 2.0
-        with self.assertRaises(ValueError):
-            calibration.validate_uniform_top_k_control_artifact(control)
+
+    def test_uniform_control_cli_is_removed(self):
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT_PATH),
+                "--stats-input",
+                "unused.pt",
+                "--uniform-top-k-control-from",
+                "unused-control.pt",
+                "--output",
+                "unused-output.pt",
+            ],
+            cwd=REPO_ROOT,
+            env={**os.environ, "PYTHONPATH": str(REPO_ROOT / "src")},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("unrecognized arguments", proc.stderr)
 
     def test_saved_statistics_cli_builds_top_p_without_model_arguments(self):
         sigma2 = torch.tensor(
