@@ -81,7 +81,7 @@ GPU_ID=1
   unless `MODEL_PATH` or `--model-path` is provided. Do not reintroduce tracked
   model-to-local-path maps.
 
-### experiments/ output rule
+### experiments/ output + data rule
 
 Research experiment code lives under repo-root `experiments/<name>/` (scripts
 and READMEs are tracked). **All experiment run outputs must write to**
@@ -93,6 +93,17 @@ repo-root `outputs/<name>/` (optionally with a run-tag subdirectory such as
 - Canonical LongBench / PPL / RULER still use their own roots
   (`longbench_out/`, `ppl_out/`, `ruler_out/`); this rule applies to
   `experiments/` only.
+
+**Self-contained inputs.** Experiments under `experiments/` must generate their
+own intermediate data (masks, stats, tensors, figures) with scripts that live
+in that experiment directory (or by calling stable repo entry points such as
+`scripts/calibrate_qlutattn_mask.py`), and write those artifacts under
+`outputs/<name>/`. Prefer a documented `make_*.sh` / stage-0 step over hard-
+coding paths to another agent's temporary dumps (`autoresearch_*.pt`,
+worktree-only caches, ad-hoc root-level `.pt` leftovers, etc.). Reusing such
+transient files is allowed only as a short-lived bootstrap while the
+experiment's own generator is being wired; the committed README and default
+commands must not depend on them.
 
 The `kitty` conda env has the compatible stack used here. The detailed
 package snapshot below was read from the active `kitty` env on 2026-05-25.

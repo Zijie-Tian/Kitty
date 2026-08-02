@@ -50,22 +50,38 @@ against the a30 anchors (3 decimal places):
 
 ```text
 experiments/sensitivity_overlap/
+  make_ref_masks.sh       # stage 0: WikiText-2 ρ=0.62 top-p ref masks
   collect_task_stats.py   # stage 1: per-task forward → stats.pt
   overlap_metrics.py      # stage 2: masks + Jaccard + Spearman + bootstrap
   plot_m2_figure.py       # stage 3: M2 paper-figure candidate
   run_collection.sh       # 6-lane GPU scheduler
   lanes/lane{0..5}.txt    # 40 (model,task) shards
-outputs/sensitivity_overlap/<RUN_TAG>/   # gitignored (/outputs)
+outputs/sensitivity_overlap/
+  ref/                    # self-calibrated WikiText-2 top-p masks (+ stats)
+  <RUN_TAG>/              # collection + metrics (gitignored /outputs)
 ```
 
-Paths resolve from `.env` / CLI (`KITTY_LLAMA32_*_PATH`, `LONGBENCH_DATA_ROOT`).
-`--data-root` is the LongBench **root** containing `data/<task>.jsonl`
-(same as `scripts/run_exp.sh`).
+Paths resolve from `.env` / CLI (`KITTY_LLAMA32_*_PATH`,
+`KITTY_WIKITEXT2_TRAIN_PATH`, `LONGBENCH_DATA_ROOT`). `--data-root` is the
+LongBench **root** containing `data/<task>.jsonl` (same as `scripts/run_exp.sh`).
 
-WikiText-2 ρ=0.62 reference masks (already in repo root, not copied here):
+This experiment does **not** use repo-root `autoresearch_*.pt` artifacts.
+Reference masks for the M2 red dashed line are produced by
+`scripts/calibrate_qlutattn_mask.py` via `make_ref_masks.sh`.
 
-- 1B: `autoresearch_llama32_1b_topp_p0p62_seed0_v3.pt`
-- 3B: `autoresearch_llama32_3b_topp_p062_seed0.pt`
+## Stage 0 — calibrate WikiText-2 ρ=0.62 ref masks (GPU1)
+
+```bash
+cd "$(git rev-parse --show-toplevel)"
+source accuracy_simulation/env.sh
+# requires KITTY_LLAMA32_1B_PATH, KITTY_LLAMA32_3B_PATH, KITTY_WIKITEXT2_TRAIN_PATH
+bash experiments/sensitivity_overlap/make_ref_masks.sh
+# -> outputs/sensitivity_overlap/ref/llama32-1b_topp_p0p62.pt
+# -> outputs/sensitivity_overlap/ref/llama32-3b_topp_p0p62.pt
+# (also writes reusable *_stats.pt next to each mask)
+```
+
+One model only: `MODELS=llama32-1b bash experiments/sensitivity_overlap/make_ref_masks.sh`.
 
 ## Smoke (GPU1, 4 prompts)
 
@@ -106,10 +122,13 @@ with `run_collection.sh 1 …` (serial, much slower).
 
 ## Metrics + M2 figure
 
+Requires stage-0 ref masks under `outputs/sensitivity_overlap/ref/`.
+
 ```bash
 cd "$(git rev-parse --show-toplevel)"
 source accuracy_simulation/env.sh
 ROOT=outputs/sensitivity_overlap/sensitivity_overlap_ext
+REF=outputs/sensitivity_overlap/ref
 METRICS="${ROOT}/metrics"
 PY="${PYTHON_BIN:-${KITTY_PYTHON_BIN:-python}}"
 mkdir -p "${METRICS}"
@@ -120,7 +139,7 @@ CUDA_VISIBLE_DEVICES=1 PYTHONPATH=src PYTHONDONTWRITEBYTECODE=1 \
   --stats-root "${ROOT}" --model-tag llama32-1b \
   --tasks qasper,2wikimqa,gov_report,trec,passage_retrieval_en,repobench-p \
   --rho 0.62 --bootstrap 2000 --seed 0 --device cuda:0 \
-  --ref-mask autoresearch_llama32_1b_topp_p0p62_seed0_v3.pt \
+  --ref-mask "${REF}/llama32-1b_topp_p0p62.pt" \
   --out-dir "${METRICS}" --tag gate6_llama32-1b
 
 # full 1B / 3B
@@ -128,14 +147,14 @@ CUDA_VISIBLE_DEVICES=1 PYTHONPATH=src PYTHONDONTWRITEBYTECODE=1 \
   "$PY" experiments/sensitivity_overlap/overlap_metrics.py \
   --stats-root "${ROOT}" --model-tag llama32-1b \
   --rho 0.62 --bootstrap 2000 --seed 0 --device cuda:0 \
-  --ref-mask autoresearch_llama32_1b_topp_p0p62_seed0_v3.pt \
+  --ref-mask "${REF}/llama32-1b_topp_p0p62.pt" \
   --out-dir "${METRICS}" --tag full_llama32-1b
 
 CUDA_VISIBLE_DEVICES=1 PYTHONPATH=src PYTHONDONTWRITEBYTECODE=1 \
   "$PY" experiments/sensitivity_overlap/overlap_metrics.py \
   --stats-root "${ROOT}" --model-tag llama32-3b \
   --rho 0.62 --bootstrap 2000 --seed 0 --device cuda:0 \
-  --ref-mask autoresearch_llama32_3b_topp_p062_seed0.pt \
+  --ref-mask "${REF}/llama32-3b_topp_p0p62.pt" \
   --out-dir "${METRICS}" --tag full_llama32-3b
 
 "$PY" experiments/sensitivity_overlap/plot_m2_figure.py \
