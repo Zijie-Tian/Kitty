@@ -81,6 +81,19 @@ GPU_ID=1
   unless `MODEL_PATH` or `--model-path` is provided. Do not reintroduce tracked
   model-to-local-path maps.
 
+### experiments/ output rule
+
+Research experiment code lives under repo-root `experiments/<name>/` (scripts
+and READMEs are tracked). **All experiment run outputs must write to**
+repo-root `outputs/<name>/` (optionally with a run-tag subdirectory such as
+`outputs/<name>/<run_tag>/`). Do **not** put large regenerable artifacts under
+`experiments/` itself (no `experiments/<name>_out/`).
+
+- `outputs/` is gitignored (`/outputs` in `.gitignore`). Never commit it.
+- Canonical LongBench / PPL / RULER still use their own roots
+  (`longbench_out/`, `ppl_out/`, `ruler_out/`); this rule applies to
+  `experiments/` only.
+
 The `kitty` conda env has the compatible stack used here. The detailed
 package snapshot below was read from the active `kitty` env on 2026-05-25.
 Re-check this table after upgrading packages, because cache APIs can change

@@ -1,0 +1,4 @@
+llama32-1b repobench-p
+llama32-3b passage_retrieval_zh
+llama32-3b lcc
+llama32-3b repobench-p

@@ -1,0 +1,7 @@
+llama32-1b 2wikimqa
+llama32-1b hotpotqa
+llama32-1b multifieldqa_zh
+llama32-1b triviaqa
+llama32-3b musique
+llama32-3b qasper
+llama32-3b 2wikimqa

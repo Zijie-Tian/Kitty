@@ -1,0 +1,7 @@
+llama32-1b narrativeqa
+llama32-1b gov_report
+llama32-1b multi_news
+llama32-1b qmsum
+llama32-3b narrativeqa
+llama32-3b gov_report
+llama32-3b multi_news

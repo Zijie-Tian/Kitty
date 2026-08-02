@@ -1,0 +1,8 @@
+llama32-1b trec
+llama32-1b samsum
+llama32-1b lsht
+llama32-1b passage_count
+llama32-3b hotpotqa
+llama32-3b multifieldqa_zh
+llama32-3b triviaqa
+llama32-3b trec

@@ -1,0 +1,7 @@
+llama32-1b dureader
+llama32-1b vcsum
+llama32-1b musique
+llama32-1b qasper
+llama32-3b qmsum
+llama32-3b dureader
+llama32-3b vcsum

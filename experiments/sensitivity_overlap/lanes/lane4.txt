@@ -1,0 +1,7 @@
+llama32-1b passage_retrieval_en
+llama32-1b passage_retrieval_zh
+llama32-1b lcc
+llama32-3b samsum
+llama32-3b lsht
+llama32-3b passage_count
+llama32-3b passage_retrieval_en
