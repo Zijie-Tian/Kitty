@@ -64,7 +64,10 @@ SmoothAttention, online sigma^2 binning, per-token Lloyd fitting, outlier
 dense-and-sparse side paths, block-shared per-token codebooks (the block size
 is fixed at 1), per-head fraction equalization, RoPE-pair binding, per-layer
 fraction schedules, and token-level tiering (all measured non-positive under
-this signal).
+this signal). The 2026-07-17→07-19 sign/nf2 Pareto loop that selected
+`σ² × E|q|` + fixed 65/35 (kept/discarded ablations, full-21 rollouts, Qwen
+band notes) is archived in
+[`docs/qlutattn_sign_nf2_pareto_loop.md`](qlutattn_sign_nf2_pareto_loop.md).
 
 ### V-cache — rescued 2-bit tile16c64 (`rht-pcaff-mse1-bias-v1`)
 
