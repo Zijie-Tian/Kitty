@@ -126,6 +126,7 @@ Environment overrides:
   MAX_SAMPLES=${MAX_SAMPLES}    MAX_MODEL_LEN=${MAX_MODEL_LEN}    RUN_MODE=${RUN_MODE}
   RUN_VARIANT=${RUN_VARIANT:-<per-target default>}
   DATASETS_CSV=${DATASETS_CSV:-<full 21>}    FORCE=${FORCE:-0}
+  QWEN_THINKING=${QWEN_THINKING:-0}   # 1 = fixed seeded Qwen3 thinking sampling
   QLUT_CB_MASK=${QLUT_CB_MASK:-<unset>}
 
 QLUTATTN (the single canonical QLUT variant):
@@ -327,6 +328,9 @@ longbench_preflight_json() {
     --json
   )
   [[ -n "${max_gen}" ]] && cmd+=(--max-gen "${max_gen}")
+  if [[ "${QWEN_THINKING:-0}" =~ ^(1|true|TRUE|yes|YES|on|ON)$ ]]; then
+    cmd+=(--qwen-thinking)
+  fi
   [[ -n "${KBITS:-}" ]] && cmd+=(--kbits "${KBITS}")
   [[ -n "${VBITS:-}" ]] && cmd+=(--vbits "${VBITS}")
   [[ -n "${PROMOTE_BIT:-}" ]] && cmd+=(--promote_bit "${PROMOTE_BIT}")
@@ -557,6 +561,9 @@ run_eval_dataset() {
   fi
   if [[ -n "${max_gen}" ]]; then
     cmd+=(--max-gen "${max_gen}")
+  fi
+  if [[ "${QWEN_THINKING:-0}" =~ ^(1|true|TRUE|yes|YES|on|ON)$ ]]; then
+    cmd+=(--qwen-thinking)
   fi
   # K/V bit-width for the kivi / kivi_star variants (--kbits/--vbits, default 2/2).
   if [[ -n "${KBITS:-}" ]]; then

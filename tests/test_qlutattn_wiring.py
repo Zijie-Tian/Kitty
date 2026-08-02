@@ -29,7 +29,12 @@ from kitty_sim.longbench.runner import (
     QLUTATTN_VARIANT,
     VariantConfig,
     _cache_factory,
+    _ThinkingAnswerBudgetStoppingCriteria,
+    _longbench_generation_policy,
     _maybe_enable_quest_kernel,
+    _thinking_final_answer,
+    _thinking_dataset_generation_policy,
+    _thinking_sample_seed,
     build_variant,
     generate_dataset,
     load_qlutattn_mask_blob,
@@ -1035,6 +1040,495 @@ class TestManifestEngagement(_EnvIsolation):
                     )
 
 
+
+
+class TestQwenThinkingGeneration(_EnvIsolation):
+    def test_policy_changes_run_hash_and_records_fixed_settings(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            model = root / "model"
+            model.mkdir()
+            (model / "config.json").write_text(
+                json.dumps({
+                    "model_type": "qwen3",
+                    "head_dim": 64,
+                    "hidden_size": 64,
+                    "num_attention_heads": 1,
+                    "num_key_value_heads": 1,
+                    "num_hidden_layers": 1,
+                    "intermediate_size": 128,
+                    "vocab_size": 128,
+                }),
+                encoding="utf-8",
+            )
+            (model / "tokenizer_config.json").write_text(
+                json.dumps({
+                    "chat_template": (
+                        "enable_thinking {% if enable_thinking %}"
+                        "<think>{{ content }}</think>{% endif %}"
+                    )
+                }),
+                encoding="utf-8",
+            )
+            (model / "generation_config.json").write_text(
+                json.dumps({"eos_token_id": [2, 3]}),
+                encoding="utf-8",
+            )
+            data_dir = root / "longbench" / "data"
+            data_dir.mkdir(parents=True)
+            (data_dir / "narrativeqa.jsonl").write_text("{}\n", encoding="utf-8")
+            os.environ["QLUT_CB_MASK"] = self._write_mask()
+            args = _args(
+                model="Qwen/Qwen3-8B",
+                model_path=str(model),
+                model_tag="qwen3-8b",
+                model_family="qwen",
+                dataset="narrativeqa",
+                data_root=str(root / "longbench"),
+                max_samples=1,
+                max_gen=4096,
+                qwen_thinking=False,
+            )
+            variant = build_variant(args)
+            greedy_hash = longbench_run_config_hash(
+                args, variant, "narrativeqa"
+            )
+            args.qwen_thinking = True
+            thinking_hash = longbench_run_config_hash(
+                args, variant, "narrativeqa"
+            )
+            payload = resolve_longbench_preflight(args)
+            policy = payload["run_config"]["generation_policy"]
+
+            self.assertNotEqual(greedy_hash, thinking_hash)
+            self.assertEqual(payload["run_config_hash"], thinking_hash)
+            self.assertEqual(policy["name"], "qwen3-thinking-sampling-v5")
+            self.assertEqual(
+                policy["answer_extraction"], "prompt-mode-final-answer-v3"
+            )
+            self.assertTrue(policy["do_sample"])
+            self.assertEqual(policy["temperature"], 0.6)
+            self.assertEqual(policy["top_p"], 0.95)
+            self.assertEqual(policy["top_k"], 20)
+            self.assertEqual(policy["seed_base"], 0)
+            self.assertTrue(policy["chat_template_sha256"])
+            self.assertEqual(
+                policy["answer_stopping"],
+                "canonical-answer-budget-by-prompt-mode-v2",
+            )
+            self.assertEqual(
+                policy["invalid_answer_policy"],
+                "empty-prediction-score-zero-v1",
+            )
+            self.assertEqual(policy["answer_token_budget"], 128)
+            self.assertEqual(policy["max_new_tokens"], 4096)
+            self.assertEqual(policy["prompt_mode"], "chat-thinking")
+            self.assertEqual(policy["eos_token_ids"], [2, 3])
+            self.assertTrue(policy["generation_config_sha256"])
+
+    def test_policy_rejects_non_qwen_family(self):
+        args = _args(qwen_thinking=True)
+        with self.assertRaisesRegex(ValueError, "model_family='qwen'"):
+            _longbench_generation_policy(args, "llama3")
+
+    def test_seed_derivation_is_stable_and_paired(self):
+        policy = {"seed_base": 0}
+        first = _thinking_sample_seed(policy, "qasper", 7)
+        self.assertEqual(first, _thinking_sample_seed(policy, "qasper", 7))
+        self.assertNotEqual(first, _thinking_sample_seed(policy, "qasper", 8))
+        self.assertNotEqual(first, _thinking_sample_seed(policy, "trec", 7))
+
+    def test_answer_budget_stops_only_after_generated_close(self):
+        criterion = _ThinkingAnswerBudgetStoppingCriteria(
+            prompt_length=2,
+            prompt_mode="chat-thinking",
+            closing_tag_ids=(7, 8),
+            answer_token_budget=2,
+        )
+
+        def stopped(tokens):
+            return bool(
+                criterion(torch.tensor([tokens], dtype=torch.long), None).item()
+            )
+
+        self.assertFalse(stopped([7, 8, 5, 5, 5]))
+        self.assertFalse(stopped([7, 8, 5, 7, 8, 11]))
+        self.assertTrue(stopped([7, 8, 5, 7, 8, 11, 12]))
+        with self.assertRaisesRegex(ValueError, "must exceed"):
+            _thinking_dataset_generation_policy(
+                {
+                    "answer_stopping": (
+                        "canonical-answer-budget-by-prompt-mode-v2"
+                    )
+                },
+                dataset="narrativeqa",
+                answer_token_budget=128,
+                max_new_tokens=128,
+            )
+        raw_policy = _thinking_dataset_generation_policy(
+            {"answer_stopping": "canonical-answer-budget-by-prompt-mode-v2"},
+            dataset="lcc",
+            answer_token_budget=2,
+            max_new_tokens=2,
+        )
+        self.assertEqual(raw_policy["prompt_mode"], "raw-no-chat")
+        raw_criterion = _ThinkingAnswerBudgetStoppingCriteria(
+            prompt_length=2,
+            prompt_mode=raw_policy["prompt_mode"],
+            closing_tag_ids=(),
+            answer_token_budget=raw_policy["answer_token_budget"],
+        )
+        self.assertFalse(
+            raw_criterion(torch.tensor([[1, 2, 9]], dtype=torch.long), None).item()
+        )
+        self.assertTrue(
+            raw_criterion(
+                torch.tensor([[1, 2, 9, 10]], dtype=torch.long), None
+            ).item()
+        )
+
+    def test_final_answer_extraction(self):
+        self.assertEqual(
+            _thinking_final_answer(
+                "<think>reason</think>\n</think>\n final answer ",
+                "chat-thinking",
+            ),
+            ("final answer", "ok"),
+        )
+        self.assertEqual(
+            _thinking_final_answer(" direct answer ", "raw-no-chat"),
+            ("direct answer", "ok"),
+        )
+        self.assertEqual(
+            _thinking_final_answer("reasoning without tags", "chat-thinking"),
+            ("", "no_closing_think"),
+        )
+        self.assertEqual(
+            _thinking_final_answer("<think>unfinished", "raw-no-chat"),
+            ("", "no_closing_think"),
+        )
+        self.assertEqual(
+            _thinking_final_answer(
+                "<think>reason</think>", "chat-thinking"
+            ),
+            ("", "empty_final_answer"),
+        )
+        self.assertEqual(
+            _thinking_final_answer(
+                "<think>reason</think> answer <think>again",
+                "chat-thinking",
+            ),
+            ("", "reopened_think_after_final_close"),
+        )
+
+    def test_generate_uses_sampling_and_writes_only_final_answer(self):
+        class _Batch(dict):
+            def __init__(self):
+                super().__init__(input_ids=torch.tensor([[1, 2]], dtype=torch.long))
+
+            @property
+            def input_ids(self):
+                return self["input_ids"]
+
+            def to(self, _device):
+                return self
+
+        class _Tokenizer:
+            eos_token_id = 2
+            pad_token_id = 2
+
+            def __call__(self, *_args, **_kwargs):
+                return _Batch()
+
+            def apply_chat_template(self, messages, **_kwargs):
+                return messages[0]["content"]
+
+            def encode(self, *_args, **_kwargs):
+                return [7, 8]
+
+            def decode(self, *_args, **_kwargs):
+                return "<think>reasoning</think>\n final answer "
+
+        class _Model:
+            device = torch.device("cpu")
+
+            def __init__(self):
+                self.kwargs = None
+
+            def generate(self, **kwargs):
+                self.kwargs = kwargs
+                return torch.cat(
+                    [kwargs["input_ids"], torch.ones(1, 1, dtype=torch.long)],
+                    dim=1,
+                )
+
+        policy = {
+            "name": "qwen3-thinking-sampling-v5",
+            "do_sample": True,
+            "temperature": 0.6,
+            "top_p": 0.95,
+            "top_k": 20,
+            "seed_base": 0,
+            "seed_derivation": "sha256-base-dataset-sample-v1",
+            "answer_extraction": "prompt-mode-final-answer-v3",
+            "answer_stopping": "canonical-answer-budget-by-prompt-mode-v2",
+            "invalid_answer_policy": "empty-prediction-score-zero-v1",
+            "eos_token_ids": [2, 3],
+            "generation_config_sha256": "fixture",
+            "prompt_mode": "chat-thinking",
+            "answer_token_budget": 128,
+            "max_new_tokens": 4096,
+            "chat_template_sha256": "fixture",
+        }
+        model = _Model()
+        with tempfile.TemporaryDirectory() as td, mock.patch(
+            "kitty_sim.longbench.runner.torch.cuda.is_available",
+            return_value=False,
+        ):
+            out = Path(td) / "qasper.jsonl"
+            manifest = generate_dataset(
+                model_name="model",
+                model=model,
+                tokenizer=_Tokenizer(),
+                dataset="qasper",
+                records=[{
+                    "input": "code",
+                    "answers": ["answer"],
+                    "all_classes": [],
+                    "length": 1,
+                }],
+                prompt_format="{input}",
+                max_model_len=32768,
+                max_gen=4096,
+                out_path=out,
+                variant=build_variant(_args("fp16")),
+                model_family="qwen",
+                expected_run_config_hash="thinking-run-hash",
+                generation_policy=policy,
+            )
+            row = json.loads(out.read_text(encoding="utf-8"))
+
+        self.assertEqual(row["pred"], "final answer")
+        self.assertEqual(manifest["generation_policy"], policy)
+        self.assertEqual(manifest["run_config_hash"], "thinking-run-hash")
+        self.assertTrue(model.kwargs["do_sample"])
+        self.assertEqual(model.kwargs["temperature"], 0.6)
+        self.assertEqual(model.kwargs["top_p"], 0.95)
+        self.assertEqual(model.kwargs["top_k"], 20)
+        self.assertEqual(model.kwargs["eos_token_id"], [2, 3])
+        criteria = model.kwargs["stopping_criteria"]
+        self.assertEqual(len(criteria), 1)
+        self.assertEqual(criteria[0].prompt_length, 2)
+        self.assertEqual(criteria[0].closing_tag_ids, (7, 8))
+        self.assertEqual(criteria[0].answer_token_budget, 128)
+        self.assertEqual(criteria[0].prompt_mode, "chat-thinking")
+
+    def test_no_chat_generation_stops_without_a_think_tag(self):
+        class _Batch(dict):
+            def __init__(self):
+                super().__init__(input_ids=torch.tensor([[1, 2]], dtype=torch.long))
+
+            @property
+            def input_ids(self):
+                return self["input_ids"]
+
+            def to(self, _device):
+                return self
+
+        class _Tokenizer:
+            eos_token_id = 2
+            pad_token_id = 2
+
+            def __call__(self, *_args, **_kwargs):
+                return _Batch()
+
+            def encode(self, *_args, **_kwargs):
+                raise AssertionError("raw-no-chat mode must not tokenize </think>")
+
+            def decode(self, *_args, **_kwargs):
+                return "direct answer"
+
+        class _Model:
+            device = torch.device("cpu")
+
+            def __init__(self):
+                self.generated_tokens = None
+                self.criteria = None
+                self.eos_token_id = None
+
+            def generate(self, **kwargs):
+                output = kwargs["input_ids"]
+                self.criteria = kwargs["stopping_criteria"]
+                self.eos_token_id = kwargs["eos_token_id"]
+                for token_id in (9, 10, 11):
+                    output = torch.cat(
+                        [output, torch.tensor([[token_id]], dtype=torch.long)],
+                        dim=1,
+                    )
+                    if bool(self.criteria(output, None).all()):
+                        break
+                self.generated_tokens = output.shape[1] - kwargs["input_ids"].shape[1]
+                return output
+
+        base_policy = {
+            "name": "qwen3-thinking-sampling-v5",
+            "do_sample": True,
+            "temperature": 0.6,
+            "top_p": 0.95,
+            "top_k": 20,
+            "seed_base": 0,
+            "seed_derivation": "sha256-base-dataset-sample-v1",
+            "answer_extraction": "prompt-mode-final-answer-v3",
+            "answer_stopping": "canonical-answer-budget-by-prompt-mode-v2",
+            "invalid_answer_policy": "empty-prediction-score-zero-v1",
+            "eos_token_ids": [2, 3],
+            "generation_config_sha256": "fixture",
+            "chat_template_sha256": "fixture",
+        }
+        policy = _thinking_dataset_generation_policy(
+            base_policy,
+            dataset="lcc",
+            answer_token_budget=2,
+            max_new_tokens=4096,
+        )
+        model = _Model()
+        with tempfile.TemporaryDirectory() as td, mock.patch(
+            "kitty_sim.longbench.runner.torch.cuda.is_available",
+            return_value=False,
+        ):
+            out = Path(td) / "lcc.jsonl"
+            manifest = generate_dataset(
+                model_name="model",
+                model=model,
+                tokenizer=_Tokenizer(),
+                dataset="lcc",
+                records=[{
+                    "input": "code",
+                    "answers": ["answer"],
+                    "all_classes": [],
+                    "length": 1,
+                }],
+                prompt_format="{input}",
+                max_model_len=32768,
+                max_gen=4096,
+                out_path=out,
+                variant=build_variant(_args("fp16")),
+                model_family="qwen",
+                expected_run_config_hash="raw-thinking-run-hash",
+                generation_policy=policy,
+            )
+            row = json.loads(out.read_text(encoding="utf-8"))
+
+        self.assertEqual(row["pred"], "direct answer")
+        self.assertEqual(row["answer_extraction_status"], "ok")
+        self.assertEqual(manifest["generation_outcomes"]["invalid_answer_count"], 0)
+        self.assertEqual(model.generated_tokens, 2)
+        self.assertEqual(policy["prompt_mode"], "raw-no-chat")
+        self.assertEqual(manifest["generation_policy"], policy)
+        self.assertEqual(model.criteria[0].closing_tag_ids, ())
+        self.assertEqual(model.eos_token_id, [2, 3])
+
+    def test_invalid_chat_answer_is_zero_score_row_with_manifest_evidence(self):
+        class _Batch(dict):
+            def __init__(self):
+                super().__init__(input_ids=torch.tensor([[1, 2]], dtype=torch.long))
+
+            @property
+            def input_ids(self):
+                return self["input_ids"]
+
+            def to(self, _device):
+                return self
+
+        class _Tokenizer:
+            eos_token_id = 2
+            pad_token_id = 2
+
+            def __call__(self, *_args, **_kwargs):
+                return _Batch()
+
+            def apply_chat_template(self, messages, **_kwargs):
+                return messages[0]["content"]
+
+            def encode(self, *_args, **_kwargs):
+                return [7, 8]
+
+            def decode(self, *_args, **_kwargs):
+                return "reasoning without a close"
+
+        class _Model:
+            device = torch.device("cpu")
+
+            def generate(self, **kwargs):
+                return torch.cat(
+                    [
+                        kwargs["input_ids"],
+                        torch.tensor([[9, 10]], dtype=torch.long),
+                    ],
+                    dim=1,
+                )
+
+        base_policy = {
+            "name": "qwen3-thinking-sampling-v5",
+            "do_sample": True,
+            "temperature": 0.6,
+            "top_p": 0.95,
+            "top_k": 20,
+            "seed_base": 0,
+            "seed_derivation": "sha256-base-dataset-sample-v1",
+            "answer_extraction": "prompt-mode-final-answer-v3",
+            "answer_stopping": "canonical-answer-budget-by-prompt-mode-v2",
+            "invalid_answer_policy": "empty-prediction-score-zero-v1",
+            "eos_token_ids": [2, 3],
+            "generation_config_sha256": "fixture",
+            "chat_template_sha256": "fixture",
+        }
+        policy = _thinking_dataset_generation_policy(
+            base_policy,
+            dataset="qasper",
+            answer_token_budget=1,
+            max_new_tokens=2,
+        )
+        with tempfile.TemporaryDirectory() as td, mock.patch(
+            "kitty_sim.longbench.runner.torch.cuda.is_available",
+            return_value=False,
+        ):
+            out = Path(td) / "qasper.jsonl"
+            manifest = generate_dataset(
+                model_name="model",
+                model=_Model(),
+                tokenizer=_Tokenizer(),
+                dataset="qasper",
+                records=[{
+                    "input": "question",
+                    "answers": ["answer"],
+                    "all_classes": [],
+                    "length": 1,
+                }],
+                prompt_format="{input}",
+                max_model_len=32768,
+                max_gen=2,
+                out_path=out,
+                variant=build_variant(_args("fp16")),
+                model_family="qwen",
+                expected_run_config_hash="invalid-thinking-run-hash",
+                generation_policy=policy,
+            )
+            row = json.loads(out.read_text(encoding="utf-8"))
+
+        self.assertEqual(manifest["status"], "ok")
+        self.assertEqual(manifest["written_samples"], 1)
+        self.assertEqual(manifest["failed_sample_ids"], [])
+        self.assertEqual(row["pred"], "")
+        self.assertEqual(row["answer_extraction_status"], "no_closing_think")
+        self.assertEqual(row["generation_termination"], "max_new_tokens")
+        self.assertEqual(row["generated_tokens"], 2)
+        self.assertEqual(manifest["generation_outcomes"], {
+            "invalid_answer_count": 1,
+            "answer_extraction_status_counts": {"no_closing_think": 1},
+            "termination_counts": {"max_new_tokens": 1},
+            "max_generated_tokens": 2,
+        })
 
 
 if __name__ == "__main__":

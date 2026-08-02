@@ -108,6 +108,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-model-len", type=int, default=None, help="Prompt truncation length")
     parser.add_argument("--default-max-model-len", type=int, default=3500, help="Fallback prompt length for unknown model aliases")
     parser.add_argument("--max-gen", type=int, default=None, help="Override dataset generation length")
+    parser.add_argument(
+        "--qwen-thinking",
+        action="store_true",
+        help=(
+            "Use the fixed deterministic Qwen3 thinking sampling policy and "
+            "score only the final-answer suffix."
+        ),
+    )
     parser.add_argument("--prompt-token-reserve", type=int, default=0)
     parser.add_argument("--torch-dtype", default="float16", choices=["float16", "fp16", "bfloat16", "bf16", "float32", "fp32"])
     parser.add_argument("--local-files-only", action="store_true")

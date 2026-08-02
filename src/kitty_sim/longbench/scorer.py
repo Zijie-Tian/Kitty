@@ -24,11 +24,29 @@ def _manifest_path(jsonl_path: Path) -> Path:
     return jsonl_path.with_suffix(".manifest.json")
 
 
-def scorer(dataset: str, predictions: list[str], answers: list[Any], all_classes: Any) -> float:
+def scorer(
+    dataset: str,
+    predictions: list[str],
+    answers: list[Any],
+    all_classes: Any,
+    answer_extraction_statuses: list[str | None] | None = None,
+) -> float:
     metric = DATASET_TO_METRIC[dataset]
+    statuses = (
+        [None] * len(predictions)
+        if answer_extraction_statuses is None
+        else answer_extraction_statuses
+    )
+    if len(statuses) != len(predictions):
+        raise ValueError("answer extraction status count does not match predictions")
     total_score = 0.0
-    for prediction, ground_truths in zip(predictions, answers):
+    for prediction, ground_truths, extraction_status in zip(
+        predictions, answers, statuses
+    ):
         score = 0.0
+        if extraction_status is not None and extraction_status != "ok":
+            total_score += score
+            continue
         if dataset in ["trec", "triviaqa", "samsum", "lsht"]:
             prediction = prediction.lstrip("\n").split("\n")[0]
         for ground_truth in ground_truths:
@@ -43,22 +61,39 @@ def scorer_e(
     answers: list[Any],
     lengths: list[int],
     all_classes: Any,
+    answer_extraction_statuses: list[str | None] | None = None,
 ) -> dict[str, float]:
     metric = DATASET_TO_METRIC[dataset]
+    statuses = (
+        [None] * len(predictions)
+        if answer_extraction_statuses is None
+        else answer_extraction_statuses
+    )
+    if len(statuses) != len(predictions):
+        raise ValueError("answer extraction status count does not match predictions")
     scores: dict[str, list[float]] = {"0-4k": [], "4-8k": [], "8k+": []}
-    for prediction, ground_truths, length in zip(predictions, answers, lengths):
+    for prediction, ground_truths, length, extraction_status in zip(
+        predictions, answers, lengths, statuses
+    ):
         score = 0.0
-        if dataset in ["trec", "triviaqa", "samsum", "lsht"]:
-            prediction = prediction.lstrip("\n").split("\n")[0]
-        for ground_truth in ground_truths:
-            score = max(score, metric(prediction, ground_truth, all_classes=all_classes))
+        if extraction_status is None or extraction_status == "ok":
+            if dataset in ["trec", "triviaqa", "samsum", "lsht"]:
+                prediction = prediction.lstrip("\n").split("\n")[0]
+            for ground_truth in ground_truths:
+                score = max(
+                    score,
+                    metric(prediction, ground_truth, all_classes=all_classes),
+                )
         if length < 4000:
             scores["0-4k"].append(score)
         elif length < 8000:
             scores["4-8k"].append(score)
         else:
             scores["8k+"].append(score)
-    return {key: round(100 * float(np.mean(value)), 2) if value else 0.0 for key, value in scores.items()}
+    return {
+        key: round(100 * float(np.mean(value)), 2) if value else 0.0
+        for key, value in scores.items()
+    }
 
 
 def score_directory(
@@ -108,11 +143,27 @@ def score_directory(
         predictions = [row["pred"] for row in rows]
         answers = [row["answers"] for row in rows]
         all_classes = rows[-1].get("all_classes", []) if rows else []
+        answer_extraction_statuses = [
+            row.get("answer_extraction_status") for row in rows
+        ]
         if is_longbench_e:
             lengths = [int(row.get("length", 0)) for row in rows]
-            scores[metric_dataset] = scorer_e(metric_dataset, predictions, answers, lengths, all_classes)
+            scores[metric_dataset] = scorer_e(
+                metric_dataset,
+                predictions,
+                answers,
+                lengths,
+                all_classes,
+                answer_extraction_statuses,
+            )
         else:
-            scores[metric_dataset] = scorer(metric_dataset, predictions, answers, all_classes)
+            scores[metric_dataset] = scorer(
+                metric_dataset,
+                predictions,
+                answers,
+                all_classes,
+                answer_extraction_statuses,
+            )
 
     result_path = path / output_name
     if incomplete and strict_complete:

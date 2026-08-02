@@ -405,6 +405,37 @@ Per-target overrides — `<T>` is one of `LLAMA`, `LLAMA32`, `QWEN`, `GLM`, `DEE
   default Qwen3-8B), set `<T>_MODEL_SLUG` too, so results are labeled correctly
   and do not get mislabeled into / collide with the default model's dir.
 
+### Qwen thinking-model generation policy
+
+Thinking checkpoints such as the default `Qwen/Qwen3-8B` must set
+`QWEN_THINKING=1` when using `scripts/run_exp.sh`. This selects one fixed,
+non-tunable LongBench policy:
+
+- sampling enabled with `temperature=0.6`, `top_p=0.95`, and `top_k=20`;
+- a stable seed derived from `(seed_base=0, dataset, sample_index)`, so resumed
+  runs and paired quantization arms generate deterministically;
+- the checkpoint's complete `generation_config.json` EOS list is preserved
+  (Qwen3-8B: `[151645, 151643]`) rather than collapsed to tokenizer EOS;
+- `QWEN_MAX_GEN=4096` remains the total reasoning-plus-answer ceiling. For
+  chat-wrapped datasets, generation may use that reasoning budget but stops
+  after the canonical `dataset2maxlen` answer budget following the first
+  generated `</think>`. Raw/no-chat datasets count the same canonical budget
+  from generation start;
+- valid chat output stores only the trimmed suffix after the final `</think>`.
+  Unclosed, empty-final, or reopened-think model output is an explicit quality
+  failure: the row stores `pred=""`, extraction status, termination reason, and
+  generated-token count; both standard and LongBench-E scorers force that row
+  to zero. Manifests aggregate invalid/status/termination counts;
+- the full policy, seed/stopping/extraction/invalid-answer versions, prompt
+  mode, answer budget, EOS list, tokenizer chat-template SHA-256, and
+  `generation_config.json` SHA-256 enter each `run_config_hash` and manifest.
+
+The flag is accepted only for model family `qwen` and a local checkpoint with a
+thinking-capable tokenizer chat template plus `generation_config.json`. Leave
+it unset for non-thinking checkpoints such as `Qwen3-4B-Instruct-2507`. For
+Qwen3-8B at a 32K prompt cap, use `QWEN_MAX_GEN=4096`; the combined maximum
+remains within its 40960-token context limit.
+
 **Resume / clean-slate.**
 - smoke: the target's previous smoke dir is wiped on every launch (smoke is never resumed).
 - full: completed datasets are kept; partial/missing ones are rerun, so an

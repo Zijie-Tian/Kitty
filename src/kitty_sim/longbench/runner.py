@@ -17,7 +17,13 @@ from typing import Any, Optional
 
 import torch
 from tqdm import tqdm
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+from transformers import (
+    AutoConfig,
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    StoppingCriteria,
+    StoppingCriteriaList,
+)
 
 from kitty_sim import get_kvcache_kitty
 from kitty_sim.glm_kitty_patch import (
@@ -26,7 +32,12 @@ from kitty_sim.glm_kitty_patch import (
     is_glm_family,
 )
 
-from .config import LONG_BENCH_DATASETS, LONG_BENCH_E_DATASETS, load_json_config
+from .config import (
+    LONG_BENCH_DATASETS,
+    LONG_BENCH_E_DATASETS,
+    NO_CHAT_DATASETS,
+    load_json_config,
+)
 from .data import default_data_root, load_longbench_dataset
 from .templates import (
     format_longbench_prompt,
@@ -55,6 +66,92 @@ QLUTATTN_TOP_P_THRESHOLD_RULE = "minimal_desc_prefix_cumsum_ge_p"
 QLUTATTN_TOP_P_TIE_RULE = "score_desc_flat_index_asc"
 QLUTATTN_TOP_P_SCORE_DTYPE = "float64"
 QLUTATTN_V_TILE_CHANNELS = 64
+
+QWEN_THINKING_POLICY_VERSION = "qwen3-thinking-sampling-v5"
+QWEN_THINKING_SEED_DERIVATION = "sha256-base-dataset-sample-v1"
+QWEN_THINKING_ANSWER_EXTRACTION = "prompt-mode-final-answer-v3"
+QWEN_THINKING_SEED_BASE = 0
+QWEN_THINKING_CLOSE_TAG = "</think>"
+QWEN_THINKING_ANSWER_STOPPING = "canonical-answer-budget-by-prompt-mode-v2"
+QWEN_THINKING_INVALID_ANSWER_POLICY = "empty-prediction-score-zero-v1"
+QWEN_THINKING_CHAT_PROMPT_MODE = "chat-thinking"
+QWEN_THINKING_RAW_PROMPT_MODE = "raw-no-chat"
+
+
+class _ThinkingAnswerBudgetStoppingCriteria(StoppingCriteria):
+    """Apply the canonical answer budget according to the dataset prompt mode."""
+
+    def __init__(
+        self,
+        *,
+        prompt_length: int,
+        prompt_mode: str,
+        closing_tag_ids: tuple[int, ...],
+        answer_token_budget: int,
+    ) -> None:
+        if isinstance(prompt_length, bool) or int(prompt_length) < 0:
+            raise ValueError(f"prompt_length must be >= 0, got {prompt_length!r}")
+        if prompt_mode not in (
+            QWEN_THINKING_CHAT_PROMPT_MODE,
+            QWEN_THINKING_RAW_PROMPT_MODE,
+        ):
+            raise ValueError(f"unknown Qwen thinking prompt_mode={prompt_mode!r}")
+        if prompt_mode == QWEN_THINKING_CHAT_PROMPT_MODE and not closing_tag_ids:
+            raise ValueError("chat-thinking closing_tag_ids must not be empty")
+        if prompt_mode == QWEN_THINKING_RAW_PROMPT_MODE and closing_tag_ids:
+            raise ValueError("raw-no-chat stopping must not use closing_tag_ids")
+        if isinstance(answer_token_budget, bool) or int(answer_token_budget) <= 0:
+            raise ValueError(
+                "answer_token_budget must be a positive integer, "
+                f"got {answer_token_budget!r}"
+            )
+        self.prompt_length = int(prompt_length)
+        self.prompt_mode = prompt_mode
+        self.closing_tag_ids = tuple(int(token_id) for token_id in closing_tag_ids)
+        self.answer_token_budget = int(answer_token_budget)
+        self._closing_tag_tensor: torch.Tensor | None = None
+
+    def __call__(
+        self,
+        input_ids: torch.LongTensor,
+        scores: torch.FloatTensor,
+        **kwargs: Any,
+    ) -> torch.BoolTensor:
+        if input_ids.ndim != 2:
+            raise ValueError(
+                f"thinking stopping criterion requires rank-2 input_ids, got {input_ids.shape}"
+            )
+        batch_size, current_length = input_ids.shape
+        result = torch.zeros(batch_size, dtype=torch.bool, device=input_ids.device)
+        if self.prompt_mode == QWEN_THINKING_RAW_PROMPT_MODE:
+            is_done = current_length - self.prompt_length >= self.answer_token_budget
+            return torch.full(
+                (batch_size,),
+                is_done,
+                dtype=torch.bool,
+                device=input_ids.device,
+            )
+        search_end = current_length - self.answer_token_budget
+        marker_length = len(self.closing_tag_ids)
+        if search_end - self.prompt_length < marker_length:
+            return result
+
+        if (
+            self._closing_tag_tensor is None
+            or self._closing_tag_tensor.device != input_ids.device
+            or self._closing_tag_tensor.dtype != input_ids.dtype
+        ):
+            self._closing_tag_tensor = torch.tensor(
+                self.closing_tag_ids,
+                dtype=input_ids.dtype,
+                device=input_ids.device,
+            )
+        generated_prefix = input_ids[:, self.prompt_length:search_end]
+        windows = generated_prefix.unfold(1, marker_length, 1)
+        return (
+            windows
+            == self._closing_tag_tensor.view(1, 1, marker_length)
+        ).all(dim=-1).any(dim=-1)
 
 
 def _top_p_threshold_slug(value: float) -> str:
@@ -1198,6 +1295,205 @@ def _stable_json_hash(payload: dict[str, Any]) -> str:
     ).hexdigest()
 
 
+def _normalize_eos_token_ids(value: Any, *, source: str) -> list[int]:
+    if isinstance(value, bool):
+        raise ValueError(f"{source} eos_token_id must be an int or non-empty list")
+    if isinstance(value, int):
+        values = [value]
+    elif isinstance(value, (list, tuple)) and value:
+        values = list(value)
+    else:
+        raise ValueError(f"{source} eos_token_id must be an int or non-empty list")
+    if any(
+        isinstance(token_id, bool)
+        or not isinstance(token_id, int)
+        or token_id < 0
+        for token_id in values
+    ):
+        raise ValueError(f"{source} eos_token_id contains an invalid token ID")
+    return values
+
+
+def _longbench_generation_policy(
+    args: Any, model_family: str
+) -> dict[str, Any] | None:
+    if not bool(getattr(args, "qwen_thinking", False)):
+        return None
+    if model_family.lower() != "qwen":
+        raise ValueError("--qwen-thinking requires model_family='qwen'")
+
+    model_path = getattr(args, "model_path", None) or getattr(args, "model", None)
+    tokenizer_config_path = Path(str(model_path)) / "tokenizer_config.json"
+    if not tokenizer_config_path.is_file():
+        raise FileNotFoundError(
+            "--qwen-thinking requires a local tokenizer_config.json; "
+            f"not found at {tokenizer_config_path}"
+        )
+    tokenizer_config = json.loads(tokenizer_config_path.read_text(encoding="utf-8"))
+    generation_config_path = Path(str(model_path)) / "generation_config.json"
+    if not generation_config_path.is_file():
+        raise FileNotFoundError(
+            "--qwen-thinking requires a local generation_config.json; "
+            f"not found at {generation_config_path}"
+        )
+    generation_config = json.loads(
+        generation_config_path.read_text(encoding="utf-8")
+    )
+    eos_token_ids = _normalize_eos_token_ids(
+        generation_config.get("eos_token_id"),
+        source="checkpoint generation_config.json",
+    )
+    chat_template = tokenizer_config.get("chat_template")
+    if (
+        not isinstance(chat_template, str)
+        or "enable_thinking" not in chat_template
+        or "<think>" not in chat_template
+        or QWEN_THINKING_CLOSE_TAG not in chat_template
+    ):
+        raise ValueError(
+            "--qwen-thinking requires a Qwen tokenizer chat template with "
+            "enable_thinking and think-tag support"
+        )
+    return {
+        "name": QWEN_THINKING_POLICY_VERSION,
+        "do_sample": True,
+        "temperature": 0.6,
+        "top_p": 0.95,
+        "top_k": 20,
+        "seed_base": QWEN_THINKING_SEED_BASE,
+        "seed_derivation": QWEN_THINKING_SEED_DERIVATION,
+        "answer_extraction": QWEN_THINKING_ANSWER_EXTRACTION,
+        "answer_stopping": QWEN_THINKING_ANSWER_STOPPING,
+        "invalid_answer_policy": QWEN_THINKING_INVALID_ANSWER_POLICY,
+        "eos_token_ids": eos_token_ids,
+        "generation_config_sha256": _sha256_file(generation_config_path),
+        "chat_template_sha256": hashlib.sha256(
+            chat_template.encode("utf-8")
+        ).hexdigest(),
+    }
+
+
+def _thinking_dataset_generation_policy(
+    generation_policy: dict[str, Any] | None,
+    *,
+    dataset: str,
+    answer_token_budget: int,
+    max_new_tokens: int,
+) -> dict[str, Any] | None:
+    if generation_policy is None:
+        return None
+    if generation_policy.get("answer_stopping") != QWEN_THINKING_ANSWER_STOPPING:
+        raise ValueError("Qwen thinking generation policy has an unknown stopping rule")
+    if (
+        isinstance(answer_token_budget, bool)
+        or int(answer_token_budget) <= 0
+    ):
+        raise ValueError(
+            f"canonical answer-token budget for {dataset!r} must be positive"
+        )
+    prompt_mode = (
+        QWEN_THINKING_RAW_PROMPT_MODE
+        if dataset in NO_CHAT_DATASETS
+        else QWEN_THINKING_CHAT_PROMPT_MODE
+    )
+    too_short = int(max_new_tokens) < int(answer_token_budget)
+    no_reasoning_room = (
+        prompt_mode == QWEN_THINKING_CHAT_PROMPT_MODE
+        and int(max_new_tokens) == int(answer_token_budget)
+    )
+    if isinstance(max_new_tokens, bool) or too_short or no_reasoning_room:
+        relation = "exceed" if prompt_mode == QWEN_THINKING_CHAT_PROMPT_MODE else "cover"
+        raise ValueError(
+            f"Qwen thinking max_new_tokens must {relation} the canonical answer-token "
+            f"budget for {dataset!r}: max_new_tokens={max_new_tokens}, "
+            f"answer_token_budget={answer_token_budget}"
+        )
+    return {
+        **generation_policy,
+        "prompt_mode": prompt_mode,
+        "answer_token_budget": int(answer_token_budget),
+        "max_new_tokens": int(max_new_tokens),
+    }
+
+
+def _validate_runtime_generation_policy(
+    model: Any,
+    tokenizer: Any,
+    generation_policy: dict[str, Any] | None,
+) -> None:
+    if generation_policy is None:
+        return
+    chat_template = getattr(tokenizer, "chat_template", None)
+    if not isinstance(chat_template, str):
+        raise ValueError("Qwen thinking tokenizer has no runtime chat_template")
+    actual_digest = hashlib.sha256(chat_template.encode("utf-8")).hexdigest()
+    if actual_digest != generation_policy["chat_template_sha256"]:
+        raise ValueError(
+            "Qwen thinking tokenizer chat template disagrees with shell preflight"
+        )
+    runtime_eos = _normalize_eos_token_ids(
+        getattr(getattr(model, "generation_config", None), "eos_token_id", None),
+        source="loaded model generation_config",
+    )
+    if runtime_eos != generation_policy["eos_token_ids"]:
+        raise ValueError(
+            "Qwen thinking model EOS tokens disagree with shell preflight: "
+            f"preflight={generation_policy['eos_token_ids']} runtime={runtime_eos}"
+        )
+
+
+def _thinking_sample_seed(
+    generation_policy: dict[str, Any], dataset: str, sample_idx: int
+) -> int:
+    material = (
+        f"{generation_policy['seed_base']}\0{dataset}\0{sample_idx}".encode("utf-8")
+    )
+    return int.from_bytes(hashlib.sha256(material).digest()[:8], "big") % (2**63 - 1)
+
+
+def _thinking_final_answer(response: str, prompt_mode: str) -> tuple[str, str]:
+    if prompt_mode not in (
+        QWEN_THINKING_CHAT_PROMPT_MODE,
+        QWEN_THINKING_RAW_PROMPT_MODE,
+    ):
+        raise ValueError(f"unknown Qwen thinking prompt_mode={prompt_mode!r}")
+    if QWEN_THINKING_CLOSE_TAG in response:
+        response = response.rsplit(QWEN_THINKING_CLOSE_TAG, 1)[1]
+        if "<think>" in response:
+            return "", "reopened_think_after_final_close"
+    elif (
+        prompt_mode == QWEN_THINKING_CHAT_PROMPT_MODE
+        or "<think>" in response
+    ):
+        return "", "no_closing_think"
+    answer = response.strip()
+    if not answer:
+        return "", "empty_final_answer"
+    return answer, "ok"
+
+
+def _thinking_termination_reason(
+    output: torch.LongTensor,
+    *,
+    context_length: int,
+    max_new_tokens: int,
+    eos_token_ids: list[int],
+    answer_stopping_criterion: _ThinkingAnswerBudgetStoppingCriteria,
+) -> tuple[str, int]:
+    generated_tokens = int(output.shape[-1]) - int(context_length)
+    if generated_tokens < 0:
+        raise RuntimeError("generated sequence is shorter than its prompt")
+    if generated_tokens and int(output[-1].item()) in eos_token_ids:
+        return "eos", generated_tokens
+    if generated_tokens >= int(max_new_tokens):
+        return "max_new_tokens", generated_tokens
+    if bool(
+        answer_stopping_criterion(output.unsqueeze(0), None).all().item()
+    ):
+        return "answer_budget", generated_tokens
+    return "other", generated_tokens
+
+
 def variant_semantic_payload(variant: VariantConfig) -> dict[str, Any]:
     """Portable algorithm payload: content digests replace host-local paths."""
     payload = asdict(variant)
@@ -1278,7 +1574,7 @@ def longbench_run_config_payload(
         getattr(args, "model_tag", None) or model, model_path or model
     )
     templates_source = Path(__file__).with_name("templates.py")
-    return {
+    payload = {
         "schema_version": 1,
         "variant_semantic_hash": variant_semantic_hash(variant),
         "model_id": model,
@@ -1297,6 +1593,15 @@ def longbench_run_config_payload(
         "prompt_token_reserve": int(getattr(args, "prompt_token_reserve", 0)),
         "torch_dtype": str(getattr(args, "torch_dtype", "float16")),
     }
+    generation_policy = _thinking_dataset_generation_policy(
+        _longbench_generation_policy(args, model_family),
+        dataset=dataset,
+        answer_token_budget=int(dataset2maxlen[dataset]),
+        max_new_tokens=int(max_gen),
+    )
+    if generation_policy is not None:
+        payload["generation_policy"] = generation_policy
+    return payload
 
 
 def longbench_run_config_hash(args: Any, variant: VariantConfig, dataset: str) -> str:
@@ -1435,6 +1740,55 @@ def _completed_rows(out_path: Path) -> int:
         return sum(1 for line in handle if line.strip())
 
 
+def _thinking_outcome_summary(out_path: Path) -> dict[str, Any]:
+    status_counts: dict[str, int] = {}
+    termination_counts: dict[str, int] = {}
+    invalid_count = 0
+    max_generated_tokens = 0
+    if not out_path.exists():
+        return {
+            "invalid_answer_count": 0,
+            "answer_extraction_status_counts": {},
+            "termination_counts": {},
+            "max_generated_tokens": 0,
+        }
+    with out_path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            status = row.get("answer_extraction_status")
+            termination = row.get("generation_termination")
+            generated_tokens = row.get("generated_tokens")
+            if not isinstance(status, str) or not isinstance(termination, str):
+                raise RuntimeError(
+                    "Qwen thinking output row lacks extraction/termination evidence"
+                )
+            if (
+                isinstance(generated_tokens, bool)
+                or not isinstance(generated_tokens, int)
+                or generated_tokens < 0
+            ):
+                raise RuntimeError(
+                    "Qwen thinking output row has invalid generated_tokens evidence"
+                )
+            status_counts[status] = status_counts.get(status, 0) + 1
+            termination_counts[termination] = termination_counts.get(termination, 0) + 1
+            max_generated_tokens = max(max_generated_tokens, generated_tokens)
+            if status != "ok":
+                if row.get("pred") != "":
+                    raise RuntimeError(
+                        "invalid Qwen thinking output must use an empty prediction"
+                    )
+                invalid_count += 1
+    return {
+        "invalid_answer_count": invalid_count,
+        "answer_extraction_status_counts": dict(sorted(status_counts.items())),
+        "termination_counts": dict(sorted(termination_counts.items())),
+        "max_generated_tokens": max_generated_tokens,
+    }
+
+
 def _write_manifest(path: Path, manifest: dict[str, Any]) -> None:
     path.with_suffix(".manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -1460,6 +1814,7 @@ def generate_dataset(
     legacy_cache_model: bool = False,
     kitty_stats: dict[str, Any] | None = None,
     expected_run_config_hash: str | None = None,
+    generation_policy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     if overwrite:
@@ -1527,6 +1882,44 @@ def generate_dataset(
         "last_v_tile_channels": None,
     }
     device = getattr(model, "device", torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+    closing_tag_ids: tuple[int, ...] | None = None
+    answer_token_budget: int | None = None
+    thinking_prompt_mode: str | None = None
+    thinking_eos_token_ids: list[int] | None = None
+    if generation_policy is not None:
+        if generation_policy.get("answer_stopping") != QWEN_THINKING_ANSWER_STOPPING:
+            raise ValueError("Qwen thinking generation policy has an unknown stopping rule")
+        if generation_policy.get("answer_extraction") != QWEN_THINKING_ANSWER_EXTRACTION:
+            raise ValueError("Qwen thinking generation policy has an unknown extraction rule")
+        if (
+            generation_policy.get("invalid_answer_policy")
+            != QWEN_THINKING_INVALID_ANSWER_POLICY
+        ):
+            raise ValueError(
+                "Qwen thinking generation policy has an unknown invalid-answer rule"
+            )
+        thinking_eos_token_ids = _normalize_eos_token_ids(
+            generation_policy.get("eos_token_ids"),
+            source="Qwen thinking generation policy",
+        )
+        answer_token_budget = int(generation_policy["answer_token_budget"])
+        thinking_prompt_mode = str(generation_policy["prompt_mode"])
+        if int(generation_policy["max_new_tokens"]) != int(max_gen):
+            raise ValueError(
+                "Qwen thinking generation policy max_new_tokens disagrees with max_gen"
+            )
+        if thinking_prompt_mode == QWEN_THINKING_CHAT_PROMPT_MODE:
+            closing_tag_ids = tuple(
+                tokenizer.encode(QWEN_THINKING_CLOSE_TAG, add_special_tokens=False)
+            )
+            if not closing_tag_ids:
+                raise ValueError("Qwen tokenizer produced no IDs for </think>")
+        elif thinking_prompt_mode == QWEN_THINKING_RAW_PROMPT_MODE:
+            closing_tag_ids = ()
+        else:
+            raise ValueError(
+                f"unknown Qwen thinking prompt_mode={thinking_prompt_mode!r}"
+            )
 
     for local_idx, json_obj in enumerate(tqdm(records, desc=dataset)):
         sample_idx = completed + local_idx
@@ -1557,13 +1950,22 @@ def generate_dataset(
                 kv_cache = _shadowkv_cache(variant, model, context_length, max_gen)
             else:
                 kv_cache = _cache_factory(variant)
-            eos_token_id: int | list[int] | None = tokenizer.eos_token_id
-            if dataset == "samsum" and tokenizer.eos_token_id is not None:
+            eos_token_id: int | list[int] | None = (
+                thinking_eos_token_ids
+                if thinking_eos_token_ids is not None
+                else tokenizer.eos_token_id
+            )
+            if (
+                dataset == "samsum"
+                and generation_policy is None
+                and tokenizer.eos_token_id is not None
+            ):
                 newline_ids = tokenizer.encode("\n", add_special_tokens=False)
                 eos_token_id = [tokenizer.eos_token_id]
                 if newline_ids:
                     eos_token_id.append(newline_ids[-1])
             with torch.inference_mode():
+                answer_stopping_criterion = None
                 gen_kwargs = {
                     "past_key_values": kv_cache,
                     "max_new_tokens": max_gen,
@@ -1574,13 +1976,37 @@ def generate_dataset(
                     "pad_token_id": tokenizer.pad_token_id or tokenizer.eos_token_id,
                     "use_cache": True,
                 }
+                if generation_policy is not None:
+                    sample_seed = _thinking_sample_seed(
+                        generation_policy, dataset, sample_idx
+                    )
+                    torch.manual_seed(sample_seed)
+                    if torch.cuda.is_available():
+                        torch.cuda.manual_seed_all(sample_seed)
+                    gen_kwargs.update(
+                        do_sample=True,
+                        temperature=generation_policy["temperature"],
+                        top_p=generation_policy["top_p"],
+                        top_k=generation_policy["top_k"],
+                    )
+                    answer_stopping_criterion = (
+                        _ThinkingAnswerBudgetStoppingCriteria(
+                            prompt_length=context_length,
+                            prompt_mode=thinking_prompt_mode,
+                            closing_tag_ids=closing_tag_ids,
+                            answer_token_budget=answer_token_budget,
+                        )
+                    )
+                    gen_kwargs["stopping_criteria"] = StoppingCriteriaList([
+                        answer_stopping_criterion
+                    ])
                 if dataset == "samsum":
                     gen_kwargs["min_length"] = context_length + 1
                 if variant.shadowkv or variant.quest_kernel:
                     # ShadowKV / QUEST kernel hooks have data-dependent shapes, so
                     # torch.compile must stay off.
                     gen_kwargs["disable_compile"] = True
-                    if variant.shadowkv:
+                    if variant.shadowkv and generation_policy is None:
                         gen_kwargs["temperature"] = None
                 output = model.generate(
                     **inputs,
@@ -1739,7 +2165,8 @@ def generate_dataset(
                 if not engaged:
                     raise RuntimeError(raise_msg)
                 kitty_engagement_checked = True
-            pred = tokenizer.decode(output[context_length:], skip_special_tokens=True)
+            generated_output = output[context_length:]
+            pred = tokenizer.decode(generated_output, skip_special_tokens=True)
             pred = post_process(pred, model_family)
             row = {
                 "pred": pred,
@@ -1747,6 +2174,27 @@ def generate_dataset(
                 "all_classes": json_obj["all_classes"],
                 "length": json_obj["length"],
             }
+            if generation_policy is not None:
+                if answer_stopping_criterion is None:
+                    raise RuntimeError("Qwen thinking answer stopping was not installed")
+                pred, extraction_status = _thinking_final_answer(
+                    pred, str(generation_policy["prompt_mode"])
+                )
+                termination_reason, generated_token_count = (
+                    _thinking_termination_reason(
+                        output,
+                        context_length=context_length,
+                        max_new_tokens=max_gen,
+                        eos_token_ids=thinking_eos_token_ids,
+                        answer_stopping_criterion=answer_stopping_criterion,
+                    )
+                )
+                row.update({
+                    "pred": pred,
+                    "answer_extraction_status": extraction_status,
+                    "generation_termination": termination_reason,
+                    "generated_tokens": generated_token_count,
+                })
             with out_path.open("a", encoding="utf-8") as handle:
                 json.dump(row, handle, ensure_ascii=False)
                 handle.write("\n")
@@ -1794,6 +2242,9 @@ def generate_dataset(
         "mask_sha256": variant_semantic_payload(variant)["mask_sha256"],
         "engagement": engagement_evidence,
     }
+    if generation_policy is not None:
+        manifest["generation_policy"] = generation_policy
+        manifest["generation_outcomes"] = _thinking_outcome_summary(out_path)
     manifest["config_hash"] = config_hash(manifest)
     _write_manifest(out_path, manifest)
     if strict_complete and status != "ok":
@@ -1810,6 +2261,7 @@ def run_longbench(args: Any) -> dict[str, Any]:
 
     variant = _maybe_enable_quest_kernel(build_variant(args), args)
     model_family = args.model_family or infer_model_family(args.model_tag or args.model, args.model_path or args.model)
+    generation_policy = _longbench_generation_policy(args, model_family)
     validate_qlutattn_model_family(variant, model_family)
     validate_qlutattn_preload(args, variant, model_family)
     model_tag = args.model_tag or model_basename(args.model, args.model_path)
@@ -1876,6 +2328,9 @@ def run_longbench(args: Any) -> dict[str, Any]:
         dtype=args.torch_dtype,
         local_files_only=args.local_files_only,
     )
+    _validate_runtime_generation_policy(model_obj, tokenizer, generation_policy)
+    if generation_policy is not None:
+        print(f"[generation] policy={generation_policy}")
     validate_qlutattn_model_config(variant, model_obj.config, model_obj.dtype)
 
     # Validate a per-layer promote_ratio schedule against the model's real layer
@@ -1954,6 +2409,12 @@ def run_longbench(args: Any) -> dict[str, Any]:
             data = load_longbench_dataset(data_name, data_root=args.data_root)
             data = _select_data(data, args.max_samples)
             max_gen = args.max_gen or dataset2maxlen[dataset]
+            dataset_generation_policy = _thinking_dataset_generation_policy(
+                generation_policy,
+                dataset=dataset,
+                answer_token_budget=int(dataset2maxlen[dataset]),
+                max_new_tokens=int(max_gen),
+            )
             out_path = pred_dir / f"{dataset}.jsonl"
             manifest = generate_dataset(
                 model_name=resolved_model_path,
@@ -1973,6 +2434,7 @@ def run_longbench(args: Any) -> dict[str, Any]:
                 legacy_cache_model=legacy_cache_model,
                 kitty_stats=kitty_stats,
                 expected_run_config_hash=run_hashes[dataset],
+                generation_policy=dataset_generation_policy,
             )
             manifests.append(manifest)
     finally:
@@ -1997,6 +2459,8 @@ def run_longbench(args: Any) -> dict[str, Any]:
         "manifests": manifests,
         "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
     }
+    if generation_policy is not None:
+        report["generation_policy"] = generation_policy
     if args.report_json:
         report_path = Path(args.report_json)
         report_path.parent.mkdir(parents=True, exist_ok=True)

@@ -190,6 +190,42 @@ class LongBenchTests(unittest.TestCase):
             self.assertEqual(scores["passage_count"], 100.0)
             self.assertTrue((pred_dir / "result.json").exists())
 
+    def test_invalid_thinking_status_forces_zero_for_classification(self):
+        row = {
+            "pred": "",
+            "answers": ["gold"],
+            "all_classes": ["gold", "other"],
+            "length": 10,
+            "answer_extraction_status": "no_closing_think",
+        }
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for dirname, filename, is_longbench_e in (
+                ("normal", "trec.jsonl", False),
+                ("extended", "trec_e.jsonl", True),
+            ):
+                pred_dir = root / dirname
+                pred_dir.mkdir()
+                jsonl = pred_dir / filename
+                jsonl.write_text(json.dumps(row) + "\n", encoding="utf-8")
+                jsonl.with_suffix(".manifest.json").write_text(
+                    json.dumps({
+                        "expected_samples": 1,
+                        "written_samples": 1,
+                        "failed_sample_ids": [],
+                    }),
+                    encoding="utf-8",
+                )
+                scores = score_directory(
+                    pred_dir,
+                    is_longbench_e=is_longbench_e,
+                    strict_complete=True,
+                )
+                if is_longbench_e:
+                    self.assertEqual(scores["trec"]["0-4k"], 0.0)
+                else:
+                    self.assertEqual(scores["trec"], 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()
